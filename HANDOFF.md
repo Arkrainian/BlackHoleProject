@@ -173,3 +173,110 @@ Both configs build clean with no warnings (beyond pre-existing, unrelated
 GLM `CMakeLists.txt` deprecation notices) as of this handoff. `build.bat`
 passes all 38 tests; `build_cuda.bat` passes all 42 (the extra 4 are the
 automated CPU-vs-GPU render comparison, see above).
+
+## Session 2 — jet piloting mode, TON 618 default, realistic disk/jet physics, HUD compass, star tidal disruption
+
+Builds on everything above; nothing in Session 1 was reverted. Both
+`build.bat` and `build_cuda.bat` still build clean and pass the full test
+suite (38/42) after all of this.
+
+### What's new
+
+- **Jet piloting mode** (`src/Jet/`): a third camera mode (Orbit / Free-Fly
+  / **Jet**) that puts the user in a flyable Su-57 (GLB model + texture in
+  `resources/jet/`) with an arcade thrust/drag/G-force flight model, chase
+  and cockpit camera views (`Jet::FlightCamera`), and real Schwarzschild
+  gravity (`Physics::StaticObserverGravityAccelSim`, see below) pulling it
+  toward the hole. Composited on top of the ray-traced view via
+  `Renderer::BeginOverlayPass`, the same mechanism used for stars (see
+  below).
+  - **Known fragile point:** the jet model/texture load via a relative
+    path (`resources/jet/...`), which only resolves if the working
+    directory is the source tree. Fixed by adding a CMake post-build step
+    (`CMakeLists.txt`) that copies `resources/` next to whichever exe was
+    just built, so launching the exe directly from `build/` or
+    `build_cuda/` also finds it. If you ever add more runtime assets,
+    remember they need the same treatment (or go through this existing
+    copy step automatically, since it copies the whole directory).
+- **TON 618 is now the default black hole mass** (`App::Run`, was 10 solar
+  masses), still a live, adjustable slider (now ranges up to 1e11 solar
+  masses instead of 1e9, since TON 618 — ~6.6e10 M☉ — didn't fit the old
+  range). This was a deliberate user request, not a tuning accident.
+- **The accretion disk's color is now physically tied to the black hole's
+  actual mass**, not an artist-picked color ramp (`Astronomy::AccretionDisk`
+  / `AccretionDisk.cpp`). It derives the real Shakura-Sunyaev effective
+  temperature from an assumed Eddington fraction + radiative efficiency
+  (both now UI sliders), giving the textbook `T_eff ~ M^-1/4` scaling: a
+  10-solar-mass hole's disk runs ~10^7 K (X-ray, like a real stellar X-ray
+  binary); TON 618's disk runs ~10^4-10^5 K (UV/blue-white "big blue
+  bump", like a real quasar). `Temperature()`'s dimensionless shape
+  function is unchanged (tests still pass unmodified) — only `EmittedColor`
+  changed, multiplying that shape by a real, mass-derived Kelvin value
+  (`AccretionDisk::PeakKelvin()`) instead of a fixed `1500 + T*11000` fudge.
+- **HUD compass** (`App::Run`'s render loop, just before `ImGui::Render()`):
+  a horizontal strip across the top of the screen showing relative bearing
+  to nearby points of interest (currently: the black hole always, the jet
+  while piloting it), with adaptive-unit distance labels (km vs. ly). Built
+  as an extensible `PointOfInterest{name, position, color}` list — adding
+  more is a one-line addition, not a redesign.
+- **Jet relativistic speed cap** (`Jet::FlightPhysics`): the thrust/drag
+  model was tuned treating "sim units" as meters, which was harmless at
+  10 solar masses (1 sim unit ≈ 15 km) but became absurd at TON 618 scale
+  (1 sim unit ≈ 0.01 ly) — the old equilibrium speed worked out to
+  billions of c. Fixed with a hard cap, expressed as a fraction of c
+  (`maxSpeedFractionOfC`, default 0.2, UI slider), converted every frame
+  into however many sim-units/s that implies for whichever black hole mass
+  is currently loaded. **Known tradeoff, not a bug:** at TON 618's scale
+  this makes long-distance travel genuinely slow (realistically, years) —
+  that's the physically correct consequence of light-year-scale distances,
+  not a mistake. The slider exists specifically so this tradeoff is
+  adjustable rather than argued about.
+- **Stars: real-physics tidal disruption** (`src/Astronomy/StarBody.*`,
+  new files). "Add Star" (Simple and Advanced mode) drops a cluster of
+  ~28 independent particles into orbit with **no self-gravity binding
+  them** — each free-falls under the exact same gravity law as the jet
+  (`Physics::StaticObserverGravityAccelSim`, factored out of
+  `Jet::FlightPhysics` into `Physics/BlackHole.h` specifically so both
+  share it). Spaghettification is therefore not a scripted stretch effect;
+  it's the direct, measured consequence of near-side particles feeling
+  stronger gravity than far-side ones. Particles crossing the horizon are
+  marked consumed, stop integrating, stop drawing; a star is dropped from
+  the active list once every particle is consumed. Rendered via the same
+  `BeginOverlayPass` compositing path as the jet, and also in the debug 3D
+  view. Advanced mode exposes spawn radius and orbital-speed-fraction
+  sliders plus a live particle-count readout.
+
+### Decisions worth knowing about (additions to the Session 1 list above)
+
+- **Sim units are NOT literal meters**, even though some constants look
+  like they assume that (`Jet::MACH_1 = 343.0f`, `STALL_SPEED = 70.0f`).
+  This was always true (1 sim unit = GM/c^2 for whichever mass is loaded,
+  see `Physics/Constants.h`), but it only became consequential once the
+  default mass went supermassive. Any new code that wants a REAL physical
+  quantity (speed, Kelvin, distance) must explicitly convert via the
+  current `blackHole.MassKg()`-derived scale — never assume sim-units are
+  meters, seconds, or anything else physical by default.
+- **The ray-traced image itself is intentionally mass-invariant.** The
+  Schwarzschild metric is scale-invariant in units of r_s, so the lensing
+  shape, starfield, and disk geometry never change when you move the mass
+  slider — only labeled real-world sizes (km/ly) and anything that
+  explicitly converts to real units (jet speed cap, disk Kelvin, compass
+  distances) do. This was confirmed as correct, expected behavior when a
+  user asked about it — don't "fix" it into mass-dependent lensing.
+- **Stars have no self-gravity by design**, not as a missing feature.
+  Modeling it would mean modeling the competition between self-gravity and
+  tidal force (i.e. an actual Roche/tidal-disruption-radius calculation)
+  instead of just letting differential external gravity do the work. Every
+  star here is effectively already past the point self-gravity would have
+  lost. Documented in `StarBody.h` as a limitation, same spirit as
+  `docs/physics.md`'s others — don't quietly add cohesion without updating
+  that comment.
+
+### Build environment note (for next session, not a code issue)
+
+`cmake`/`ninja` are not on PATH in the plain shell used for dev in this
+environment — they only resolve inside a VS2022 Developer Command Prompt
+(`vcvars64.bat`). Both `build.bat` and `build_cuda.bat` already call
+`vcvars64.bat` themselves when run normally (e.g. by double-clicking or
+from a regular `cmd.exe`), so this only matters if you're driving the
+build from a non-Developer shell/script directly.

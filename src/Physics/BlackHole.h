@@ -1,5 +1,10 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
+
+#include <glm/glm.hpp>
+
 #include "Constants.h"
 
 namespace Physics {
@@ -45,5 +50,31 @@ public:
 private:
     double m_massKg;
 };
+
+// The exact proper acceleration a "static" observer must apply to hover at
+// a fixed Schwarzschild radial coordinate r (sim units, GM=1): a(r) =
+// (GM/r^2) / sqrt(1 - r_s/r). Shared by anything that needs real point-mass
+// gravity toward the hole -- originally written for Jet::FlightPhysics (see
+// its header for the physical justification: it reduces to ordinary
+// Newtonian 1/r^2 far away but diverges at the horizon, correctly modeling
+// that nothing can hover arbitrarily close to it) and reused as-is by
+// Astronomy::StarBody so a star's particles free-fall under the SAME exact
+// law the jet does -- tidal "spaghettification" then isn't a separate
+// effect to simulate, it's just what emerges when particles starting a
+// little apart each follow this exact, radius-dependent pull independently.
+// Clamped to a finite ceiling so one oversized timestep at the horizon
+// can't inject inf/NaN before the caller's own horizon-crossing check has a
+// chance to react.
+inline glm::dvec3 StaticObserverGravityAccelSim(const glm::dvec3& position) {
+    const double r = glm::length(position);
+    if (r < 1e-6) {
+        return glm::dvec3(0.0);
+    }
+    const double rs = BlackHole::SchwarzschildRadiusSim();
+    const double newtonTerm = 1.0 / (r * r); // GM = 1 in sim units
+    const double relativisticFactor = 1.0 / std::sqrt(std::max(1e-4, 1.0 - rs / r));
+    const double magnitude = std::min(newtonTerm * relativisticFactor, 5000.0);
+    return -glm::normalize(position) * magnitude;
+}
 
 } // namespace Physics

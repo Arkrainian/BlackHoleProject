@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "Physics/BlackHole.h"
+#include "Physics/Constants.h"
 
 namespace Jet {
 
@@ -33,8 +34,15 @@ void FlightPhysics::Reset(const glm::vec3& spawnPosition) {
     capturedByBlackHole = false;
 }
 
-void FlightPhysics::Update(float deltaTime) {
-    UpdateForces(deltaTime);
+void FlightPhysics::Update(float deltaTime, double metersPerSimUnit) {
+    // See FlightPhysics.h point 3: convert the real speed cap into however
+    // many sim-units/s that is for the CURRENTLY loaded black hole. Smaller
+    // holes (tiny metersPerSimUnit) get a huge cap in sim-units/s, so the
+    // original arcade thrust/drag equilibrium is what limits speed, same as
+    // before this was added; a hole as large as TON 618 gets a small enough
+    // cap to actually bind.
+    const double maxSpeedSim = (static_cast<double>(maxSpeedFractionOfC) * Physics::Constants::C_SI) / metersPerSimUnit;
+    UpdateForces(deltaTime, static_cast<float>(maxSpeedSim));
     UpdateRotation(deltaTime);
 
     // Event horizon "crash": falling inside r_s means nothing escapes,
@@ -47,7 +55,7 @@ void FlightPhysics::Update(float deltaTime) {
     }
 }
 
-void FlightPhysics::UpdateForces(float deltaTime) {
+void FlightPhysics::UpdateForces(float deltaTime, float maxSpeedSimUnitsPerSec) {
     float airSpeed = glm::length(velocity);
 
     // No atmosphere in orbit around a black hole -- nominal sea-level-
@@ -81,23 +89,10 @@ void FlightPhysics::UpdateForces(float deltaTime) {
     // can hold station arbitrarily close to the horizon. In practice this
     // stays negligible while cruising (r ~ 100s of units) and only becomes
     // a real, escalating threat once the jet dives in toward the accretion
-    // disk/photon sphere -- exactly where it should.
-    glm::vec3 gravityAccel(0.0f);
-    {
-        const glm::dvec3 dpos(position);
-        const double r = glm::length(dpos);
-        const double rs = Physics::BlackHole::SchwarzschildRadiusSim();
-        if (r > 1e-6) {
-            const double newtonTerm = 1.0 / (r * r); // GM=1
-            // Clamped, not left to blow up to infinity, purely so one large
-            // timestep right at the horizon can't inject NaN/inf into
-            // velocity before FlightPhysics::Update's capture check (next
-            // frame) has a chance to reset the flight.
-            const double relativisticFactor = 1.0 / std::sqrt(std::max(1e-4, 1.0 - rs / r));
-            const double magnitude = std::min(newtonTerm * relativisticFactor, 5000.0);
-            gravityAccel = glm::vec3(-glm::normalize(dpos) * magnitude);
-        }
-    }
+    // disk/photon sphere -- exactly where it should. Shared with
+    // Astronomy::StarBody (see Physics/BlackHole.h) so a falling star feels
+    // the identical law.
+    const glm::vec3 gravityAccel(Physics::StaticObserverGravityAccelSim(glm::dvec3(position)));
 
     // 2. Thrust. Afterburner adds 50% more.
     float thrustMultiplier = afterburner ? 1.5f : 1.0f;
@@ -124,6 +119,14 @@ void FlightPhysics::UpdateForces(float deltaTime) {
     CalculateGForce(acceleration);
 
     velocity += acceleration * deltaTime;
+
+    // Hard relativistic speed limit -- see FlightPhysics.h point 3. Whatever
+    // the thrust/drag equilibrium above would otherwise produce, velocity
+    // never exceeds this (mass-dependent) cap.
+    const float speed = glm::length(velocity);
+    if (speed > maxSpeedSimUnitsPerSec && speed > 1e-6f) {
+        velocity *= maxSpeedSimUnitsPerSec / speed;
+    }
 
     // Aerodynamic "turn" correction -- velocity aligns with the nose.
     if (airSpeed > 10.0f) {

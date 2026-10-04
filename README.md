@@ -147,7 +147,3 @@ MHD, realistic disk radiative transfer, or flux-calibrated brightness —
 see [docs/physics.md §10](docs/physics.md#10-limitations) for the full,
 honest list of what this is and isn't. Where an approximation is made
 anywhere in the code, it's labeled as such at the point it's made.
-
-## Attribution
-
-Built with [Claude Code](https://claude.com/claude-code).

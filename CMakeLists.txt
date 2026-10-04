@@ -163,6 +163,16 @@ if(WIN32)
     target_compile_definitions(BlackHoleSimulator PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
+# The jet model/texture are loaded at runtime via the relative path
+# "resources/jet/..." (see src/Jet/JetRenderer.cpp), which only resolves
+# when the working directory is the source tree. Mirror resources/ next to
+# the built exe so running BlackHoleSimulator.exe directly from the build
+# directory (the common case) finds them too.
+add_custom_command(TARGET BlackHoleSimulator POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${CMAKE_SOURCE_DIR}/resources" "$<TARGET_FILE_DIR:BlackHoleSimulator>/resources"
+)
+
 # ---------------------------------------------------------------------------
 # Tests (Stage 1: a tiny header-only runner; swap for Catch2/GoogleTest later
 # once the API surface stabilizes — not worth the dependency yet).

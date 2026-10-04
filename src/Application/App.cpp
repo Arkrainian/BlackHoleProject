@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -23,6 +24,7 @@
 #include <chrono>
 
 #include "Astronomy/AccretionDisk.h"
+#include "Astronomy/StarBody.h"
 #include "Astronomy/StarField.h"
 #include "Jet/FlightCamera.h"
 #include "Jet/FlightPhysics.h"
@@ -81,6 +83,24 @@ const char* MethodName(IntegratorMethod method) {
 // this wraps SliderScalar so call sites below read like the float version.
 bool SliderDouble(const char* label, double* v, double vMin, double vMax, const char* format = "%.3f") {
     return ImGui::SliderScalar(label, ImGuiDataType_Double, v, &vMin, &vMax, format);
+}
+
+// Formats a physical distance (in meters) adaptively -- km for anything
+// solar-system-scale, light-years once it's bigger than that -- so the
+// compass HUD (see the Run() loop) reads sensibly whether the black hole is
+// a stellar-mass hole a few hundred km away or TON 618 a fraction of a
+// light-year away (sim units always scale with the hole's own mass, see
+// Physics/Constants.h, so the same on-screen distance means very different
+// real distances depending on which hole is loaded).
+std::string FormatDistance(double meters) {
+    constexpr double kLightYearMeters = 9.4607e15;
+    char buf[64];
+    if (meters < 0.1 * kLightYearMeters) {
+        std::snprintf(buf, sizeof(buf), "%.3g km", meters / 1000.0);
+    } else {
+        std::snprintf(buf, sizeof(buf), "%.3g ly", meters / kLightYearMeters);
+    }
+    return buf;
 }
 
 // Draws a small "(?)" next to the previous control and shows `text` as a
@@ -334,7 +354,11 @@ int App::Run() {
         return 1;
     }
 
-    BlackHole blackHole(10.0); // 10 solar masses by default
+    // Default to TON 618, one of the most massive black holes known
+    // (~6.6e10 solar masses) -- still just a starting point for the mass
+    // sliders below, not a fixed value.
+    constexpr double kTon618MassSolar = 6.6e10;
+    BlackHole blackHole(kTon618MassSolar);
     Rendering::Camera camera;
     Rendering::Renderer renderer;
 
@@ -422,7 +446,30 @@ int App::Run() {
     // --- Stage 6: accretion disk state ---
     bool diskEnabled = false;
     Astronomy::AccretionDiskSettings diskSettings;
-    Astronomy::AccretionDisk accretionDisk(diskSettings);
+    Astronomy::AccretionDisk accretionDisk(diskSettings, blackHole.MassKg());
+
+    // --- Stars: user-spawned tidal-disruption test bodies (see
+    // Astronomy/StarBody.h) -- each is a small cluster of particles that
+    // free-falls under the same exact gravity law as the jet, so any
+    // stretching/shredding on screen is a real consequence of differential
+    // gravity, not a scripted animation.
+    std::vector<Astronomy::StarBody> stars;
+    double starSpawnRadius = 20.0;             // sim units
+    double starOrbitalSpeedFraction = 0.55;    // fraction of the local Newtonian circular speed; <1 spirals/plunges in
+    std::mt19937 starSpawnRng(std::random_device{}());
+    auto SpawnStar = [&]() {
+        // Equatorial plane, same convention as the accretion disk, at a
+        // random azimuth so repeated spawns don't all land on top of each
+        // other.
+        std::uniform_real_distribution<double> azimuthDist(0.0, 2.0 * glm::pi<double>());
+        const double azimuth = azimuthDist(starSpawnRng);
+        const glm::dvec3 radial(std::cos(azimuth), 0.0, std::sin(azimuth));
+        const glm::dvec3 position = radial * starSpawnRadius;
+        const glm::dvec3 tangential(-std::sin(azimuth), 0.0, std::cos(azimuth));
+        const double circularSpeed = std::sqrt(1.0 / starSpawnRadius); // Newtonian v_circ, GM=1 sim units
+        const glm::dvec3 velocity = tangential * (circularSpeed * starOrbitalSpeedFraction);
+        stars.emplace_back(position, velocity);
+    };
 
     double lastMouseX = 0.0, lastMouseY = 0.0;
     bool dragging = false;
@@ -450,6 +497,7 @@ int App::Run() {
     bool jetMouseCaptured = true; // Tab toggles this while piloting, see the Jet input block
     bool jetTabWasDown = false;   // edge-detects the Tab press above (GLFW has no "just pressed" query)
     bool jetCameraCycleKeyWasDown = false; // edge-detects the C press that cycles chase/cockpit view
+    double jetMaxSpeedFractionOfC = jetPhysics.maxSpeedFractionOfC; // mirrors the slider below into FlightPhysics (SliderDouble needs a double*)
 
 #ifdef BH_CUDA_AVAILABLE
     if (cudaDeviceAvailable) {
@@ -507,6 +555,7 @@ int App::Run() {
                 : RayTracing::BackgroundSampler([&](const glm::dvec3& dir) { return starField.Sample(dir); });
 
         accretionDisk.SetSettings(diskSettings);
+        accretionDisk.SetBlackHoleMassKg(blackHole.MassKg());
         const RayTracing::DiskSampler diskSampler = [&](const PhotonTraceResult& hit) {
             const double emittedTemperature = accretionDisk.Temperature(hit.diskHitRadius);
             const double observedTemperature =
@@ -589,7 +638,7 @@ int App::Run() {
                 jetInput.ProcessKeyboard(m_window, jetPhysics, static_cast<float>(dt));
             }
 
-            jetPhysics.Update(static_cast<float>(dt));
+            jetPhysics.Update(static_cast<float>(dt), Physics::Constants::GravitationalRadiusMeters(blackHole.MassKg()));
             if (jetPhysics.capturedByBlackHole) {
                 jetPhysics.Reset(jetSpawnPosition);
             }
@@ -769,10 +818,16 @@ int App::Run() {
                 if (ImGui::Button(jetFlightCamera.mode == Jet::FlightCameraMode::Chase ? "Switch to Cockpit View" : "Switch to Chase View")) {
                     jetFlightCamera.CycleMode();
                 }
-                ImGui::Text("Speed: %.0f sim units/s   G: %.1f (peak %.1f)", jetPhysics.GetSpeed(), jetPhysics.currentGForce, jetPhysics.peakGForce);
+                const double jetMetersPerSimUnit = Physics::Constants::GravitationalRadiusMeters(blackHole.MassKg());
+                const double jetSpeedMetersPerSec = jetPhysics.GetSpeed() * jetMetersPerSimUnit;
+                ImGui::Text("Speed: %.0f sim units/s = %.3gc   G: %.1f (peak %.1f)", jetPhysics.GetSpeed(),
+                            jetSpeedMetersPerSec / Physics::Constants::C_SI, jetPhysics.currentGForce, jetPhysics.peakGForce);
                 ImGui::TextDisabled("Jet pos: (%.1f, %.1f, %.1f)   Camera pos: (%.1f, %.1f, %.1f)",
                                      jetPhysics.position.x, jetPhysics.position.y, jetPhysics.position.z,
                                      camera.jetPosition.x, camera.jetPosition.y, camera.jetPosition.z);
+                SliderDouble("Max speed (fraction of c)", &jetMaxSpeedFractionOfC, 0.001, 0.9, "%.3f");
+                HelpTooltip("Hard ceiling on the jet's real speed, as a fraction of light speed -- this is what keeps flight from becoming 'cross several light-years in a few seconds' once the black hole is supermassive (one sim unit is much bigger in real terms for a hole like TON 618 than for a stellar-mass one, see Physics/Constants.h). Raise it if a heavier hole feels too slow to get anywhere; it can never reach or exceed 1.0 (actual light speed).");
+                jetPhysics.maxSpeedFractionOfC = static_cast<float>(jetMaxSpeedFractionOfC);
             }
         }
         ImGui::Separator();
@@ -866,9 +921,22 @@ int App::Run() {
 #endif
             }
 
-            if (SliderDouble("Black hole mass (solar masses)", &blackHoleMassSolar, 1.0, 1.0e9, "%.2e")) {
+            if (SliderDouble("Black hole mass (solar masses)", &blackHoleMassSolar, 1.0, 1.0e11, "%.2e")) {
                 blackHole.SetMassSolarMasses(blackHoleMassSolar);
             }
+
+            ImGui::Separator();
+            if (ImGui::Button("Add Star")) {
+                SpawnStar();
+            }
+            ImGui::SameLine();
+            if (!stars.empty() && ImGui::Button("Clear Stars")) {
+                stars.clear();
+            }
+            ImGui::TextWrapped(
+                "Drops a small star into orbit and watches real tidal gravity pull it apart -- no "
+                "scripted stretching, just ~28 particles each falling under the exact same physics "
+                "as everything else here. Switch to Advanced mode to tune its starting orbit.");
 
             ImGui::TextWrapped("Tip: drag with the left mouse button to look around -- the light bends in real time as you move. Scroll to zoom.");
             if (ImGui::Button("Show every control (Advanced mode)")) {
@@ -889,7 +957,7 @@ int App::Run() {
             "curve is not how light actually bends near a black hole.");
 
         if (ImGui::CollapsingHeader("Black Hole", ImGuiTreeNodeFlags_DefaultOpen)) {
-            if (SliderDouble("Mass (solar masses)", &blackHoleMassSolar, 1.0, 1.0e9, "%.3e")) {
+            if (SliderDouble("Mass (solar masses)", &blackHoleMassSolar, 1.0, 1.0e11, "%.3e")) {
                 blackHole.SetMassSolarMasses(blackHoleMassSolar);
             }
             HelpTooltip("How much mass the black hole has, in units of our Sun's mass. Heavier = larger Schwarzschild radius, but the SHAPE of everything you see stays the same (it's all scale-invariant) -- only the physical size in kilometers changes.");
@@ -1104,6 +1172,7 @@ int App::Run() {
                         : RayTracing::BackgroundSampler([&](const glm::dvec3& dir) { return starField.Sample(dir); });
 
                 accretionDisk.SetSettings(diskSettings);
+                accretionDisk.SetBlackHoleMassKg(blackHole.MassKg());
                 const RayTracing::DiskSampler diskSampler = [&](const PhotonTraceResult& hit) {
                     const double emittedTemperature = accretionDisk.Temperature(hit.diskHitRadius);
                     const double observedTemperature = diskSettings.relativisticEffects
@@ -1229,6 +1298,45 @@ int App::Run() {
             needsRerender |= SliderDouble("Brightness scale", &diskSettings.brightnessScale, 0.01, 2.0, "%.3f");
             needsRerender |= ImGui::Checkbox("Clockwise rotation", &diskSettings.clockwise);
             needsRerender |= ImGui::Checkbox("Relativistic effects (redshift + beaming)", &diskSettings.relativisticEffects);
+
+            needsRerender |= SliderDouble("Eddington fraction (L / L_Edd)", &diskSettings.eddingtonFraction, 0.01, 1.0, "%.2f");
+            HelpTooltip("How hard the black hole is accreting, as a fraction of the Eddington limit (the luminosity at which radiation pressure balances gravity). Together with the mass, this sets the disk's REAL temperature in Kelvin (bigger mass + same Eddington fraction = a cooler disk, since the emitting area grows faster than the luminosity) -- it does not just recolor the image, it's the physical quantity the color comes from.");
+            needsRerender |= SliderDouble("Radiative efficiency (eta)", &diskSettings.radiativeEfficiency, 0.01, 0.4, "%.2f");
+            HelpTooltip("Fraction of accreted rest-mass energy radiated away (eta = L / Mdot*c^2). 0.1 is the standard thin-disk (Shakura-Sunyaev) value; a rapidly spinning hole can reach ~0.3-0.4.");
+            ImGui::Text("Disk inner-edge temperature: %.0f K (mass-dependent -- see tooltips above)", accretionDisk.PeakKelvin());
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Stars: tidal disruption");
+        {
+            ImGui::TextWrapped(
+                "Each star is ~28 independent particles released together with no self-gravity "
+                "binding them -- they free-fall under the exact same point-mass law "
+                "(Physics::StaticObserverGravityAccelSim) as the piloted jet. Any stretching into "
+                "a 'spaghetti' streak you see is the real, measured difference in gravity between "
+                "a particle's near side and far side, not a scripted effect.");
+
+            const double isco = 3.0 * BlackHole::SchwarzschildRadiusSim();
+            SliderDouble("Spawn radius", &starSpawnRadius, isco, 100.0, "%.2f");
+            HelpTooltip("How far from the black hole (in sim units, same scale as everything else) a newly-added star starts. Closer in = stronger, faster tidal disruption.");
+            SliderDouble("Orbital speed (fraction of circular)", &starOrbitalSpeedFraction, 0.0, 1.3, "%.2f");
+            HelpTooltip("0 = drops straight in (radial plunge). 1.0 = a circular orbit that (ignoring tidal spreading) would never fall in. Something around 0.4-0.7 gives an elliptical orbit that dives close enough to the hole to visibly spaghettify, which is usually the most interesting case.");
+
+            if (ImGui::Button("Add Star")) {
+                SpawnStar();
+            }
+            ImGui::SameLine();
+            if (!stars.empty() && ImGui::Button("Clear Stars")) {
+                stars.clear();
+            }
+
+            int remainingParticles = 0;
+            for (const Astronomy::StarBody& star : stars) {
+                for (const Astronomy::StarParticle& particle : star.Particles()) {
+                    if (!particle.consumed) ++remainingParticles;
+                }
+            }
+            ImGui::Text("Active stars: %d (%d particles not yet consumed)", static_cast<int>(stars.size()), remainingParticles);
         }
         } // uiMode == Advanced
 
@@ -1249,10 +1357,33 @@ int App::Run() {
             for (int s = 0; s < stepsPerFrame; ++s) {
                 simulation.Step();
             }
+
+            for (Astronomy::StarBody& star : stars) {
+                star.Update(dt);
+            }
+            stars.erase(std::remove_if(stars.begin(), stars.end(),
+                                        [](const Astronomy::StarBody& star) { return star.IsFullyConsumed(); }),
+                        stars.end());
         }
 
         const int width = fbWidth, height = fbHeight; // set earlier this frame, before PerformRender used them
         const float aspect = height > 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.0f;
+
+        // Draws every star's non-consumed particles (a short fading trail
+        // plus the particle itself) -- shared between the ray-traced view's
+        // overlay pass and the debug 3D view below, since a star's position
+        // means the same sim-unit coordinates in either one.
+        const auto DrawStars = [&]() {
+            for (const Astronomy::StarBody& star : stars) {
+                for (const Astronomy::StarParticle& particle : star.Particles()) {
+                    if (particle.consumed) continue;
+                    if (particle.trail.size() >= 2) {
+                        renderer.DrawPath(particle.trail, star.Color(), 1.5f);
+                    }
+                    renderer.DrawPoint(particle.position, star.Color(), 4.0f);
+                }
+            }
+        };
 
         if (viewLensedRender && lensedTextureWidth > 0) {
             glViewport(0, 0, width, height);
@@ -1260,21 +1391,26 @@ int App::Run() {
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             renderer.DrawFullscreenTexture(lensedTexture);
 
-            // Composite the piloted jet on top of the ray-traced image,
-            // using the SAME camera the tracer used this frame (see
-            // BuildCameraFrame) so it lines up with the lensed background.
-            // Lit from the black hole's direction -- it's the only light
-            // source in this scene.
-            if (camera.mode == Rendering::Camera::Mode::Jet && jetRenderer.IsLoaded()) {
+            // Composite the piloted jet and any stars on top of the
+            // ray-traced image, using the SAME camera the tracer used this
+            // frame (see BuildCameraFrame) so both line up with the lensed
+            // background. The jet is lit from the black hole's direction --
+            // it's the only light source in this scene.
+            const bool jetVisible = camera.mode == Rendering::Camera::Mode::Jet && jetRenderer.IsLoaded();
+            if (jetVisible || !stars.empty()) {
                 renderer.BeginOverlayPass(camera, aspect);
-                const glm::vec3 lightDirection = glm::length(jetPhysics.position) > 1e-4f
-                                                      ? glm::normalize(jetPhysics.position)
-                                                      : glm::vec3(0.0f, 0.0f, -1.0f);
-                jetRenderer.Draw(jetPhysics.position, jetPhysics.rotation, camera.ViewMatrix(),
-                                  camera.ProjectionMatrix(aspect), lightDirection);
+                if (jetVisible) {
+                    const glm::vec3 lightDirection = glm::length(jetPhysics.position) > 1e-4f
+                                                          ? glm::normalize(jetPhysics.position)
+                                                          : glm::vec3(0.0f, 0.0f, -1.0f);
+                    jetRenderer.Draw(jetPhysics.position, jetPhysics.rotation, camera.ViewMatrix(),
+                                      camera.ProjectionMatrix(aspect), lightDirection);
+                }
+                DrawStars();
             }
         } else {
             renderer.BeginFrame(camera, aspect, width, height);
+            DrawStars();
 
             if (showGrid) {
                 renderer.DrawGrid(40.0, 40, glm::vec3(0.15f, 0.15f, 0.2f));
@@ -1335,6 +1471,83 @@ int App::Run() {
                     renderer.DrawPath(alignmentLine, glm::vec3(1.0f, 1.0f, 0.4f), 1.5f);
                 }
             }
+        }
+
+        // --- HUD compass: a horizontal strip across the top of the screen
+        // showing the relative bearing (left/right of straight ahead) to
+        // nearby points of interest -- the black hole always, plus the
+        // piloted jet while flying it. Bearing is computed by projecting
+        // each POI's offset from the camera onto the camera's own forward/
+        // right axes, so it tracks whichever camera mode is active (Orbit,
+        // FreeFly, or Jet) without any mode-specific logic here.
+        {
+            struct PointOfInterest {
+                const char* name;
+                glm::dvec3 position;
+                ImU32 color;
+            };
+            std::vector<PointOfInterest> pointsOfInterest;
+            pointsOfInterest.push_back({"Black Hole", glm::dvec3(0.0), IM_COL32(255, 170, 60, 255)});
+            if (camera.mode == Rendering::Camera::Mode::Jet) {
+                pointsOfInterest.push_back(
+                    {"Jet", glm::dvec3(jetPhysics.position), IM_COL32(120, 220, 255, 255)});
+            }
+
+            const glm::dvec3 camPos = camera.Position();
+            const Rendering::Camera::Basis basis = camera.OrthonormalBasis();
+            const double metersPerSimUnit = Physics::Constants::GravitationalRadiusMeters(blackHole.MassKg());
+
+            const ImGuiViewport* viewport = ImGui::GetMainViewport();
+            const float barWidth = std::min(viewport->Size.x * 0.6f, 640.0f);
+            const float barHeight = 48.0f;
+            constexpr double kHalfFovDegrees = 70.0; // the strip's full width spans this many degrees either side of dead ahead
+
+            ImGui::SetNextWindowPos(ImVec2(viewport->Pos.x + (viewport->Size.x - barWidth) * 0.5f, viewport->Pos.y + 10.0f));
+            ImGui::SetNextWindowSize(ImVec2(barWidth, barHeight));
+            ImGui::SetNextWindowBgAlpha(0.3f);
+            const ImGuiWindowFlags compassFlags =
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoInputs |
+                ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+            if (ImGui::Begin("##Compass", nullptr, compassFlags)) {
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+                const ImVec2 winPos = ImGui::GetWindowPos();
+                const ImVec2 winSize = ImGui::GetWindowSize();
+                const float centerX = winPos.x + winSize.x * 0.5f;
+                const float midY = winPos.y + winSize.y * 0.5f;
+                const float halfTrackWidth = winSize.x * 0.5f - 14.0f; // leaves room for edge arrows
+
+                draw->AddLine(ImVec2(winPos.x, midY), ImVec2(winPos.x + winSize.x, midY), IM_COL32(255, 255, 255, 50), 1.0f);
+                draw->AddTriangleFilled(ImVec2(centerX - 5.0f, winPos.y + 2.0f), ImVec2(centerX + 5.0f, winPos.y + 2.0f),
+                                         ImVec2(centerX, winPos.y + 11.0f), IM_COL32(255, 255, 255, 170));
+
+                for (const PointOfInterest& poi : pointsOfInterest) {
+                    const glm::dvec3 relative = poi.position - camPos;
+                    const double distanceSim = glm::length(relative);
+                    if (distanceSim < 1e-9) continue; // POI coincides with the camera (e.g. jet in cockpit view) -- no bearing to show
+
+                    const double forwardComponent = glm::dot(relative, basis.forward);
+                    const double rightComponent = glm::dot(relative, basis.right);
+                    const double bearingDegrees = glm::degrees(std::atan2(rightComponent, forwardComponent));
+                    const bool behindOrWide = std::abs(bearingDegrees) > kHalfFovDegrees;
+                    const double clampedBearing = std::clamp(bearingDegrees, -kHalfFovDegrees, kHalfFovDegrees);
+                    const float x = centerX + static_cast<float>(clampedBearing / kHalfFovDegrees) * halfTrackWidth;
+
+                    if (behindOrWide) {
+                        const float dir = bearingDegrees > 0.0 ? 1.0f : -1.0f;
+                        draw->AddTriangleFilled(ImVec2(x, midY - 5.0f), ImVec2(x, midY + 5.0f),
+                                                 ImVec2(x + dir * 7.0f, midY), poi.color);
+                    } else {
+                        draw->AddLine(ImVec2(x, winPos.y + 8.0f), ImVec2(x, winPos.y + winSize.y - 16.0f), poi.color, 2.0f);
+                    }
+
+                    const std::string label = std::string(poi.name) + "  " + FormatDistance(distanceSim * metersPerSimUnit);
+                    const ImVec2 textSize = ImGui::CalcTextSize(label.c_str());
+                    const float labelX = std::clamp(x - textSize.x * 0.5f, winPos.x, winPos.x + winSize.x - textSize.x);
+                    draw->AddText(ImVec2(labelX, winPos.y + winSize.y - 15.0f), poi.color, label.c_str());
+                }
+            }
+            ImGui::End();
         }
 
         ImGui::Render();

@@ -21,6 +21,13 @@ inline constexpr double G_SI = 6.67430e-11;      // m^3 kg^-1 s^-2
 inline constexpr double C_SI = 2.99792458e8;     // m/s
 inline constexpr double SOLAR_MASS_KG = 1.98892e30; // kg
 
+// Used by Astronomy::AccretionDisk to derive a physically real Kelvin scale
+// (Eddington luminosity and the Shakura-Sunyaev effective temperature) from
+// a black hole's actual mass, rather than an artist-picked color ramp.
+inline constexpr double PROTON_MASS_KG = 1.67262192e-27;      // kg
+inline constexpr double STEFAN_BOLTZMANN = 5.670374e-8;       // W m^-2 K^-4
+inline constexpr double THOMSON_CROSS_SECTION_M2 = 6.6524587e-29; // m^2
+
 // Convenience: gravitational radius GM/c^2 in meters for a mass in kg.
 inline double GravitationalRadiusMeters(double massKg) {
     return G_SI * massKg / (C_SI * C_SI);
