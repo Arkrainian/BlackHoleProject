@@ -11,9 +11,10 @@ A real-time GPU-accelerated Schwarzschild black hole ray tracer. All 7
 planned stages are implemented and working. The interactive app defaults
 to a "Simple" mode (four one-click preset scenes) with a full "Advanced"
 mode underneath exposing every scientific control. 38 automated physics
-tests pass, all validated against closed-form GR results. **No git
-repository has been initialized yet** — nothing in this project is
-committed anywhere.
+tests pass (42 with `-DBH_ENABLE_CUDA=ON`, including an automated CPU-vs-GPU
+render comparison), all validated against closed-form GR results. A git
+repository has now been initialized, with an initial commit covering the
+full source tree (see "What's been done this session" below).
 
 ## What's been done
 
@@ -109,43 +110,57 @@ committed anywhere.
 
 ## What needs attention
 
-- [ ] **`docs/validation.md` §9 is now stale.** It documents a
-      bit-identical CPU vs. GPU comparison (`max abs diff = 0.000000`).
-      That was true when the GPU kernel used `double`; after the float
-      conversion it is **no longer bit-identical** (small, expected
-      float-vs-double differences). Re-run "Validate: Compare CPU vs GPU"
-      in the app (Advanced mode) and update that section with real
-      numbers and an explanation of the expected float/double delta.
-- [ ] **No git repository.** Nothing is committed. First real task for
-      whoever picks this up: `git init`, decide on a `.gitignore` (at
-      minimum `build/`, `build_cuda/`), and get an initial commit in.
-- [ ] **Window title is stale**: still says "Stage 1-3: Baseline,
-      Geodesics & Lensing" (`App.cpp`, `glfwCreateWindow` call) even
-      though Stages 1-7 are all implemented.
+Resolved this session (see git log for details):
+
+- [x] **`docs/validation.md` §9 updated.** Re-measured CPU vs. GPU (now
+      genuinely float-vs-double, post the earlier `float` kernel
+      conversion) both via the app's compare button and a new automated
+      test; real numbers and an explanation of the expected, non-zero
+      delta are in place.
+- [x] **Git repository initialized.** `.gitignore` added (`build/`,
+      `build_cuda/`, `crashdumps/`, logs, `imgui.ini`, local Claude
+      settings); initial commit made covering the full source tree.
+- [x] **Window title fixed** — no longer references stale "Stage 1-3."
+- [x] **GPU correctness now has automated coverage**
+      (`tests/test_gpu_render.cpp`, `RunGpuRenderTests`, only
+      built/run with `-DBH_ENABLE_CUDA=ON`): renders a known scene
+      (starfield + disk) on both tracers and checks per-pixel agreement
+      within a loose, regression-catching tolerance. 42 tests total in
+      the CUDA build (38 without).
+- [x] **`kMaxRenderPixels` is now an Advanced-mode slider** ("Max
+      rays/frame (millions)", `App.cpp`), not a hardcoded constant — the
+      1.5M default (`kDefaultMaxRenderPixels`) is unchanged, but a
+      stronger/weaker GPU than the RTX 4070 Ti Super this was tuned on
+      can now adjust it without a rebuild.
+- [x] **Near-radial camera-ray special case now handled in the CUDA
+      kernel** (`cuda/geodesic_kernel.cu`'s `TracePhotonDevice`), mirroring
+      the CPU tracer's linear-r stepping instead of falling through to the
+      b-parametrized path. CPU and GPU tracers no longer have this known
+      gap between them.
+
+Still open:
+
 - [ ] **`docs/images/*.png` predate the Simple/Advanced UI split.** They
       show the old single-panel debug view, not the current default
-      Simple-mode experience. Consider recapturing for the README.
-- [ ] **No automated coverage of `App.cpp` or the CUDA kernel.** All 38
-      tests exercise the CPU physics engine only. GPU correctness is only
-      spot-checked interactively via the compare button. If this project
-      grows, consider a small headless GPU test (render a known scene,
-      check a few pixels) rather than relying on eyeballing screenshots.
-- [ ] **`kMaxRenderPixels = 1,500,000` is a hardcoded constant**, not a UI
-      setting. It was tuned against one GPU (RTX 4070 Ti Super). A much
-      stronger or much weaker machine might want it higher/lower. Worth
-      exposing as an advanced setting if perf complaints keep coming from
-      different hardware.
-- [ ] **The near-radial camera-ray special case is unhandled in the CUDA
-      kernel** (documented in a comment at the top of
-      `cuda/geodesic_kernel.cu`). Affects at most a handful of pixels
-      directly along the camera's exact forward axis; the CPU path
-      handles it correctly. Low priority — visually negligible — but a
-      real, known gap between the two tracers.
+      Simple-mode experience. Attempted to recapture this session by
+      driving the app's preset buttons via synthetic `SendInput`/
+      `mouse_event` clicks — the window receives them (cursor moves,
+      the process is frontmost) but ImGui never registers them as
+      clicks, so the UI state never changes. This reproduces the next
+      bullet's known limitation rather than being a new issue. A plain
+      "Black Hole" default-view screenshot (no preset click needed) was
+      captured successfully and discarded only because it didn't clearly
+      show the lensed shadow (covered by the control panel at that
+      camera angle) — recapturing well still needs a human driving the
+      app, or a deliberate non-default camera framing set via code
+      rather than a UI click.
 - [ ] **UI automation doesn't work reliably in this dev environment**
-      (synthetic mouse clicks on ImGui buttons frequently didn't
-      register during this session, whereas screenshots and keyboard/
-      state-based verification did). Worth knowing before relying on
-      click-driven UI tests here.
+      (confirmed again this session: neither the older `mouse_event`
+      nor the newer `SendInput` Win32 API got a synthetic click to
+      register on an ImGui button, despite the cursor visibly moving and
+      the window being focused/frontmost — screenshots and keyboard/
+      state-based verification did work). Worth knowing before relying
+      on click-driven UI tests or automated screenshot capture here.
 
 ## Build
 
@@ -155,5 +170,6 @@ build_cuda.bat      # adds the GPU tracer (needs CUDA Toolkit 12.6+, tested agai
 ```
 
 Both configs build clean with no warnings (beyond pre-existing, unrelated
-GLM `CMakeLists.txt` deprecation notices) and pass all 38 tests as of this
-handoff.
+GLM `CMakeLists.txt` deprecation notices) as of this handoff. `build.bat`
+passes all 38 tests; `build_cuda.bat` passes all 42 (the extra 4 are the
+automated CPU-vs-GPU render comparison, see above).
