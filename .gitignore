@@ -1,0 +1,20 @@
+# Build output (build.bat / build_cuda.bat), including FetchContent'd
+# third-party sources/build trees (glfw, glm, imgui, glew)
+build/
+build_cuda/
+
+# Crash dumps and runtime logs
+crashdumps/
+*.log
+
+# ImGui window-layout state, regenerated on first run
+imgui.ini
+
+# Claude Code machine-local settings (permissions etc., not shared config)
+.claude/settings.local.json
+
+# Common IDE/editor and Windows cruft
+.vs/
+.vscode/
+*.user
+Thumbs.db

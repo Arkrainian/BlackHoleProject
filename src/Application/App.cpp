@@ -1,0 +1,1349 @@
+#include "App.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <vector>
+
+// GLEW must be included before any header that drags in GL/gl.h (GLFW's
+// glfw3.h among them) -- it's only needed here for the jet piloting mode's
+// modern-GL mesh rendering (see src/Jet/); everything else in this file
+// stays on the legacy fixed-function GL that opengl32.lib exports directly.
+#include <GL/glew.h>
+#include <GLFW/glfw3.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/constants.hpp>
+
+#include <imgui.h>
+#include <backends/imgui_impl_glfw.h>
+#include <backends/imgui_impl_opengl3.h>
+
+#include <chrono>
+
+#include "Astronomy/AccretionDisk.h"
+#include "Astronomy/StarField.h"
+#include "Jet/FlightCamera.h"
+#include "Jet/FlightPhysics.h"
+#include "Jet/InputHandler.h"
+#include "Jet/JetRenderer.h"
+#include "Physics/BlackHole.h"
+#include "Physics/Constants.h"
+#include "Physics/GeodesicSolver.h"
+#include "Physics/NewtonianSimulation.h"
+#include "Physics/Photon.h"
+#include "Physics/SchwarzschildMetric.h"
+#include "RayTracing/CPUTracer.h"
+#ifdef BH_CUDA_AVAILABLE
+#include "RayTracing/CUDATracer.h"
+#endif
+#include "Rendering/Camera.h"
+#include "Rendering/Renderer.h"
+
+using Physics::BlackHole;
+using Physics::GeodesicConfig;
+using Physics::IntegratorMethod;
+using Physics::NewtonianSimulation;
+using Physics::NewtonianSimulationConfig;
+using Physics::ParticleFate;
+using Physics::ParticleSpawnConfig;
+using Physics::ParticleState;
+using Physics::PhotonFate;
+using Physics::PhotonTraceResult;
+using Physics::TracePhoton;
+
+namespace Application {
+
+namespace {
+
+// Method colors used consistently across the trajectory lines, points, and
+// the stats panel, so a color in the plot always means the same integrator.
+glm::vec3 ColorForMethod(IntegratorMethod method) {
+    switch (method) {
+        case IntegratorMethod::Euler: return {0.95f, 0.25f, 0.25f};
+        case IntegratorMethod::VelocityVerlet: return {0.25f, 0.85f, 0.35f};
+        case IntegratorMethod::RK4: return {0.35f, 0.55f, 0.95f};
+    }
+    return {1.0f, 1.0f, 1.0f};
+}
+
+const char* MethodName(IntegratorMethod method) {
+    switch (method) {
+        case IntegratorMethod::Euler: return "Euler";
+        case IntegratorMethod::VelocityVerlet: return "Velocity Verlet";
+        case IntegratorMethod::RK4: return "RK4";
+    }
+    return "?";
+}
+
+// ImGui's C++ API has no native SliderDouble (only SliderFloat/SliderScalar);
+// this wraps SliderScalar so call sites below read like the float version.
+bool SliderDouble(const char* label, double* v, double vMin, double vMax, const char* format = "%.3f") {
+    return ImGui::SliderScalar(label, ImGuiDataType_Double, v, &vMin, &vMax, format);
+}
+
+// Draws a small "(?)" next to the previous control and shows `text` as a
+// plain-language tooltip on hover -- used throughout the Advanced panel so
+// the technical labels (impact parameter, ISCO, redshift, ...) stay precise
+// for a technical reader without being a wall of text for everyone else.
+void HelpTooltip(const char* text) {
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 28.0f);
+        ImGui::TextUnformatted(text);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
+enum class UiMode { Simple, Advanced };
+
+const char* FateName(ParticleFate fate) {
+    switch (fate) {
+        case ParticleFate::ACTIVE: return "active";
+        case ParticleFate::CAPTURED: return "CAPTURED";
+        case ParticleFate::ESCAPED: return "ESCAPED";
+        case ParticleFate::UNRESOLVED: return "UNRESOLVED";
+    }
+    return "?";
+}
+
+const char* PhotonFateName(PhotonFate fate) {
+    switch (fate) {
+        case PhotonFate::ACTIVE: return "active";
+        case PhotonFate::CAPTURED: return "CAPTURED";
+        case PhotonFate::ESCAPED: return "ESCAPED";
+        case PhotonFate::UNRESOLVED: return "UNRESOLVED";
+    }
+    return "?";
+}
+
+// Photon paths are colored by fate rather than by method (there's only one
+// "method" -- the exact Schwarzschild geodesic -- so fate is the
+// interesting dimension to distinguish visually here).
+glm::vec3 ColorForPhotonFate(PhotonFate fate) {
+    switch (fate) {
+        case PhotonFate::ESCAPED: return {0.3f, 0.9f, 0.95f};    // cyan
+        case PhotonFate::CAPTURED: return {0.95f, 0.25f, 0.65f}; // magenta
+        case PhotonFate::UNRESOLVED: return {0.95f, 0.9f, 0.2f}; // yellow -- near b_crit, orbits the photon sphere
+        case PhotonFate::ACTIVE: return {1.0f, 1.0f, 1.0f};
+    }
+    return {1.0f, 1.0f, 1.0f};
+}
+
+// Stage 1 scenario: a "beam" of test particles approaching the black hole
+// from the same starting distance along -x, offset in y by their impact
+// parameter b, all moving in the +x direction at the same speed. Each
+// impact parameter is spawned three times (once per integrator) so their
+// divergence is directly comparable. This mirrors how Stage 2+ will treat
+// photon impact parameters, just under Newtonian gravity for now.
+struct ScenarioParams {
+    int impactParameterCount = 9;
+    double impactParameterMin = 3.0;
+    double impactParameterMax = 15.0;
+    double startDistance = 40.0;
+    double speed = 1.0; // in units of c; 1.0 = "photon-like" (non-relativistic approximation, see UI note)
+};
+
+std::vector<ParticleSpawnConfig> BuildScenario(const ScenarioParams& params) {
+    std::vector<ParticleSpawnConfig> spawns;
+    const int n = std::max(1, params.impactParameterCount);
+    spawns.reserve(static_cast<size_t>(n) * 3);
+
+    for (int i = 0; i < n; ++i) {
+        const double t = n > 1 ? static_cast<double>(i) / (n - 1) : 0.0;
+        const double b = params.impactParameterMin + t * (params.impactParameterMax - params.impactParameterMin);
+
+        ParticleState initial;
+        initial.position = glm::dvec3(-params.startDistance, b, 0.0);
+        initial.velocity = glm::dvec3(params.speed, 0.0, 0.0);
+
+        for (IntegratorMethod method : {IntegratorMethod::Euler, IntegratorMethod::VelocityVerlet, IntegratorMethod::RK4}) {
+            spawns.push_back(ParticleSpawnConfig{initial, method});
+        }
+    }
+    return spawns;
+}
+
+// Stage 2: traces one exact Schwarzschild null geodesic per impact
+// parameter, using the SAME start distance/impact-parameter range as the
+// Newtonian scenario above so the two can be visually overlaid and
+// compared directly -- same starting position and speed (c), the only
+// difference is Newtonian 1/r^2 gravity vs the true geodesic.
+std::vector<PhotonTraceResult> BuildPhotonTraces(const ScenarioParams& params) {
+    std::vector<PhotonTraceResult> traces;
+    const int n = std::max(1, params.impactParameterCount);
+    traces.reserve(n);
+
+    GeodesicConfig config;
+    config.recordPath = true;
+    config.maxPathPoints = 1000;
+    config.escapeRadius = std::max(1.0e4, params.startDistance * 50.0);
+    config.maxSteps = 100000;
+    config.basePhiStep = 0.01;
+
+    for (int i = 0; i < n; ++i) {
+        const double t = n > 1 ? static_cast<double>(i) / (n - 1) : 0.0;
+        const double b = params.impactParameterMin + t * (params.impactParameterMax - params.impactParameterMin);
+
+        const glm::dvec3 origin(-params.startDistance, b, 0.0);
+        const glm::dvec3 direction(1.0, 0.0, 0.0);
+        traces.push_back(TracePhoton(origin, direction, config));
+    }
+    return traces;
+}
+
+// Stage 3: turns the Camera (which the debug 3D view already uses) into the
+// orthonormal frame the per-pixel ray tracer needs. In Orbit mode this
+// always looks at the black hole at the origin -- consistent with every
+// other control in this app, which orbits around it. In FreeFly mode it
+// looks wherever the camera itself is pointed, independent of the origin
+// (see Rendering::Camera::Forward).
+RayTracing::CameraFrame BuildCameraFrame(const Rendering::Camera& camera, int renderWidth, int renderHeight) {
+    const Rendering::Camera::Basis basis = camera.OrthonormalBasis();
+
+    RayTracing::CameraFrame frame;
+    frame.position = camera.Position();
+    frame.forward = basis.forward;
+    frame.right = basis.right;
+    frame.up = basis.up;
+    frame.tanHalfFovY = std::tan(glm::radians(camera.fovYDegrees) * 0.5);
+    frame.aspect = static_cast<double>(renderWidth) / static_cast<double>(renderHeight);
+    return frame;
+}
+
+// The "Resolution" slider is a PERCENTAGE of the window's own framebuffer,
+// which means its actual ray count scales with however large the user's
+// window or monitor happens to be -- on a maximized window at a high
+// resolution, even a modest-looking percentage can add up to several
+// million rays per frame, and frame rate drops accordingly. That isn't a
+// bug in any one feature (it reproduces identically with or without the
+// accretion disk enabled); it's this function forgetting to bound the
+// result. maxRenderPixels caps the traced image at a fixed ray budget
+// regardless of window size, scaling both dimensions down proportionally
+// (preserving aspect ratio, and thus the fix for the earlier "stretched at
+// 1024x1024" bug) so frame rate stays predictable on any monitor.
+// Default of 1.5M rays/frame was tuned against an RTX 4070 Ti Super; exposed
+// as an Advanced-mode setting (see "Max rays/frame" slider) rather than a
+// hardcoded constant so it can be raised or lowered for different hardware.
+constexpr int kDefaultMaxRenderPixels = 1'500'000;
+
+std::pair<int, int> ComputeRenderResolution(int fbWidth, int fbHeight, double scalePercent, int maxRenderPixels) {
+    const double scale = scalePercent / 100.0;
+    int w = std::max(1, static_cast<int>(fbWidth * scale));
+    int h = std::max(1, static_cast<int>(fbHeight * scale));
+
+    const long long pixelCount = static_cast<long long>(w) * h;
+    if (pixelCount > maxRenderPixels) {
+        const double shrink = std::sqrt(static_cast<double>(maxRenderPixels) / static_cast<double>(pixelCount));
+        w = std::max(1, static_cast<int>(w * shrink));
+        h = std::max(1, static_cast<int>(h * shrink));
+    }
+    return {w, h};
+}
+
+// Stage 4: a single distant point source, used for the Einstein ring test.
+// Its direction is always camera.forward -- i.e. it sits on the camera's
+// own viewing axis, beyond the black hole -- so camera/black-hole/source
+// are automatically collinear for ANY orbit position without needing
+// separate alignment controls. This is exactly the "camera -> black hole ->
+// source" configuration the Einstein ring requires; the ring itself is not
+// drawn, it emerges from CPUTracer sampling this function per pixel.
+glm::vec3 SamplePointSource(const glm::dvec3& direction, const glm::dvec3& sourceDirection,
+                             double angularRadius, double brightness) {
+    const double angularDistance = std::acos(glm::clamp(glm::dot(direction, sourceDirection), -1.0, 1.0));
+    if (angularDistance > angularRadius) {
+        return glm::vec3(0.0f);
+    }
+    const double falloff = 1.0 - angularDistance / angularRadius;
+    return glm::vec3(static_cast<float>(brightness * falloff * falloff));
+}
+
+// Stage 4 debug mode: traces a small fan of rays directly from the camera
+// (the SAME origin/basis the Stage 3 renderer uses, not the parallel-beam
+// setup Stage 2's debug view uses) along a vertical scanline through the
+// image center, with full path recording. This is what exposes individual
+// photon paths/impact parameters/deflection angles/closest approach for
+// the actual camera-perspective rays that build the Einstein ring, rather
+// than the flat-beam rays used for the Stage 1/2 comparison plot.
+std::vector<PhotonTraceResult> BuildCameraDebugRays(const RayTracing::CameraFrame& frame, int count) {
+    std::vector<PhotonTraceResult> traces;
+    traces.reserve(count);
+
+    GeodesicConfig config;
+    config.recordPath = true;
+    config.maxPathPoints = 500;
+    config.escapeRadius = 1.0e4;
+    config.maxSteps = 20000;
+    config.basePhiStep = 0.01;
+
+    for (int i = 0; i < count; ++i) {
+        const double t = count > 1 ? static_cast<double>(i) / (count - 1) : 0.5;
+        const double ndcY = (t * 2.0 - 1.0) * frame.tanHalfFovY;
+        const glm::dvec3 direction = glm::normalize(frame.forward + ndcY * frame.up);
+        traces.push_back(TracePhoton(frame.position, direction, config));
+    }
+    return traces;
+}
+
+} // namespace
+
+App::App() {
+    if (!glfwInit()) {
+        std::fprintf(stderr, "Failed to initialize GLFW\n");
+        return;
+    }
+
+    m_window = glfwCreateWindow(1280, 800, "Black Hole Ray-Tracing Simulator", nullptr, nullptr);
+    if (!m_window) {
+        std::fprintf(stderr, "Failed to create GLFW window\n");
+        glfwTerminate();
+        return;
+    }
+
+    glfwMakeContextCurrent(m_window);
+    glfwSwapInterval(1);
+
+    glewExperimental = GL_TRUE; // needed on some drivers to expose core-profile-only entry points via glew's legacy path
+    if (glewInit() != GLEW_OK) {
+        std::fprintf(stderr, "Failed to initialize GLEW -- the jet's mesh rendering will be unavailable\n");
+    }
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(m_window, true);
+    ImGui_ImplOpenGL3_Init("#version 130");
+}
+
+App::~App() {
+    if (m_window) {
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+        glfwDestroyWindow(m_window);
+    }
+    glfwTerminate();
+}
+
+int App::Run() {
+    if (!m_window) {
+        return 1;
+    }
+
+    BlackHole blackHole(10.0); // 10 solar masses by default
+    Rendering::Camera camera;
+    Rendering::Renderer renderer;
+
+    UiMode uiMode = UiMode::Simple;
+    std::string activePreset = "Black Hole"; // which Simple-mode preset is currently framed up
+    double blackHoleMassSolar = blackHole.MassSolarMasses(); // shared by the Simple and Advanced mass sliders
+
+    ScenarioParams scenarioParams;
+    NewtonianSimulationConfig simConfig;
+    simConfig.timeStep = 0.02;
+    simConfig.outerBoundary = 50.0;
+    simConfig.maxSteps = 20000;
+
+    NewtonianSimulation simulation;
+    simulation.Reset(BuildScenario(scenarioParams), simConfig);
+
+    std::vector<PhotonTraceResult> photonTraces = BuildPhotonTraces(scenarioParams);
+
+    bool paused = false;
+    int stepsPerFrame = 2;
+    bool showGrid = true;
+    bool showAnalyticCurve = true;
+    bool showHorizon = true;
+    bool showNewtonianTrajectories = true;
+    bool showPhotonGeodesics = true;
+    bool showPhotonSphere = true;
+    bool showPhotonDebugTable = false;
+
+    // --- Stage 3: gravitational lensing render state ---
+    bool viewLensedRender = true; // start on the rendered black hole, not an empty debug grid
+
+    // The traced image is always rendered at (window size * renderScalePercent/100),
+    // matching the window's own aspect ratio exactly -- rendering a fixed
+    // square buffer (e.g. 1024x1024) and stretching it to fill a
+    // non-square window distorts circles into ellipses, which is exactly
+    // the "stretched" artifact this replaces. 100% = one traced ray per
+    // screen pixel (native resolution); lower values trade resolution for
+    // speed on slower hardware, without ever touching geodesic precision
+    // (see PerformRender -- step budget/angular step are always the same,
+    // full-precision values, whether the camera is moving or not).
+    double renderScalePercent = 80.0; // 10-100 -- full precision is mandatory (see above), so this is the main speed knob
+    int maxRenderPixels = kDefaultMaxRenderPixels; // advanced-mode override of the ray budget cap, see ComputeRenderResolution
+    Astronomy::StarField::Settings starSettings;
+    Astronomy::StarField starField(starSettings);
+    unsigned int lensedTexture = 0;
+    int lensedTextureWidth = 0, lensedTextureHeight = 0;
+    double lastRenderMilliseconds = 0.0;
+    bool needsRerender = true;
+    int fbWidth = 1280, fbHeight = 800; // updated every frame from the actual window framebuffer size
+
+    // Live mode: re-traces the scene from the CURRENT camera every single
+    // frame at FULL precision (same step budget/angular step as a one-off
+    // "final" render always -- see PerformRender), so dragging/orbiting
+    // shows the actual bent light in real time rather than a reduced-
+    // accuracy preview. The cost of that precision is frame rate, not
+    // correctness: renderScale and the GPU toggle are the two knobs that
+    // trade rendered resolution for responsiveness if a scene feels slow.
+    bool liveMode = true;
+    double smoothedFrameMs = 16.0; // exponential moving average, for the FPS readout
+
+    // --- Stage 7: CUDA acceleration ---
+#ifdef BH_CUDA_AVAILABLE
+    const bool cudaCompiledIn = true;
+    const bool cudaDeviceAvailable = RayTracing::CudaAvailable();
+#else
+    const bool cudaCompiledIn = false;
+    const bool cudaDeviceAvailable = false;
+#endif
+    // Always use the GPU when one is available -- no toggle: the CPU path
+    // is dramatically slower for live rendering and there's no reason to
+    // let it be selected by accident. Only ever falls back to CPU when no
+    // CUDA device exists at all (or this build wasn't compiled with CUDA).
+    const bool useGpu = cudaDeviceAvailable;
+    bool lastRenderWasGpu = false;
+    std::string cpuVsGpuReport;
+
+    // --- Stage 4: Einstein ring test state ---
+    bool useEinsteinRingSource = false;
+    double sourceAngularRadius = 0.01; // radians
+    double sourceBrightness = 3.0;
+    bool showCameraDebugRays = false;
+    int cameraDebugRayCount = 21;
+    std::vector<PhotonTraceResult> cameraDebugRays;
+
+    // --- Stage 6: accretion disk state ---
+    bool diskEnabled = false;
+    Astronomy::AccretionDiskSettings diskSettings;
+    Astronomy::AccretionDisk accretionDisk(diskSettings);
+
+    double lastMouseX = 0.0, lastMouseY = 0.0;
+    bool dragging = false;
+
+    // --- Free-fly camera state ---
+    // Free-fly movement needs an actual wall-clock frame delta (not
+    // lastRenderMilliseconds, which measures ray-tracer cost and is only
+    // known partway through the loop) so speed stays constant regardless of
+    // frame rate.
+    double lastFrameTime = glfwGetTime();
+    double freeFlyMoveSpeed = 12.0; // sim units/sec at 1x -- Shift multiplies this
+    bool freeFlyLooking = false;    // right mouse button held
+    Rendering::Camera::Mode previousCameraMode = camera.mode; // detects a mode switch this frame, to avoid a mouse-delta jump
+
+    // --- Jet piloting mode (see src/Jet/) ---
+    // Spawned well outside the disk/photon sphere, matching the scale the
+    // Orbit/FreeFly presets already use, so the black hole is immediately
+    // visible without the jet starting dangerously close to the horizon.
+    const glm::vec3 jetSpawnPosition(0.0f, 15.0f, 180.0f);
+    Jet::FlightPhysics jetPhysics(jetSpawnPosition);
+    Jet::InputHandler jetInput;
+    Jet::FlightCamera jetFlightCamera;
+    Jet::JetRenderer jetRenderer;
+    bool jetRendererLoadAttempted = false; // load lazily on first use, see PerformRender's sibling below
+    bool jetMouseCaptured = true; // Tab toggles this while piloting, see the Jet input block
+    bool jetTabWasDown = false;   // edge-detects the Tab press above (GLFW has no "just pressed" query)
+    bool jetCameraCycleKeyWasDown = false; // edge-detects the C press that cycles chase/cockpit view
+
+#ifdef BH_CUDA_AVAILABLE
+    if (cudaDeviceAvailable) {
+        // A CUDA context's first-ever kernel launch in a process pays a
+        // one-time driver/context initialization cost (observed ~150ms on
+        // this machine) that has nothing to do with the tracer's actual
+        // throughput. Absorbing that cost here, before the user's first
+        // real render, keeps the in-UI GPU timing meaningful instead of
+        // making the first click look misleadingly slow.
+        RayTracing::RenderSettings warmup;
+        warmup.width = 4;
+        warmup.height = 4;
+        RayTracing::CameraFrame warmupFrame;
+        warmupFrame.position = glm::dvec3(0.0, 0.0, 30.0);
+        (void)RayTracing::RenderImageCUDA(warmupFrame, warmup, [](const glm::dvec3&) { return glm::vec3(0.0f); });
+    }
+#endif
+
+    // Performs one lensed render using whatever the current UI state is
+    // (camera, resolution scale, disk/Einstein-ring settings, CPU/GPU
+    // choice) and uploads the result. Defined once here (not inlined at
+    // each call site) so BOTH the Simple-mode presets (which just flip
+    // flags and rely on the automatic trigger below) and the Advanced
+    // "Render" button actually produce an image -- earlier this logic
+    // lived only inside the Advanced panel's UI code, so Simple-mode
+    // presets silently never rendered anything.
+    //
+    // Always full geodesic precision (maxSteps/basePhiStep never change
+    // whether the camera is moving or still) -- resolution/frame rate is
+    // the only thing renderScale and the GPU toggle trade off, never the
+    // accuracy of the light paths themselves.
+    const auto PerformRender = [&]() {
+        const auto [w, h] = ComputeRenderResolution(fbWidth, fbHeight, renderScalePercent, maxRenderPixels);
+
+        RayTracing::RenderSettings renderSettings;
+        renderSettings.width = w;
+        renderSettings.height = h;
+        renderSettings.geodesicConfig.escapeRadius = 1.0e4;
+        renderSettings.geodesicConfig.maxSteps = 8000;
+        renderSettings.geodesicConfig.basePhiStep = 0.015;
+        renderSettings.geodesicConfig.checkDisk = diskEnabled;
+        renderSettings.geodesicConfig.diskInnerRadius = diskSettings.innerRadius;
+        renderSettings.geodesicConfig.diskOuterRadius = diskSettings.outerRadius;
+        renderSettings.geodesicConfig.diskClockwise = diskSettings.clockwise;
+
+        const RayTracing::CameraFrame frame = BuildCameraFrame(camera, w, h);
+        const glm::dvec3 sourceDirection = frame.forward; // Stage 4: always collinear, see SamplePointSource
+
+        starField.SetSettings(starSettings);
+        const RayTracing::BackgroundSampler background =
+            useEinsteinRingSource
+                ? RayTracing::BackgroundSampler([&](const glm::dvec3& dir) {
+                      return SamplePointSource(dir, sourceDirection, sourceAngularRadius, sourceBrightness);
+                  })
+                : RayTracing::BackgroundSampler([&](const glm::dvec3& dir) { return starField.Sample(dir); });
+
+        accretionDisk.SetSettings(diskSettings);
+        const RayTracing::DiskSampler diskSampler = [&](const PhotonTraceResult& hit) {
+            const double emittedTemperature = accretionDisk.Temperature(hit.diskHitRadius);
+            const double observedTemperature =
+                diskSettings.relativisticEffects ? emittedTemperature * hit.diskRedshiftFactor : emittedTemperature;
+            return accretionDisk.EmittedColor(observedTemperature);
+        };
+
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<glm::vec3> pixels;
+#ifdef BH_CUDA_AVAILABLE
+        if (useGpu && cudaDeviceAvailable) {
+            pixels = RayTracing::RenderImageCUDA(frame, renderSettings, background, diskSampler);
+        } else
+#endif
+        {
+            pixels = RayTracing::RenderImage(frame, renderSettings, background, diskSampler);
+        }
+        const auto t1 = std::chrono::steady_clock::now();
+        lastRenderMilliseconds = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        lastRenderWasGpu = useGpu && cudaDeviceAvailable;
+
+        lensedTexture = renderer.UploadImage(pixels, w, h, lensedTexture);
+        lensedTextureWidth = w;
+        lensedTextureHeight = h;
+    };
+
+    while (!glfwWindowShouldClose(m_window)) {
+        glfwPollEvents();
+
+        const double now = glfwGetTime();
+        const double dt = std::clamp(now - lastFrameTime, 0.0, 0.1); // clamp guards against a huge dt after a stall/breakpoint
+        lastFrameTime = now;
+
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        const bool cameraModeJustChanged = (camera.mode != previousCameraMode);
+        previousCameraMode = camera.mode;
+
+        const ImGuiIO& io = ImGui::GetIO();
+        if (camera.mode == Rendering::Camera::Mode::Jet) {
+            // --- Jet piloting controls: continuous mouse-look by default ---
+            // (cursor hidden/captured, mouse acts as a virtual joystick,
+            // matching the source project's HOTAS-style control feel), WASD
+            // pitch/roll, Q/E yaw, Shift/Space for thrust. Tab toggles the
+            // cursor free so the ImGui panel (camera-view switch, etc.) can
+            // be clicked without leaving Jet mode -- flight keyboard
+            // controls keep working either way, only mouse-look pauses.
+            // See Jet::InputHandler/Jet::FlightPhysics.
+            if (cameraModeJustChanged) {
+                jetMouseCaptured = true;
+            }
+            const bool tabDown = glfwGetKey(m_window, GLFW_KEY_TAB) == GLFW_PRESS;
+            if (tabDown && !jetTabWasDown) {
+                jetMouseCaptured = !jetMouseCaptured;
+            }
+            jetTabWasDown = tabDown;
+
+            // C cycles Chase/Cockpit view, same key as the source project.
+            const bool cDown = !io.WantCaptureKeyboard && glfwGetKey(m_window, GLFW_KEY_C) == GLFW_PRESS;
+            if (cDown && !jetCameraCycleKeyWasDown) {
+                jetFlightCamera.CycleMode();
+            }
+            jetCameraCycleKeyWasDown = cDown;
+
+            glfwSetInputMode(m_window, GLFW_CURSOR, jetMouseCaptured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+            freeFlyLooking = false;
+
+            double mx, my;
+            glfwGetCursorPos(m_window, &mx, &my);
+            if (jetMouseCaptured && !cameraModeJustChanged && !io.WantCaptureMouse) {
+                jetInput.ProcessMouse(static_cast<float>(mx - lastMouseX), static_cast<float>(my - lastMouseY),
+                                       jetPhysics, static_cast<float>(dt));
+            }
+            lastMouseX = mx;
+            lastMouseY = my;
+
+            if (!io.WantCaptureKeyboard) {
+                jetInput.ProcessKeyboard(m_window, jetPhysics, static_cast<float>(dt));
+            }
+
+            jetPhysics.Update(static_cast<float>(dt));
+            if (jetPhysics.capturedByBlackHole) {
+                jetPhysics.Reset(jetSpawnPosition);
+            }
+
+            jetFlightCamera.Update(jetPhysics.position, jetPhysics.rotation, static_cast<float>(dt));
+            camera.jetPosition = glm::dvec3(jetFlightCamera.position);
+            camera.jetForward = glm::dvec3(glm::normalize(jetFlightCamera.target - jetFlightCamera.position));
+            camera.jetUp = glm::dvec3(jetFlightCamera.up);
+        } else if (camera.mode == Rendering::Camera::Mode::Orbit) {
+            // --- Orbit controls: mouse drag = orbit, scroll = zoom, ---
+            // only active when ImGui isn't consuming the mouse.
+            freeFlyLooking = false;
+            glfwSetInputMode(m_window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+
+            if (!io.WantCaptureMouse) {
+                double mx, my;
+                glfwGetCursorPos(m_window, &mx, &my);
+                const bool leftDown = glfwGetMouseButton(m_window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+
+                if (leftDown && !dragging) {
+                    dragging = true;
+                } else if (leftDown && dragging) {
+                    camera.yawRadians += (mx - lastMouseX) * 0.01;
+                    camera.pitchRadians = std::clamp(camera.pitchRadians - (my - lastMouseY) * 0.01, -1.5, 1.5);
+                } else {
+                    dragging = false;
+                }
+                lastMouseX = mx;
+                lastMouseY = my;
+
+                camera.distance = std::clamp(camera.distance - io.MouseWheel * 2.0, 5.0, 300.0);
+            }
+        } else {
+            // --- Free-fly controls: hold right mouse button to look ---
+            // around, WASD to move, Space/Ctrl for up/down, Shift to move
+            // faster. Cursor is only captured/hidden while actually
+            // looking, so ImGui panels stay fully usable otherwise.
+            double mx, my;
+            glfwGetCursorPos(m_window, &mx, &my);
+            const bool rightDown = !io.WantCaptureMouse &&
+                                    glfwGetMouseButton(m_window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+
+            if (rightDown) {
+                if (freeFlyLooking) {
+                    camera.freeFlyYawRadians += (mx - lastMouseX) * 0.005;
+                    camera.freeFlyPitchRadians =
+                        std::clamp(camera.freeFlyPitchRadians - (my - lastMouseY) * 0.005, -1.5, 1.5);
+                }
+                freeFlyLooking = true;
+                glfwSetInputMode(m_window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+            } else {
+                freeFlyLooking = false;
+                glfwSetInputMode(m_window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+            }
+            lastMouseX = mx;
+            lastMouseY = my;
+
+            if (!io.WantCaptureKeyboard) {
+                const Rendering::Camera::Basis basis = camera.OrthonormalBasis();
+                double speed = freeFlyMoveSpeed * dt;
+                if (glfwGetKey(m_window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS) {
+                    speed *= 4.0;
+                }
+                if (glfwGetKey(m_window, GLFW_KEY_W) == GLFW_PRESS) camera.freeFlyPosition += basis.forward * speed;
+                if (glfwGetKey(m_window, GLFW_KEY_S) == GLFW_PRESS) camera.freeFlyPosition -= basis.forward * speed;
+                if (glfwGetKey(m_window, GLFW_KEY_A) == GLFW_PRESS) camera.freeFlyPosition -= basis.right * speed;
+                if (glfwGetKey(m_window, GLFW_KEY_D) == GLFW_PRESS) camera.freeFlyPosition += basis.right * speed;
+                if (glfwGetKey(m_window, GLFW_KEY_SPACE) == GLFW_PRESS) camera.freeFlyPosition.y += speed;
+                if (glfwGetKey(m_window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS) camera.freeFlyPosition.y -= speed;
+            }
+        }
+
+        glfwGetFramebufferSize(m_window, &fbWidth, &fbHeight);
+
+        // --- ImGui control panel ---
+        ImGui::SetNextWindowSize(ImVec2(430, 0), ImGuiCond_FirstUseEver);
+        ImGui::Begin("Black Hole Simulator");
+
+        // --- Mode switcher: Simple (presets, plain language) vs Advanced ---
+        // (the full Stage 1-7 scientific control panel, unchanged below).
+        {
+            const float fullWidth = ImGui::GetContentRegionAvail().x;
+            const float halfWidth = (fullWidth - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+
+            if (uiMode == UiMode::Simple) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
+            }
+            if (ImGui::Button("Simple", ImVec2(halfWidth, 0))) uiMode = UiMode::Simple;
+            if (uiMode == UiMode::Simple) ImGui::PopStyleColor();
+
+            ImGui::SameLine();
+            if (uiMode == UiMode::Advanced) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
+            }
+            if (ImGui::Button("Advanced (all controls)", ImVec2(halfWidth, 0))) uiMode = UiMode::Advanced;
+            if (uiMode == UiMode::Advanced) ImGui::PopStyleColor();
+        }
+        ImGui::Separator();
+
+        // --- Camera mode: Orbit (locked onto the black hole, what every ---
+        // preset/scientific control assumes) vs FreeFly (noclip fly-around)
+        // vs Jet (pilot a fighter jet, with real thrust/drag/gravity -- see
+        // src/Jet/).
+        {
+            const float fullWidth = ImGui::GetContentRegionAvail().x;
+            const float thirdWidth = (fullWidth - 2.0f * ImGui::GetStyle().ItemSpacing.x) / 3.0f;
+            const bool isOrbit = camera.mode == Rendering::Camera::Mode::Orbit;
+            const bool isFreeFly = camera.mode == Rendering::Camera::Mode::FreeFly;
+            const bool isJet = camera.mode == Rendering::Camera::Mode::Jet;
+
+            if (isOrbit) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
+            if (ImGui::Button("Orbit Camera", ImVec2(thirdWidth, 0))) camera.mode = Rendering::Camera::Mode::Orbit;
+            if (isOrbit) ImGui::PopStyleColor();
+
+            ImGui::SameLine();
+            if (isFreeFly) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
+            if (ImGui::Button("Free-Fly Camera", ImVec2(thirdWidth, 0))) {
+                if (isOrbit) {
+                    // Start free-flying from wherever the orbit camera
+                    // currently is, looking at the black hole, so switching
+                    // modes doesn't jar the view. Orbit's Forward() is
+                    // -Position() (i.e. yaw/pitch rotated 180 degrees from
+                    // FreeFly's own yaw/pitch convention), so the angles
+                    // need that same flip here, not a direct copy.
+                    camera.freeFlyPosition = camera.Position();
+                    camera.freeFlyYawRadians = camera.yawRadians + glm::pi<double>();
+                    camera.freeFlyPitchRadians = -camera.pitchRadians;
+                }
+                camera.mode = Rendering::Camera::Mode::FreeFly;
+            }
+            if (isFreeFly) ImGui::PopStyleColor();
+
+            ImGui::SameLine();
+            if (isJet) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
+            if (ImGui::Button("Pilot Jet", ImVec2(thirdWidth, 0))) {
+                if (!jetRendererLoadAttempted) {
+                    jetRendererLoadAttempted = true;
+                    if (!jetRenderer.Load("resources/jet/su57.glb", "resources/jet/su57_basecolor.png", 3.0f)) {
+                        std::fprintf(stderr, "Jet mode: model/texture failed to load -- piloting still works, but the jet won't be visible.\n");
+                    }
+                }
+                // The jet is only ever drawn/tracked in the ray-traced view
+                // (see the composite draw below) -- force it on so clicking
+                // this button always shows the jet, even if the debug 3D
+                // view (e.g. from the "Newtonian vs Einstein" preset) was
+                // showing instead.
+                viewLensedRender = true;
+                needsRerender = true;
+                jetMouseCaptured = true;
+
+                // Always start from a clean, known-good flight state --
+                // without this, re-entering Jet mode after the jet drifted
+                // far away (or was reset by falling into the black hole)
+                // kept whatever position/velocity/camera-smoothing state it
+                // last had, which could look like "the camera isn't
+                // following the jet" if that state was bad.
+                jetPhysics.Reset(jetSpawnPosition);
+                jetFlightCamera = Jet::FlightCamera();
+
+                // Compute the camera's first frame synchronously (rather
+                // than waiting for next frame's top-of-loop input block) so
+                // there's no one-frame glitch where camera.jetPosition still
+                // holds its stale default (the origin -- i.e. inside the
+                // black hole) before this mode's own update code has run.
+                jetFlightCamera.Update(jetPhysics.position, jetPhysics.rotation, 0.0f);
+                camera.jetPosition = glm::dvec3(jetFlightCamera.position);
+                camera.jetForward = glm::dvec3(glm::normalize(jetFlightCamera.target - jetFlightCamera.position));
+                camera.jetUp = glm::dvec3(jetFlightCamera.up);
+                camera.mode = Rendering::Camera::Mode::Jet;
+            }
+            if (isJet) ImGui::PopStyleColor();
+
+            if (isFreeFly) {
+                ImGui::TextDisabled("WASD to move, hold Right Mouse to look, Space/Ctrl for up/down, Shift to go faster.");
+            } else if (isJet) {
+                ImGui::TextDisabled("Mouse to look (virtual joystick), WASD pitch/roll, Q/E yaw, Shift/Space thrust, Shift+W afterburner, C to cycle camera view, Tab to free the cursor.");
+                if (ImGui::Button(jetFlightCamera.mode == Jet::FlightCameraMode::Chase ? "Switch to Cockpit View" : "Switch to Chase View")) {
+                    jetFlightCamera.CycleMode();
+                }
+                ImGui::Text("Speed: %.0f sim units/s   G: %.1f (peak %.1f)", jetPhysics.GetSpeed(), jetPhysics.currentGForce, jetPhysics.peakGForce);
+                ImGui::TextDisabled("Jet pos: (%.1f, %.1f, %.1f)   Camera pos: (%.1f, %.1f, %.1f)",
+                                     jetPhysics.position.x, jetPhysics.position.y, jetPhysics.position.z,
+                                     camera.jetPosition.x, camera.jetPosition.y, camera.jetPosition.z);
+            }
+        }
+        ImGui::Separator();
+
+        if (uiMode == UiMode::Simple) {
+            ImGui::TextWrapped("Explore how a black hole bends light. Pick a scene below, then drag to look around.");
+            ImGui::Dummy(ImVec2(0, 4));
+
+            // --- Preset scenes: each sets up camera + scene flags and ---
+            // triggers a render, so one click is a complete demonstration.
+            struct Preset {
+                const char* name;
+                const char* blurb;
+            };
+            static const Preset presets[] = {
+                {"Black Hole", "A star field lensed around the shadow -- the baseline view."},
+                {"Einstein Ring", "A light source hidden exactly behind the black hole, bent into a ring."},
+                {"Accretion Disk", "A glowing disk of matter, its far side visibly wrapped around the shadow."},
+                {"Newtonian vs Einstein", "Old-physics vs. real-physics light paths, side by side."},
+            };
+
+            const float presetWidth = ImGui::GetContentRegionAvail().x;
+            for (const Preset& preset : presets) {
+                const bool isActive = activePreset == preset.name;
+                if (isActive) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
+                const bool clicked = ImGui::Button(preset.name, ImVec2(presetWidth, 32));
+                if (isActive) ImGui::PopStyleColor();
+                ImGui::TextWrapped("%s", preset.blurb);
+                ImGui::Dummy(ImVec2(0, 6));
+
+                if (clicked) {
+                    activePreset = preset.name;
+                    diskEnabled = false;
+                    useEinsteinRingSource = false;
+                    showCameraDebugRays = false;
+                    // Presets are all framed as Orbit shots (several rely on
+                    // the camera pointing at the origin, e.g. the Einstein
+                    // Ring's source-alignment) -- picking one always returns
+                    // to Orbit mode even if the user was free-flying.
+                    camera.mode = Rendering::Camera::Mode::Orbit;
+
+                    if (std::string(preset.name) == "Black Hole") {
+                        viewLensedRender = true;
+                        camera.distance = 30.0;
+                        camera.pitchRadians = 0.3;
+                    } else if (std::string(preset.name) == "Einstein Ring") {
+                        viewLensedRender = true;
+                        useEinsteinRingSource = true;
+                        sourceAngularRadius = 0.008;
+                        camera.distance = 220.0;
+                        camera.pitchRadians = 0.0;
+                    } else if (std::string(preset.name) == "Accretion Disk") {
+                        viewLensedRender = true;
+                        diskEnabled = true;
+                        camera.distance = 45.0;
+                        camera.pitchRadians = 0.35;
+                    } else if (std::string(preset.name) == "Newtonian vs Einstein") {
+                        viewLensedRender = false;
+                        showNewtonianTrajectories = true;
+                        showPhotonGeodesics = true;
+                        showGrid = true;
+                        showAnalyticCurve = true;
+                        camera.distance = 60.0;
+                        camera.pitchRadians = 0.3;
+                    }
+                    needsRerender = true;
+                }
+            }
+
+            if (viewLensedRender) {
+                ImGui::Separator();
+
+                const double fps = smoothedFrameMs > 0.0 ? 1000.0 / smoothedFrameMs : 0.0;
+                const ImVec4 fpsColor = fps >= 24.0 ? ImVec4(0.4f, 0.9f, 0.4f, 1.0f)
+                                        : fps >= 10.0 ? ImVec4(0.95f, 0.8f, 0.2f, 1.0f)
+                                                       : ImVec4(0.95f, 0.35f, 0.3f, 1.0f);
+                ImGui::TextColored(fpsColor, "%.0f fps", fps);
+                ImGui::SameLine();
+                ImGui::TextDisabled("(%d x %d, full precision, re-traced every frame)", lensedTextureWidth, lensedTextureHeight);
+
+                SliderDouble("Resolution", &renderScalePercent, 10.0, 100.0, "%.0f%%");
+                ImGui::TextWrapped("Lower resolution = faster. This never reduces the physics precision -- only how many rays are traced.");
+#ifdef BH_CUDA_AVAILABLE
+                if (cudaDeviceAvailable) {
+                    ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "GPU (CUDA) active");
+                } else {
+                    ImGui::TextDisabled("No CUDA GPU found -- running on CPU. Try a lower resolution if it feels slow.");
+                }
+#else
+                ImGui::TextDisabled("Running on CPU (built without CUDA). Try a lower resolution if it feels slow.");
+#endif
+            }
+
+            if (SliderDouble("Black hole mass (solar masses)", &blackHoleMassSolar, 1.0, 1.0e9, "%.2e")) {
+                blackHole.SetMassSolarMasses(blackHoleMassSolar);
+            }
+
+            ImGui::TextWrapped("Tip: drag with the left mouse button to look around -- the light bends in real time as you move. Scroll to zoom.");
+            if (ImGui::Button("Show every control (Advanced mode)")) {
+                uiMode = UiMode::Advanced;
+            }
+        } // uiMode == Simple
+
+        bool scenarioChanged = false;
+
+        if (uiMode == UiMode::Advanced) {
+        ImGui::TextWrapped(
+            "Stage 1 (Newtonian, red/green/blue): 1/r^2 gravity integrated "
+            "three ways -- Euler, Verlet, RK4 -- against the exact analytic "
+            "Kepler orbit, showing each method's error and stability. "
+            "Stage 2 (Schwarzschild, cyan/magenta/yellow): the SAME impact "
+            "parameters traced as exact null geodesics through curved "
+            "spacetime instead. Compare the two directly -- the Newtonian "
+            "curve is not how light actually bends near a black hole.");
+
+        if (ImGui::CollapsingHeader("Black Hole", ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (SliderDouble("Mass (solar masses)", &blackHoleMassSolar, 1.0, 1.0e9, "%.3e")) {
+                blackHole.SetMassSolarMasses(blackHoleMassSolar);
+            }
+            HelpTooltip("How much mass the black hole has, in units of our Sun's mass. Heavier = larger Schwarzschild radius, but the SHAPE of everything you see stays the same (it's all scale-invariant) -- only the physical size in kilometers changes.");
+            ImGui::Text("Schwarzschild radius r_s = 2GM/c^2 = %.3e km", blackHole.SchwarzschildRadiusMeters() / 1000.0);
+            ImGui::Text("(In simulation units, r_s is always exactly 2.0 -- see Physics/Constants.h)");
+        }
+
+        if (ImGui::CollapsingHeader("Scenario", ImGuiTreeNodeFlags_DefaultOpen)) {
+            scenarioChanged |= ImGui::SliderInt("Impact parameter count", &scenarioParams.impactParameterCount, 1, 20);
+            HelpTooltip("The 'impact parameter' is how far off-center a ray of light starts -- like the distance between a thrown ball's path and a goalpost it's aimed near. A small impact parameter passes close to the black hole (more bending, possibly captured); a large one passes far away (barely bent).");
+            scenarioChanged |= SliderDouble("Impact parameter min (b)", &scenarioParams.impactParameterMin, 0.5, 20.0);
+            scenarioChanged |= SliderDouble("Impact parameter max (b)", &scenarioParams.impactParameterMax, 0.5, 30.0);
+            scenarioChanged |= SliderDouble("Start distance", &scenarioParams.startDistance, 10.0, 100.0);
+            scenarioChanged |= SliderDouble("Particle speed (c)", &scenarioParams.speed, 0.05, 1.0);
+            ImGui::TextWrapped(
+                "Note: speed = 1.0c under NEWTONIAN gravity is NOT how real "
+                "light behaves -- this is the classical (pre-GR) baseline, "
+                "included specifically so Stage 2's relativistic result can "
+                "be shown to differ from it.");
+        }
+
+        if (ImGui::CollapsingHeader("Integration", ImGuiTreeNodeFlags_DefaultOpen)) {
+            scenarioChanged |= SliderDouble("Timestep dt", &simConfig.timeStep, 0.001, 0.1, "%.4f");
+            ImGui::SliderInt("Steps per frame", &stepsPerFrame, 1, 20);
+            ImGui::Checkbox("Paused", &paused);
+            if (ImGui::Button("Reset Scenario")) {
+                scenarioChanged = true;
+            }
+        }
+
+        ImGui::Checkbox("Show grid", &showGrid);
+        ImGui::Checkbox("Show analytic Kepler reference", &showAnalyticCurve);
+        ImGui::Checkbox("Show black hole horizon", &showHorizon);
+        ImGui::Checkbox("Show Newtonian trajectories (Stage 1)", &showNewtonianTrajectories);
+        ImGui::Checkbox("Show Schwarzschild photon geodesics (Stage 2)", &showPhotonGeodesics);
+        ImGui::Checkbox("Show photon sphere (r = 1.5 r_s)", &showPhotonSphere);
+        HelpTooltip("The photon sphere is a razor's-edge orbit where light can (in theory) circle the black hole forever. It's larger than the black hole itself -- get closer than this and light can no longer escape.");
+
+        if (scenarioChanged) {
+            simulation.Reset(BuildScenario(scenarioParams), simConfig);
+            photonTraces = BuildPhotonTraces(scenarioParams);
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Validation: numerical vs analytic Kepler orbit");
+        {
+            std::array<double, 3> maxErrorByMethod{0.0, 0.0, 0.0};
+            std::array<int, 3> countByMethod{0, 0, 0};
+            std::array<std::array<int, 4>, 3> fateCounts{}; // [method][fate]
+
+            for (const auto& p : simulation.Particles()) {
+                const int mi = static_cast<int>(p.method);
+                maxErrorByMethod[mi] = std::max(maxErrorByMethod[mi], p.maxRadialError);
+                countByMethod[mi]++;
+                fateCounts[mi][static_cast<int>(p.fate)]++;
+            }
+
+            for (int mi = 0; mi < 3; ++mi) {
+                const auto method = static_cast<IntegratorMethod>(mi);
+                const glm::vec3 c = ColorForMethod(method);
+                ImGui::TextColored(ImVec4(c.r, c.g, c.b, 1.0f), "%s", MethodName(method));
+                ImGui::SameLine();
+                ImGui::Text(" max |r_numeric - r_analytic| = %.5f  (n=%d, active=%d, captured=%d, escaped=%d, unresolved=%d)",
+                            maxErrorByMethod[mi], countByMethod[mi],
+                            fateCounts[mi][static_cast<int>(ParticleFate::ACTIVE)],
+                            fateCounts[mi][static_cast<int>(ParticleFate::CAPTURED)],
+                            fateCounts[mi][static_cast<int>(ParticleFate::ESCAPED)],
+                            fateCounts[mi][static_cast<int>(ParticleFate::UNRESOLVED)]);
+            }
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Stage 2: Schwarzschild photon geodesics (exact, not an approximation)");
+        {
+            int escaped = 0, captured = 0, unresolved = 0;
+            for (const auto& p : photonTraces) {
+                if (p.fate == PhotonFate::ESCAPED) ++escaped;
+                else if (p.fate == PhotonFate::CAPTURED) ++captured;
+                else if (p.fate == PhotonFate::UNRESOLVED) ++unresolved;
+            }
+            ImGui::Text("Critical impact parameter b_crit = 3*sqrt(3) GM/c^2 = %.4f (sim units)",
+                        BlackHole::CriticalImpactParameterSim());
+            ImGui::Text("n=%d  escaped=%d  captured=%d  unresolved(near photon sphere)=%d",
+                        static_cast<int>(photonTraces.size()), escaped, captured, unresolved);
+            ImGui::Checkbox("Show per-ray debug table", &showPhotonDebugTable);
+
+            if (showPhotonDebugTable && ImGui::BeginTable("PhotonDebugTable", 5,
+                    ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                ImGui::TableSetupColumn("b");
+                ImGui::TableSetupColumn("fate");
+                ImGui::TableSetupColumn("closest approach");
+                ImGui::TableSetupColumn("deflection (rad)");
+                ImGui::TableSetupColumn("steps");
+                ImGui::TableHeadersRow();
+                for (const auto& p : photonTraces) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("%.3f", p.impactParameter);
+                    ImGui::TableSetColumnIndex(1);
+                    const glm::vec3 c = ColorForPhotonFate(p.fate);
+                    ImGui::TextColored(ImVec4(c.r, c.g, c.b, 1.0f), "%s", PhotonFateName(p.fate));
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::Text("%.4f", p.closestApproach);
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::Text("%.5f", p.totalDeflectionAngle);
+                    ImGui::TableSetColumnIndex(4);
+                    ImGui::Text("%d", p.steps);
+                }
+                ImGui::EndTable();
+            }
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Stage 3: Gravitational Lensing (backward ray tracing)");
+        {
+            ImGui::Checkbox("Show lensed render instead of debug view", &viewLensedRender);
+            ImGui::SameLine();
+            ImGui::Checkbox("Live (re-trace every frame)", &liveMode);
+            if (viewLensedRender) {
+                ImGui::SameLine();
+                if (liveMode) {
+                    const double fps = smoothedFrameMs > 0.0 ? 1000.0 / smoothedFrameMs : 0.0;
+                    ImGui::TextDisabled("(%.0f fps)", fps);
+                } else {
+                    ImGui::TextDisabled("(paused -- use Render or a slider change to update)");
+                }
+            }
+
+            SliderDouble("Resolution", &renderScalePercent, 10.0, 100.0, "%.0f%%");
+            ImGui::SameLine();
+            {
+                const auto [previewW, previewH] = ComputeRenderResolution(fbWidth, fbHeight, renderScalePercent, maxRenderPixels);
+                ImGui::TextDisabled("(%d x %d px, aspect-matched, capped at %.1fM rays/frame)", previewW, previewH,
+                                     maxRenderPixels / 1.0e6);
+            }
+            HelpTooltip("Percentage of the window's actual pixel count to trace, capped at a fixed ray budget so frame rate stays predictable no matter how large your window or monitor is. Lower = faster, never less accurate -- geodesic precision (step budget) is always full regardless of this setting.");
+            {
+                double maxRenderPixelsM = maxRenderPixels / 1.0e6;
+                if (SliderDouble("Max rays/frame (millions)", &maxRenderPixelsM, 0.1, 8.0, "%.1fM")) {
+                    maxRenderPixels = std::max(1, static_cast<int>(maxRenderPixelsM * 1.0e6));
+                }
+                HelpTooltip("Hard cap on how many rays are traced per frame, regardless of the Resolution slider or window size. Tuned by default (1.5M) against a mid-high-end consumer GPU (RTX 4070 Ti Super) -- raise it on a faster machine for more detail, or lower it on a slower one to keep frame rate up.");
+            }
+            SliderDouble("Camera FOV (deg)", &camera.fovYDegrees, 10.0, 120.0, "%.1f");
+
+            {
+                // Stage 5: the shadow's apparent angular size is NOT the
+                // horizon's angular size -- shown here quantitatively for
+                // the camera's current distance (see test_shadow.cpp for
+                // the derivation and numeric validation).
+                const double r0 = camera.distance;
+                const double rs = BlackHole::SchwarzschildRadiusSim();
+                const double lapse = Physics::Schwarzschild::LapseFactor(r0, rs);
+                const double shadowAngleDeg = glm::degrees(std::asin(std::clamp(
+                    BlackHole::CriticalImpactParameterSim() * std::sqrt(lapse) / r0, -1.0, 1.0)));
+                const double horizonAngleDeg = glm::degrees(std::asin(std::clamp(rs / r0, -1.0, 1.0)));
+                ImGui::Text("At this distance: shadow angular radius = %.2f deg  (horizon's OWN angular size = %.2f deg -- not the same thing)",
+                            shadowAngleDeg, horizonAngleDeg);
+            }
+            needsRerender |= SliderDouble("Star density", &starSettings.density, 0.0, 0.35, "%.4f");
+            needsRerender |= SliderDouble("Star brightness", &starSettings.brightness, 0.0, 4.0, "%.2f");
+            starField.SetSettings(starSettings);
+
+            ImGui::TextWrapped(
+                "Each pixel below is one photon traced BACKWARD from the "
+                "camera through curved spacetime via the same GeodesicSolver "
+                "as Stage 2's paths -- wherever a ray escapes, it samples "
+                "the starfield in that escape direction; wherever it's "
+                "captured or unresolved, the pixel is black (the shadow). "
+                "In Live mode this re-traces every frame, so orbiting the "
+                "camera shows the light bending in real time.");
+
+            if (cudaCompiledIn) {
+                if (cudaDeviceAvailable) {
+                    ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "GPU (CUDA) active -- always used when available, no CPU fallback toggle.");
+                } else {
+                    ImGui::TextDisabled("Compiled with CUDA, but no CUDA device found -- running on CPU.");
+                }
+            } else {
+                ImGui::TextDisabled("GPU (CUDA): not compiled in this build (configure with -DBH_ENABLE_CUDA=ON)");
+            }
+
+            if (ImGui::Button(liveMode ? "Render Now (force refresh)" : "Render Now")) {
+                PerformRender();
+                needsRerender = false;
+            }
+
+#ifdef BH_CUDA_AVAILABLE
+            if (cudaDeviceAvailable && ImGui::Button("Validate: Compare CPU vs GPU")) {
+                const auto [w, h] = ComputeRenderResolution(fbWidth, fbHeight, renderScalePercent, maxRenderPixels);
+
+                RayTracing::RenderSettings renderSettings;
+                renderSettings.width = w;
+                renderSettings.height = h;
+                renderSettings.geodesicConfig.escapeRadius = 1.0e4;
+                renderSettings.geodesicConfig.maxSteps = 8000;
+                renderSettings.geodesicConfig.basePhiStep = 0.015;
+                renderSettings.geodesicConfig.checkDisk = diskEnabled;
+                renderSettings.geodesicConfig.diskInnerRadius = diskSettings.innerRadius;
+                renderSettings.geodesicConfig.diskOuterRadius = diskSettings.outerRadius;
+                renderSettings.geodesicConfig.diskClockwise = diskSettings.clockwise;
+
+                const RayTracing::CameraFrame frame = BuildCameraFrame(camera, w, h);
+                const glm::dvec3 sourceDirection = frame.forward;
+
+                starField.SetSettings(starSettings);
+                const RayTracing::BackgroundSampler background =
+                    useEinsteinRingSource
+                        ? RayTracing::BackgroundSampler([&](const glm::dvec3& dir) {
+                              return SamplePointSource(dir, sourceDirection, sourceAngularRadius, sourceBrightness);
+                          })
+                        : RayTracing::BackgroundSampler([&](const glm::dvec3& dir) { return starField.Sample(dir); });
+
+                accretionDisk.SetSettings(diskSettings);
+                const RayTracing::DiskSampler diskSampler = [&](const PhotonTraceResult& hit) {
+                    const double emittedTemperature = accretionDisk.Temperature(hit.diskHitRadius);
+                    const double observedTemperature = diskSettings.relativisticEffects
+                                                             ? emittedTemperature * hit.diskRedshiftFactor
+                                                             : emittedTemperature;
+                    return accretionDisk.EmittedColor(observedTemperature);
+                };
+
+                const auto cpuT0 = std::chrono::steady_clock::now();
+                const std::vector<glm::vec3> cpuPixels = RayTracing::RenderImage(frame, renderSettings, background, diskSampler);
+                const auto cpuT1 = std::chrono::steady_clock::now();
+                const double cpuMs = std::chrono::duration<double, std::milli>(cpuT1 - cpuT0).count();
+
+                const auto gpuT0 = std::chrono::steady_clock::now();
+                const std::vector<glm::vec3> gpuPixels = RayTracing::RenderImageCUDA(frame, renderSettings, background, diskSampler);
+                const auto gpuT1 = std::chrono::steady_clock::now();
+                const double gpuMs = std::chrono::duration<double, std::milli>(gpuT1 - gpuT0).count();
+
+                float maxAbsDiff = 0.0f;
+                double sumAbsDiff = 0.0;
+                for (size_t i = 0; i < cpuPixels.size(); ++i) {
+                    const glm::vec3 d = glm::abs(cpuPixels[i] - gpuPixels[i]);
+                    maxAbsDiff = std::max({maxAbsDiff, d.r, d.g, d.b});
+                    sumAbsDiff += d.r + d.g + d.b;
+                }
+                const double meanAbsDiff = sumAbsDiff / (cpuPixels.size() * 3.0);
+
+                char buf[512];
+                std::snprintf(buf, sizeof(buf),
+                              "CPU: %.1f ms (%.2f Mrays/s)   GPU: %.1f ms (%.2f Mrays/s)   speedup: %.1fx\n"
+                              "Max abs color diff: %.6f   Mean abs color diff: %.6f",
+                              cpuMs, (w * h) / (cpuMs * 1000.0), gpuMs, (w * h) / (gpuMs * 1000.0), cpuMs / gpuMs,
+                              maxAbsDiff, meanAbsDiff);
+                cpuVsGpuReport = buf;
+
+                lensedTexture = renderer.UploadImage(gpuPixels, w, h, lensedTexture);
+                lensedTextureWidth = w;
+                lensedTextureHeight = h;
+            }
+            if (!cpuVsGpuReport.empty()) {
+                ImGui::TextWrapped("%s", cpuVsGpuReport.c_str());
+            }
+#endif
+
+            if (lensedTextureWidth > 0) {
+                ImGui::Text("Last render (%s): %dx%d in %.1f ms (%.2f Mrays/s)",
+                            lastRenderWasGpu ? "GPU/CUDA" : "CPU multi-threaded",
+                            lensedTextureWidth, lensedTextureHeight, lastRenderMilliseconds,
+                            (lensedTextureWidth * lensedTextureHeight) / (lastRenderMilliseconds * 1000.0));
+            }
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Stage 4: Einstein Ring (camera -> black hole -> point source)");
+        {
+            needsRerender |= ImGui::Checkbox("Use aligned point source instead of starfield", &useEinsteinRingSource);
+            HelpTooltip("An Einstein ring forms when a light source sits exactly behind the black hole from the viewer. Light from the source reaches you from every direction around the shadow at once, so it appears as a ring instead of a point.");
+            ImGui::TextWrapped(
+                "The source direction is always camera.forward -- i.e. it "
+                "sits on the camera's own viewing axis, on the far side of "
+                "the black hole -- so camera/hole/source are automatically "
+                "collinear for ANY orbit angle. No manual alignment needed. "
+                "With this enabled, render at Stage 3 above: a ring at "
+                "angular radius ~ b_crit/distance should appear around the "
+                "shadow, emerging purely from the geodesic integration.");
+            needsRerender |= SliderDouble("Source angular radius", &sourceAngularRadius, 0.001, 0.1, "%.4f");
+            needsRerender |= SliderDouble("Source brightness", &sourceBrightness, 0.5, 10.0, "%.2f");
+
+            ImGui::Checkbox("Show camera debug rays in 3D view", &showCameraDebugRays);
+            if (ImGui::SliderInt("Debug ray count", &cameraDebugRayCount, 3, 41)) {
+                showCameraDebugRays = true;
+            }
+            if (ImGui::Button("Trace Camera Debug Rays") || (showCameraDebugRays && cameraDebugRays.empty())) {
+                const RayTracing::CameraFrame frame = BuildCameraFrame(camera, 320, 180);
+                cameraDebugRays = BuildCameraDebugRays(frame, cameraDebugRayCount);
+            }
+
+            if (!cameraDebugRays.empty() && ImGui::BeginTable("CameraRayDebugTable", 5,
+                    ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                ImGui::TableSetupColumn("b (impact param)");
+                ImGui::TableSetupColumn("fate");
+                ImGui::TableSetupColumn("closest approach");
+                ImGui::TableSetupColumn("deflection (rad)");
+                ImGui::TableSetupColumn("steps");
+                ImGui::TableHeadersRow();
+                for (const auto& p : cameraDebugRays) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("%.4f", p.impactParameter);
+                    ImGui::TableSetColumnIndex(1);
+                    const glm::vec3 c = ColorForPhotonFate(p.fate);
+                    ImGui::TextColored(ImVec4(c.r, c.g, c.b, 1.0f), "%s", PhotonFateName(p.fate));
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::Text("%.4f", p.closestApproach);
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::Text("%.5f", p.totalDeflectionAngle);
+                    ImGui::TableSetColumnIndex(4);
+                    ImGui::Text("%d", p.steps);
+                }
+                ImGui::EndTable();
+            }
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Stage 6: Accretion Disk");
+        {
+            needsRerender |= ImGui::Checkbox("Enable accretion disk", &diskEnabled);
+            ImGui::TextWrapped(
+                "A thin equatorial disk (Shakura-Sunyaev radial temperature "
+                "profile). Each disk pixel's color/brightness is redshifted "
+                "by the EXACT gravitational + Doppler factor at that ray's "
+                "disk crossing (computed from the same conserved impact "
+                "parameter the geodesic solver already tracks) -- toggle "
+                "'Relativistic effects' below to compare against a flat, "
+                "unshifted disk.");
+
+            const double isco = 3.0 * BlackHole::SchwarzschildRadiusSim();
+            needsRerender |= SliderDouble("Inner radius", &diskSettings.innerRadius, isco * 0.5, diskSettings.outerRadius - 0.1, "%.2f");
+            HelpTooltip("ISCO = Innermost Stable Circular Orbit: the closest distance matter can orbit the black hole without spiraling in. Real accretion disks start around here -- material that gets closer falls in within one orbit.");
+            needsRerender |= SliderDouble("Outer radius", &diskSettings.outerRadius, diskSettings.innerRadius + 0.1, 100.0, "%.2f");
+            ImGui::Text("(ISCO = 3*r_s = %.2f: physically, stable circular orbits require inner radius >= this)", isco);
+            needsRerender |= SliderDouble("Temperature scale", &diskSettings.temperatureScale, 0.1, 3.0, "%.2f");
+            needsRerender |= SliderDouble("Brightness scale", &diskSettings.brightnessScale, 0.01, 2.0, "%.3f");
+            needsRerender |= ImGui::Checkbox("Clockwise rotation", &diskSettings.clockwise);
+            needsRerender |= ImGui::Checkbox("Relativistic effects (redshift + beaming)", &diskSettings.relativisticEffects);
+        }
+        } // uiMode == Advanced
+
+        ImGui::End();
+
+        // Single shared trigger for "a render is due": works regardless of
+        // uiMode, so Simple-mode presets (which just flip flags) and the
+        // Advanced panel's own controls both actually produce an image. In
+        // Live mode this fires every single frame, at full precision,
+        // whether the camera is moving or not -- see PerformRender.
+        if (viewLensedRender && (liveMode || needsRerender)) {
+            PerformRender();
+            needsRerender = false;
+            smoothedFrameMs = smoothedFrameMs * 0.9 + lastRenderMilliseconds * 0.1;
+        }
+
+        if (!paused) {
+            for (int s = 0; s < stepsPerFrame; ++s) {
+                simulation.Step();
+            }
+        }
+
+        const int width = fbWidth, height = fbHeight; // set earlier this frame, before PerformRender used them
+        const float aspect = height > 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.0f;
+
+        if (viewLensedRender && lensedTextureWidth > 0) {
+            glViewport(0, 0, width, height);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            renderer.DrawFullscreenTexture(lensedTexture);
+
+            // Composite the piloted jet on top of the ray-traced image,
+            // using the SAME camera the tracer used this frame (see
+            // BuildCameraFrame) so it lines up with the lensed background.
+            // Lit from the black hole's direction -- it's the only light
+            // source in this scene.
+            if (camera.mode == Rendering::Camera::Mode::Jet && jetRenderer.IsLoaded()) {
+                renderer.BeginOverlayPass(camera, aspect);
+                const glm::vec3 lightDirection = glm::length(jetPhysics.position) > 1e-4f
+                                                      ? glm::normalize(jetPhysics.position)
+                                                      : glm::vec3(0.0f, 0.0f, -1.0f);
+                jetRenderer.Draw(jetPhysics.position, jetPhysics.rotation, camera.ViewMatrix(),
+                                  camera.ProjectionMatrix(aspect), lightDirection);
+            }
+        } else {
+            renderer.BeginFrame(camera, aspect, width, height);
+
+            if (showGrid) {
+                renderer.DrawGrid(40.0, 40, glm::vec3(0.15f, 0.15f, 0.2f));
+            }
+            if (showHorizon) {
+                renderer.DrawSphere(BlackHole::SchwarzschildRadiusSim(), glm::vec3(0.0f, 0.0f, 0.0f));
+                renderer.DrawWireSphere(BlackHole::SchwarzschildRadiusSim(), glm::vec3(0.6f, 0.1f, 0.1f));
+            }
+            if (showPhotonSphere) {
+                renderer.DrawWireSphere(BlackHole::PhotonSphereRadiusSim(), glm::vec3(0.9f, 0.75f, 0.2f), 12, 24);
+            }
+
+            if (showAnalyticCurve) {
+                // Draw each unique impact parameter's exact Kepler curve once
+                // (reuse the RK4 particle's elements; all three methods share
+                // the same initial condition and therefore the same analytic orbit).
+                for (const auto& p : simulation.Particles()) {
+                    if (p.method != IntegratorMethod::RK4) continue;
+                    std::vector<glm::dvec3> curve;
+                    curve.reserve(200);
+                    for (int i = 0; i <= 200; ++i) {
+                        const double theta = -3.0 + 6.0 * i / 200.0; // sample a wide angular range
+                        const double r = Physics::KeplerRadiusAtTrueAnomaly(p.analytic, theta);
+                        if (r <= 0.0) continue;
+                        const glm::dvec3 dir = std::cos(theta) * p.analytic.periapsisDir +
+                                                std::sin(theta) * glm::cross(p.analytic.orbitNormal, p.analytic.periapsisDir);
+                        curve.push_back(r * dir);
+                    }
+                    renderer.DrawPath(curve, glm::vec3(0.5f, 0.5f, 0.5f), 1.0f);
+                }
+            }
+
+            if (showNewtonianTrajectories) {
+                for (const auto& p : simulation.Particles()) {
+                    renderer.DrawPath(p.path, ColorForMethod(p.method), 2.0f);
+                    renderer.DrawPoint(p.state.position, ColorForMethod(p.method), 5.0f);
+                }
+            }
+
+            if (showPhotonGeodesics) {
+                for (const auto& p : photonTraces) {
+                    renderer.DrawPath(p.path, ColorForPhotonFate(p.fate), 2.5f);
+                }
+            }
+
+            if (showCameraDebugRays) {
+                for (const auto& p : cameraDebugRays) {
+                    renderer.DrawPath(p.path, ColorForPhotonFate(p.fate), 2.0f);
+                }
+                renderer.DrawPoint(camera.Position(), glm::vec3(1.0f, 1.0f, 1.0f), 8.0f);
+
+                if (useEinsteinRingSource) {
+                    // Visualize the Stage 4 alignment: a line from the black
+                    // hole out along the source direction (camera.forward),
+                    // far past the horizon, showing camera/hole/source are collinear.
+                    const glm::dvec3 sourceDirection = glm::normalize(-camera.Position());
+                    std::vector<glm::dvec3> alignmentLine = {glm::dvec3(0.0), sourceDirection * 60.0};
+                    renderer.DrawPath(alignmentLine, glm::vec3(1.0f, 1.0f, 0.4f), 1.5f);
+                }
+            }
+        }
+
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        glfwSwapBuffers(m_window);
+    }
+
+    return 0;
+}
+
+} // namespace Application
