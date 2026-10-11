@@ -5,7 +5,9 @@
 
 #include <glm/glm.hpp>
 
+#include "Physics/BinaryGeodesicSolver.h"
 #include "Physics/GeodesicSolver.h"
+#include "Physics/KerrGeodesicSolver.h"
 
 namespace RayTracing {
 
@@ -26,6 +28,26 @@ struct RenderSettings {
     int width = 320;
     int height = 180;
     Physics::GeodesicConfig geodesicConfig;
+
+    // When spin != 0, RenderImage routes every pixel through
+    // KerrGeodesicSolver::TracePhotonKerr instead of the Schwarzschild
+    // TracePhoton. Both CPU (here) and GPU (RenderImageCUDA ->
+    // TraceKerrPhotonsKernel) branch on this same field.
+    double spin = 0.0;
+    Physics::KerrGeodesicConfig kerrConfig;
+
+    // When set, RenderImage routes every pixel through
+    // BinaryGeodesicSolver::TracePhotonBinary instead -- an explicitly
+    // approximate scheme for two orbiting masses (see
+    // Physics/BinaryGeodesicSolver.h for why "approximate" isn't a
+    // shortcut here, there is no exact closed-form two-body metric to
+    // fall back to). Mutually exclusive with `spin`: binary mode takes
+    // priority if both are set, since a rotating member of a binary
+    // isn't modeled. Both CPU (here) and GPU (RenderImageCUDA ->
+    // TraceBinaryPhotonsKernel) branch on this same field.
+    bool binaryEnabled = false;
+    Physics::BinarySystem binarySystem;
+    Physics::BinaryGeodesicConfig binaryConfig;
 };
 
 using BackgroundSampler = std::function<glm::vec3(const glm::dvec3& direction)>;

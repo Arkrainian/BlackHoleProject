@@ -270,16 +270,312 @@ Boltzmann) brightness law reproduces relativistic beaming — the
 approaching side of the disk brightens, the receding side dims — without
 a separate ad-hoc beaming formula bolted on afterward.
 
-## 10. Limitations
+## 10. Kerr (rotating) black holes
 
-This is explicitly a **Schwarzschild** (non-rotating, uncharged) model.
-It does not attempt:
+`BlackHole::SetSpin`/`Spin()` adds the dimensionless Kerr parameter
+`a* = Jc/(GM²) ∈ [-0.998, 0.998]` (the upper clamp is the standard
+"Thorne limit" for a realistic accreting hole, and also where the formulas
+below stay numerically well-behaved — the inner and outer horizons
+coincide exactly at `|a*| = 1`). `a* = 0` is the Schwarzschild hole
+described in §1-9 above, unchanged.
 
-- **Black hole spin / Kerr spacetime.** No frame dragging, no ergosphere,
-  no asymmetric shadow. The architecture keeps `BlackHole` mass-only by
-  design so a spin parameter and a Kerr metric module could be added
-  later without restructuring the geodesic solver's interface, but no
-  Kerr physics is implemented here.
+**Metric** (Boyer-Lindquist `t, r, θ, φ`, `Physics::Kerr` in
+`KerrMetric.h`):
+
+```
+ds² = -(1 - 2r/Σ) dt² - (4ar sin²θ/Σ) dt dφ + (Σ/Δ) dr² + Σ dθ² + (A sin²θ/Σ) dφ²
+Σ = r² + a²cos²θ,   Δ = r² - 2r + a²,   A = (r²+a²)² - a²Δ sin²θ
+```
+
+**Closed-form quantities** (checked against standard textbook/Bardeen et
+al. 1972 values in `tests/test_kerr.cpp`, including the a*=0 Schwarzschild
+limit and the a*=1 extremal limit):
+
+- Outer/inner horizons: `r± = M ± √(M² - a²)`.
+- Equatorial ergosphere: always `r = 2M` (independent of spin); at the
+  poles it coincides with the outer horizon.
+- Equatorial photon orbit / ISCO, separately for the prograde
+  (co-rotating) and retrograde branches (Bardeen, Press & Teukolsky 1972):
+  frame dragging pulls the prograde orbit inward (down to `r=M`, `r=M` at
+  extremal spin) and pushes the retrograde one outward (`r=4M`, `r=9M` at
+  extremal spin).
+
+**Geodesic integration** (`Physics::TracePhotonKerr`,
+`KerrGeodesicSolver.cpp`/`KerrGeodesicMath.h`): a general Kerr photon
+orbit is *not* planar (unlike Schwarzschild, where spherical symmetry
+guarantees it), so there is no single monotonic angle to integrate
+against the way §4 uses `φ`. Instead this uses Carter's (1968) separation
+of the Hamilton-Jacobi equation — the standard formulation for Kerr null
+geodesics (Bardeen, Press & Teukolsky 1972 §II; also used by e.g. Chan,
+Psaltis & Özel's "GRay", Dexter & Agol's `geokerr`, Vincent et al.'s
+GYOTO):
+
+```
+Σ² (dr/dλ)² = R(r) = [E(r²+a²) - aLz]² - Δ[(Lz-aE)² + Q]
+Σ² (dθ/dλ)² = Θ(θ) = Q - cos²θ[Lz²/sin²θ - a²E²]
+Σ (dφ/dλ) = -(aE - Lz/sin²θ) + a[E(r²+a²)-aLz]/Δ
+```
+
+with conserved energy `E`, angular momentum `Lz`, and Carter's constant
+`Q`. Each is a decoupled first-order ODE in a single variable, so the only
+numerical subtlety beyond Schwarzschild is handling the `±` sign choice at
+a turning point (`R(r)=0` or `Θ(θ)=0`): the solver detects an overshoot
+past a root (the trial step would make the potential go negative) and
+retries from the pre-step state with the sign flipped and the step
+halved, rather than letting `sqrt(max(0, ...))` silently clip the
+overshoot and lose the reflection.
+
+Initial `(E, Lz, Q)` are derived from the camera's local ZAMO
+(zero-angular-momentum observer) tetrad — the physically appropriate local
+frame at any `r` outside the horizon, including inside the ergosphere
+where a *static* observer (§4.1's Schwarzschild tetrad) doesn't exist.
+`E_local = 1` is an arbitrary normalization (as with Schwarzschild's `b`,
+only ratios like `Lz/E` matter); at `a=0` this reduces exactly to the
+Schwarzschild tetrad relation `b = r₀n_φ̂/√f(r₀)`, checked as a direct
+regression in `tests/test_kerr.cpp`.
+
+**Spatial embedding approximation.** The solver treats a Cartesian camera
+position's `(r, θ)` as literal spherical coordinates (`x = r sinθ cosφ`,
+etc.) rather than the Boyer-Lindquist coordinates' true oblate-spheroidal
+embedding into flat 3-space. This only affects how a 3D look direction and
+the final escape direction are read off; every conserved quantity and all
+of the actual geodesic dynamics depend only on the `(r, θ)` *values*,
+which are exact. This is the same simplification most real-time Kerr
+renderers make, and it becomes exact in the far field (large `r`) and at
+`a=0` regardless of `r`.
+
+**Accretion disk redshift in Kerr mode.** Rather than re-deriving §9's
+local-tetrad Doppler decomposition for Kerr's more involved ZAMO geometry,
+the disk uses the standard closed-form result for a photon emitted by
+matter on a *prograde* circular equatorial Kerr geodesic orbit and
+received by a distant observer (Cunningham 1975; Luminet 1979):
+
+```
+g = √(1 - 3/r + 2aΩ) / (1 + Ωλ),      Ω = 1/(r^1.5 + a),  λ = Lz/E
+```
+
+`Ω` is the disk material's Keplerian angular velocity and `λ` the
+photon's own conserved specific angular momentum — reduces to the same
+physics as §9's formula at `a=0` via an independent derivation (a
+cross-check, not a shared code path). The Kerr disk is assumed prograde
+(co-rotating with the spin) unconditionally — physically standard, since
+Lense-Thirring/Bardeen-Petterson torquing aligns a real accretion disk
+with the hole's spin over time — so unlike the Schwarzschild disk's
+`diskClockwise` flag (a pure visualization choice with no physically
+preferred direction there), Kerr's rotation sense isn't independently
+configurable.
+
+**GPU.** `cuda/geodesic_kernel.cu`'s `TracePhotonKerrDevice` /
+`TraceKerrPhotonsKernel` mirror the CPU solver above step for step (same
+shared `Physics::Kerr`/`Physics::KerrGeodesicMath` templated functions,
+deduced at `T=float` instead of `T=double` — not a reimplementation),
+launched from `RayTracing::RenderImageCUDA` whenever
+`RenderSettings::spin != 0`; the CPU and GPU paths pick the same branch
+from the same `spin` field, so Kerr mode is GPU-accelerated exactly like
+Schwarzschild mode when a CUDA device is present, with an automated
+CPU-vs-GPU comparison (`tests/test_gpu_render.cpp`'s
+`RunKerrGpuRenderTests`) alongside the existing Schwarzschild one.
+
+**Validation:** `docs/validation.md` §9 covers the closed-form
+horizon/ISCO/photon-orbit/ergosphere quantities, an a=0 regression
+against the Schwarzschild solver, and a weak-field deflection check
+against the known spin-orbit (frame-dragging) correction to light
+bending, `α_retrograde - α_prograde ≈ 8Ma/b²`.
+
+## 11. Binary black holes (approximate)
+
+`Physics::BinarySystem` / `Physics::TracePhotonBinary`
+(`BinarySystem.h`, `BinaryGeodesicSolver.{h,cpp}`) add a second,
+orbiting black hole. This is explicitly, unavoidably an **approximate**
+model — unlike Schwarzschild and Kerr above, there is no exact
+closed-form metric for two orbiting black holes in general relativity
+at all, so "approximate" here isn't a simplification of some more exact
+method this project chose not to implement; it's the best tractable
+option.
+
+**Orbital mechanics (exact, for what it models):** the two masses move
+on a circular Newtonian two-body orbit about their common barycenter
+(fixed at the origin, the same point every other scenario in this app
+orbits/centers on). Body 1 *is* the configured black hole (`GM1=1` in
+sim units, same convention as `BlackHole.h`); `massRatio` is body 2's
+mass relative to it. Positions, angular velocity, and period all follow
+the standard two-body Kepler's-third-law result
+(`Ω² = G(M1+M2)/separation³`) in closed form — exact for a circular
+orbit, though real orbiting black holes also inspiral and radiate
+gravitational waves, neither of which is modeled (the orbit here is a
+fixed circle, not a decaying one).
+
+**Photon propagation (the actual approximation):** each mass bends
+light via an acceleration of **twice** the Newtonian value,
+`2GMᵢ/r²`, directed toward that mass, summed across both masses and
+applied to a photon moving at constant coordinate speed. Doubling the
+Newtonian deflection is the standard, well-known trick for recovering
+GR's correct weak-field light-bending angle (`4GM/(bc²)` — the exact
+formula `tests/test_deflection.cpp` already validates for the real
+Schwarzschild solver) from a cheap, easily-superposed Newtonian-shaped
+force law. `tests/test_binary.cpp` checks this directly: with one
+mass's contribution zeroed out, the solver's single-mass deflection
+matches the known weak-field formula to within a few percent, improving
+monotonically at larger impact parameter — the same character of
+agreement (and the same known next-order PPN residual) the real
+Schwarzschild weak-field table shows.
+
+**What this does and doesn't capture:**
+
+- **Qualitatively plausible, not quantitatively exact, near either
+  horizon.** This is fundamentally a weak-field scheme; it does not
+  reproduce the real photon sphere, the exact critical impact
+  parameter, or frame dragging near either mass. It will still capture
+  a ray that gets close enough (the `1/r²` acceleration still diverges
+  near `r=0`), giving a plausible-looking shadow, just not an
+  exact one.
+- **"Frozen lens":** both masses' positions are read once, at launch,
+  and held fixed for that photon's entire flight — the standard
+  simplification for light-crossing times much shorter than the
+  orbital period, not a continuously-updating field.
+
+**Accretion disks:** each body has its own thin equatorial disk, both
+coplanar with the orbital plane (`z=0`) — a simplification, not a claim
+that a real binary disk is always exactly aligned with the orbit. A ray
+crossing `z=0` within either body's `[innerRadius, outerRadius]` is
+attributed to that body (`PhotonTraceResult::diskBodyIndex`, 0 or 1),
+which the renderer uses to pick the right `AccretionDisk` instance —
+each body has its own real Kelvin scale, since it has its own mass.
+Body 2's radii scale from the shared `diskSettings` by its Schwarzschild
+radius relative to body 1's, so the same "radius in units of `r_s`" the
+UI slider sets applies to both disks even though they're physically
+different sizes. The redshift calculation reuses the same
+Schwarzschild-shaped local-orbital-speed (`v=1/√(r-rs)`) and
+gravitational-redshift (`√(1-rs/r)`) formulas the exact Schwarzschild
+solver uses, evaluated locally around whichever body owns the disk —
+but unlike that solver (which reconstructs the photon's local direction
+from a conserved impact parameter), this one uses the already-tracked
+velocity vector directly, since this scheme tracks it explicitly at
+every step anyway. `tests/test_binary.cpp` checks both disks are hit
+correctly, attributed to the right body, and return a finite positive
+redshift.
+
+**GPU.** `cuda/geodesic_kernel.cu`'s `TracePhotonBinaryDevice` /
+`TraceBinaryPhotonsKernel` mirror the CPU solver above step for step
+(same superposed-acceleration scheme, in `float` instead of `double`),
+launched from `RayTracing::RenderImageCUDA` whenever
+`RenderSettings::binaryEnabled` is set — both masses' current positions
+are computed host-side each frame (the "frozen lens" snapshot) and
+passed down rather than recomputed per-thread. Binary mode's CPU/GPU
+agreement is even tighter than Kerr's (`docs/validation.md` §11) —
+this scheme has no trig and no turning-point retry loop, so there's
+less for float-vs-double rounding to disagree about.
+
+Binary mode takes priority over Kerr spin when both are configured (a
+rotating member of a binary isn't modeled) — see the Advanced-mode
+"Binary Black Holes" panel.
+
+**Flamm's paraboloid (conceptual, not exclusive to binary mode).**
+`Rendering::Renderer::DrawFlammParaboloid` draws the debug 3D view's
+classic embedding-diagram "funnel": a wireframe surface of revolution
+around a vertical axis through each active mass (the single configured
+black hole normally, or both binary bodies, each with its own funnel,
+when binary mode is active), with height `y = -2·√(rs·(ρ-rs))` at
+planar distance `ρ` from that axis, for `ρ ≥ rs` — the standard,
+textbook-exact 2D embedding of the Schwarzschild equatorial spatial
+geometry (see e.g. Misner, Thorne & Wheeler), flaring from a vertical-
+tangent throat right at the horizon (`ρ=rs`) out to nearly flat far
+away. Rings are sampled with a quadratic ease-in on `ρ` so that throat
+is resolved smoothly rather than as a sharp cone. **This is an
+analogy, not a literal picture of spacetime:** a 2D surface embedded in
+3D space standing in for 4D spacetime curvature is the classic textbook
+embedding-diagram visualization used throughout popular and technical
+treatments of GR alike — genuinely exact as far as it goes, but it is
+not a rendering of spacetime itself, and the UI's own tooltip says so
+explicitly. The surface isn't evaluated for `ρ < rs` at all (the real
+embedding doesn't extend inside the horizon), so the funnel's rim
+starts exactly at the throat rather than implying anything about the
+interior.
+
+## 12. Stars and planets: tidal disruption
+
+**Stars (`Astronomy::StarBody`).** A star is modeled as a small cluster of
+independent test particles (default 28), seeded uniformly inside a sphere
+and given the star's bulk velocity with no internal dispersion. Every
+particle free-falls under the exact same point-mass law everything else in
+this sim uses, `Physics::StaticObserverGravityAccelSim` (Newtonian far away,
+the exact GR static-observer acceleration `a(r) = (GM/r²)/√(1-rs/r)` near
+the horizon — see `BlackHole.h`). "Spaghettification" is therefore an
+emergent consequence of near-side particles measurably outpulling far-side
+particles, not a scripted stretch. **What this deliberately omits:** the
+star's own self-gravity and any material cohesion at all — every star here
+is already past the point self-gravity would have lost; there is no
+intact-until-disrupted phase, and no Roche-limit logic of any kind. This was
+true from the feature's introduction and is recorded here for the first
+time (previously only in code comments and `HANDOFF.md`).
+
+**Planets (`Astronomy::PlanetBody`, Milestone 1).** A planet extends the
+same free-falling-test-particle idea with an explicit cohesion force: each
+particle also feels a spring force toward ~6 nearest-neighbor particles,
+forming a lattice built once at construction. Deformation is a real
+consequence of two competing forces — differential gravity pulling the
+lattice apart, springs pulling it back together — rather than an unbound
+swarm. A spring breaks permanently once its strain `|Δlength/restLength|`
+exceeds the chosen material's `materialStrength` (`Physics::PlanetMaterial`);
+connected components of the remaining lattice are tracked as fragments
+(`Astronomy::PlanetFragment`), with mass/velocity/center-of-mass derived
+directly from their member particles — no momentum is fabricated when a
+spring breaks (verified by `tests/test_planet.cpp`).
+
+Two diagnostic formulas (`Physics/TidalForceModel.h`) are displayed
+alongside the simulation for comparison, but never gate or trigger
+destruction themselves — what happens is always whatever the spring network
+actually does:
+
+- **Newtonian tidal acceleration**, leading-order in `R_p/r`:
+  `Δa_tidal ≈ 2·G·M_bh·R_p/r³`. A weak-field approximation, explicitly not a
+  relativistic tidal-tensor calculation.
+- **Roche limit** (idealized fluid body): `r_Roche ≈ 2.44·R_p·(M_bh/M_p)^(1/3)`.
+  An informative reference radius, not a destruction switch — real
+  disruption in this sim depends on material strength and the actual spring
+  stresses encountered along the trajectory, which can disagree with this
+  estimate in either direction.
+
+**GPU acceleration (`cuda/planet_kernel.cu`, `PlanetBody::UpdateGPU`).**
+Unlike the ray tracer's kernels, this is not a per-pixel, launch-once-per-
+frame-over-10⁵-10⁶-independent-rays workload — it's a small (tens to low
+hundreds of elements by default), *stateful* particle/spring system that
+must round-trip to the CPU every frame regardless (for rendering and the
+union-find fragment rebuild, both of which stay CPU-side). At the default
+particle counts, a GPU kernel launch here is **not** expected to be faster
+than the equivalent CPU loop — both are O(particles + springs) per frame,
+nothing quadratic, and GPU launch/copy overhead dominates at this scale
+(measured, not assumed — see `HANDOFF.md`). The actual benefit is letting
+particle counts run far higher than CPU-real-time while the physics
+(gravity, spring forces, semi-implicit Euler integration, fracture check)
+stays otherwise identical, just in `float` instead of `double` — the same
+precision tradeoff already accepted for the Kerr/binary ray-tracing
+kernels. `PlanetBody::UpdateGPU` automatically falls back to the CPU
+`Update()` when CUDA isn't compiled in, no device is present, or the GPU
+call itself fails — same automatic-fallback-only philosophy as the ray
+tracer (no "force CPU"/"force GPU" toggle). `BuildSpringLattice` (one-time,
+at construction) and `RebuildFragments` (union-find, sequential-shaped)
+deliberately stay CPU-only in both paths.
+
+**What this milestone deliberately omits** (see `HANDOFF.md` for the
+continuation plan): planetary self-gravity among fragments/particles (the
+springs are a stand-in for it, not a simulation of it — real self-gravity
+would also let large fragments gravitationally reaccumulate, which a broken
+spring lattice cannot do); differentiated internal layers behaving
+differently (`PlanetComposition::Differentiated` is one averaged material,
+not a core/mantle/crust structure); coupling captured debris into
+`AccretionDisk`'s actual mass/temperature (its `Mdot` is still purely a UI
+slider); batching multiple simultaneously-spawned planets into one combined
+GPU kernel launch (today it's one launch per planet per frame); and
+Kerr/binary-hole-aware capture (both stars and planets check only the
+single-hole Schwarzschild radius).
+
+## 13. Limitations
+
+This was, until the Kerr and binary-black-hole additions above,
+explicitly a **Schwarzschild** (non-rotating, uncharged) model; nothing
+below is covered by either of those additions either:
+
 - **Magnetic fields or full MHD.** The accretion disk is a static,
   analytic temperature/velocity profile, not a simulated plasma.
 - **Realistic disk microphysics.** No opacity, no radiative transfer, no
@@ -288,6 +584,10 @@ It does not attempt:
   `AccretionDisk.cpp`), not a spectral integration.
 - **Flux calibration.** Brightness values are visually tuned (a documented
   `kVisualNormalization` constant), not tied to physical luminosity units.
+- **Stars and planets** (§12): no self-gravity for either; planets add an
+  explicit spring-cohesion model but no differentiated interior, no
+  self-gravity among fragments, and no GPU acceleration; both check only the
+  single-hole Schwarzschild radius for capture.
 
 Where an approximation or a simplification is made anywhere in the code,
 it is labeled as such at the point it's made, rather than presented as

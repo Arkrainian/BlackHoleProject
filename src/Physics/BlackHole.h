@@ -27,6 +27,17 @@ public:
     double MassKg() const { return m_massKg; }
     double MassSolarMasses() const { return m_massKg / Constants::SOLAR_MASS_KG; }
 
+    // Dimensionless Kerr spin parameter a* = Jc/(GM^2), in [-1, 1]. Zero
+    // (the default) is the original Schwarzschild hole this class always
+    // described; nonzero routes ray tracing through KerrGeodesicSolver
+    // instead (see CPUTracer.cpp). Clamped to +-0.998 -- the standard
+    // "Thorne limit" for a realistic accreting hole, and also where
+    // KerrMetric.h's formulas stay numerically well-behaved (the inner and
+    // outer horizons coincide exactly at |a*|=1).
+    void SetSpin(double spinParameter) { m_spin = std::clamp(spinParameter, -0.998, 0.998); }
+    double Spin() const { return m_spin; }
+    bool IsRotating() const { return m_spin != 0.0; }
+
     // Schwarzschild radius, r_s = 2GM/c^2. In sim units this is always 2.0;
     // exposed as a function (not a constant) so the physical/documentation
     // intent stays explicit at call sites.
@@ -49,6 +60,7 @@ public:
 
 private:
     double m_massKg;
+    double m_spin = 0.0;
 };
 
 // The exact proper acceleration a "static" observer must apply to hover at

@@ -28,7 +28,11 @@ literal output of tracing photon geodesics.*
 
 - General relativity: the Schwarzschild metric, null geodesics, the
   photon sphere, gravitational lensing, the Einstein ring, the
-  event-horizon/shadow distinction, gravitational + Doppler redshift.
+  event-horizon/shadow distinction, gravitational + Doppler redshift; an
+  optional Kerr (rotating) mode adding frame dragging, the ergosphere,
+  and a spin-asymmetric photon orbit/ISCO/shadow via Carter's constant;
+  and an optional binary-black-hole mode (approximate, by physical
+  necessity — no exact two-body GR metric exists).
 - Numerical methods: RK4 integration, curvature-adaptive step control,
   a from-scratch closed-form Kepler-orbit reference for validating
   integrator error, documented failure modes and the fixes for them.
@@ -36,9 +40,10 @@ literal output of tracing photon geodesics.*
   `std::execution::par` parallelism, a from-scratch OpenGL+ImGui
   application.
 - CUDA: a from-scratch GPU port sharing its numerical core with the CPU
-  path at the source level, validated bit-identical against the CPU
-  output.
-- Scientific rigor: 32 automated tests checking the code against known
+  path at the source level (Schwarzschild, Kerr, and binary all three),
+  validated against the CPU output within expected float/double
+  tolerance.
+- Scientific rigor: 98 automated tests checking the code against known
   closed-form GR results — not "it looks right," but "it matches the
   analytical prediction to N significant figures, here's the number."
 
@@ -141,9 +146,19 @@ can call directly into the same header the CPU path uses.
 
 ## Limitations
 
-This is explicitly a **Schwarzschild** (non-rotating, uncharged) model.
-It does not implement black hole spin/Kerr spacetime, magnetic fields or
-MHD, realistic disk radiative transfer, or flux-calibrated brightness —
-see [docs/physics.md §10](docs/physics.md#10-limitations) for the full,
+The core model is Schwarzschild (non-rotating, uncharged); an optional
+Kerr (rotating) mode adds frame dragging, the ergosphere, and a
+prograde/retrograde-asymmetric shadow and ISCO, via a separate geodesic
+solver (`Physics::TracePhotonKerr` on CPU, `TraceKerrPhotonsKernel` on
+GPU — see
+[docs/physics.md §10](docs/physics.md#10-kerr-rotating-black-holes)). A
+further optional binary-black-hole mode adds a second, orbiting mass —
+explicitly approximate (no exact two-body metric exists in GR at all),
+using a "doubled Newtonian" superposed light-bending scheme, on both
+CPU and GPU — see
+[docs/physics.md §11](docs/physics.md#11-binary-black-holes-approximate).
+None of these models implement magnetic fields or MHD, realistic disk
+radiative transfer, or flux-calibrated brightness — see
+[docs/physics.md §12](docs/physics.md#12-limitations) for the full,
 honest list of what this is and isn't. Where an approximation is made
 anywhere in the code, it's labeled as such at the point it's made.

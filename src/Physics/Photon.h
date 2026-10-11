@@ -43,6 +43,23 @@ struct PhotonTraceResult {
     double diskHitRadius = 0.0;
     double diskRedshiftFactor = 1.0;
 
+    // Binary-only (set by TracePhotonBinary): which body's disk was hit,
+    // 0 or 1 -- meaningless (left at its default 0) for Schwarzschild/Kerr,
+    // which have only one body anyway. Lets the caller pick between two
+    // separate AccretionDisk instances (different mass -> different real
+    // Kelvin scale) when coloring a binary disk hit.
+    int diskBodyIndex = 0;
+
+    // Kerr-only (set by TracePhotonKerr; left at these defaults, unused,
+    // by the Schwarzschild TracePhoton -- which has no separate Carter
+    // constant and reports everything through impactParameter=b=L/E
+    // alone). Exposed for the Photon Inspector UI (App.cpp) so a Kerr
+    // ray's actual conserved quantities can be read off directly, not
+    // just the single derived b.
+    double kerrEnergyE = 0.0;
+    double kerrAngularMomentumLz = 0.0;
+    double kerrCarterQ = 0.0;
+
     std::vector<glm::dvec3> path; // populated only when recordPath is requested
 };
 

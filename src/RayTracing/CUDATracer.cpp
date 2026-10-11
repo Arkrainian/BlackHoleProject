@@ -61,8 +61,57 @@ std::vector<glm::vec3> RenderImageCUDA(const CameraFrame& camera, const RenderSe
     kernelConfig.diskOuterRadius = static_cast<float>(settings.geodesicConfig.diskOuterRadius);
     kernelConfig.diskClockwise = settings.geodesicConfig.diskClockwise;
 
+    CudaTracing::KernelKerrConfig kernelKerrConfig;
+    kernelKerrConfig.captureMultiplier = static_cast<float>(settings.kerrConfig.captureMultiplier);
+    kernelKerrConfig.escapeRadius = static_cast<float>(settings.kerrConfig.escapeRadius);
+    kernelKerrConfig.baseLambdaStep = static_cast<float>(settings.kerrConfig.baseLambdaStep);
+    kernelKerrConfig.minLambdaStep = static_cast<float>(settings.kerrConfig.minLambdaStep);
+    kernelKerrConfig.maxLambdaStep = static_cast<float>(settings.kerrConfig.maxLambdaStep);
+    kernelKerrConfig.maxSteps = settings.kerrConfig.maxSteps;
+    kernelKerrConfig.checkDisk = settings.kerrConfig.checkDisk;
+    kernelKerrConfig.diskInnerRadius = static_cast<float>(settings.kerrConfig.diskInnerRadius);
+    kernelKerrConfig.diskOuterRadius = static_cast<float>(settings.kerrConfig.diskOuterRadius);
+
+    CudaTracing::KernelBinaryConfig kernelBinaryConfig;
+    kernelBinaryConfig.escapeRadius = static_cast<float>(settings.binaryConfig.escapeRadius);
+    kernelBinaryConfig.baseStep = static_cast<float>(settings.binaryConfig.baseStep);
+    kernelBinaryConfig.minStep = static_cast<float>(settings.binaryConfig.minStep);
+    kernelBinaryConfig.maxStep = static_cast<float>(settings.binaryConfig.maxStep);
+    kernelBinaryConfig.maxSteps = settings.binaryConfig.maxSteps;
+    kernelBinaryConfig.checkDisk = settings.binaryConfig.checkDisk;
+    kernelBinaryConfig.disk1InnerRadius = static_cast<float>(settings.binaryConfig.disk1InnerRadius);
+    kernelBinaryConfig.disk1OuterRadius = static_cast<float>(settings.binaryConfig.disk1OuterRadius);
+    kernelBinaryConfig.disk2InnerRadius = static_cast<float>(settings.binaryConfig.disk2InnerRadius);
+    kernelBinaryConfig.disk2OuterRadius = static_cast<float>(settings.binaryConfig.disk2OuterRadius);
+
+    // The two masses' positions/masses are a snapshot of
+    // settings.binarySystem's CURRENT orbital phase ("frozen lens," same
+    // as the CPU solver -- see BinaryGeodesicSolver.h), computed here on
+    // the host rather than passing the whole BinarySystem to the device.
+    CudaTracing::KernelBinaryBodies kernelBinaryBodies;
+    kernelBinaryBodies.position1 = ToKernel(settings.binarySystem.Position1());
+    kernelBinaryBodies.position2 = ToKernel(settings.binarySystem.Position2());
+    kernelBinaryBodies.gm1 = 1.0f;
+    kernelBinaryBodies.gm2 = static_cast<float>(settings.binarySystem.massRatio);
+    kernelBinaryBodies.rs1 = static_cast<float>(settings.binarySystem.SchwarzschildRadius1());
+    kernelBinaryBodies.rs2 = static_cast<float>(settings.binarySystem.SchwarzschildRadius2());
+    kernelBinaryBodies.captureRadius1 =
+        static_cast<float>(settings.binaryConfig.captureMultiplier * settings.binarySystem.SchwarzschildRadius1());
+    kernelBinaryBodies.captureRadius2 =
+        static_cast<float>(settings.binaryConfig.captureMultiplier * settings.binarySystem.SchwarzschildRadius2());
+
+    // Binary mode takes priority (see RayTracing::RenderImage's identical
+    // branch order), then Kerr (nonzero spin) routes to the Kerr kernel,
+    // otherwise plain Schwarzschild -- all three share this function's
+    // output type and the coloring pass below.
     const CudaTracing::KernelPixelResult* kernelResults =
-        CudaTracing::LaunchGeodesicKernel(kernelCamera, kernelConfig, settings.width, settings.height);
+        settings.binaryEnabled
+            ? CudaTracing::LaunchBinaryGeodesicKernel(kernelCamera, kernelBinaryConfig, kernelBinaryBodies,
+                                                       settings.width, settings.height)
+        : settings.spin != 0.0
+            ? CudaTracing::LaunchKerrGeodesicKernel(kernelCamera, kernelKerrConfig, static_cast<float>(settings.spin),
+                                                     settings.width, settings.height)
+            : CudaTracing::LaunchGeodesicKernel(kernelCamera, kernelConfig, settings.width, settings.height);
 
     const size_t pixelCount = static_cast<size_t>(settings.width) * settings.height;
 
@@ -99,6 +148,7 @@ std::vector<glm::vec3> RenderImageCUDA(const CameraFrame& camera, const RenderSe
                 hit.hitDisk = true;
                 hit.diskHitRadius = kr.diskHitRadius;
                 hit.diskRedshiftFactor = kr.diskRedshiftFactor;
+                hit.diskBodyIndex = kr.diskBodyIndex;
                 image[i] = disk(hit);
             } else if (FromKernelFate(kr.fate) == PhotonFate::ESCAPED) {
                 image[i] = background(FromKernel(kr.escapeDirection));

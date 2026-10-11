@@ -121,6 +121,21 @@ if(BH_ENABLE_CUDA)
     # directly; pass -DCMAKE_CUDA_ARCHITECTURES=<arch> at configure time to
     # override for a different GPU than the one that built this binary.
     set_target_properties(bh_cuda_tracer PROPERTIES CUDA_ARCHITECTURES "native")
+
+    # GPU acceleration for the planetary destruction particle/spring
+    # simulation (Astronomy/PlanetBody.cpp) -- an independent capability
+    # from the ray tracer above, in its own target/compile-definition
+    # (BH_PLANET_CUDA_AVAILABLE, not BH_CUDA_AVAILABLE) since the two are
+    # conceptually separate even though both currently gate on the same
+    # BH_ENABLE_CUDA option. See cuda/PlanetKernel.h for why this is a
+    # genuinely different kind of GPU workload than ray tracing.
+    add_library(bh_planet_cuda STATIC cuda/planet_kernel.cu)
+    target_include_directories(bh_planet_cuda PRIVATE src cuda)
+    target_link_libraries(bh_planet_cuda PUBLIC bh_physics)
+    set_target_properties(bh_planet_cuda PROPERTIES CUDA_ARCHITECTURES "native")
+
+    target_link_libraries(bh_astronomy PUBLIC bh_planet_cuda)
+    target_compile_definitions(bh_astronomy PUBLIC BH_PLANET_CUDA_AVAILABLE)
 endif()
 
 # ---------------------------------------------------------------------------

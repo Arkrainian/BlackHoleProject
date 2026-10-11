@@ -1,5 +1,6 @@
 #include "Renderer.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -69,6 +70,47 @@ void Renderer::DrawGrid(double halfExtent, int divisions, const glm::vec3& color
     glEnd();
 }
 
+void Renderer::DrawFlammParaboloid(const glm::dvec3& center, double schwarzschildRadius, double outerRadius,
+                                    const glm::vec3& color, int radialSegments, int ringSegments) const {
+    const double rs = schwarzschildRadius;
+
+    // rho(ring index): quadratic ease-in from rs to outerRadius, so rings
+    // bunch up near the throat (rho=rs) where the real surface's slope
+    // diverges (vertical tangent) and thin out in the nearly-flat outer
+    // region, rather than wasting uniform density where the curvature is
+    // mild.
+    const auto Rho = [&](int ring) {
+        const double t = static_cast<double>(ring) / ringSegments;
+        return rs + (outerRadius - rs) * t * t;
+    };
+    const auto Height = [&](double rho) { return -2.0 * std::sqrt(rs * std::max(0.0, rho - rs)); };
+
+    glColor3f(color.r, color.g, color.b);
+
+    // Rings (circles of latitude) at each sampled rho.
+    for (int i = 0; i <= ringSegments; ++i) {
+        const double rho = Rho(i);
+        const double y = Height(rho);
+        glBegin(GL_LINE_LOOP);
+        for (int s = 0; s < radialSegments; ++s) {
+            const double theta = 2.0 * kPi * s / radialSegments;
+            glVertex3d(center.x + rho * std::cos(theta), center.y + y, center.z + rho * std::sin(theta));
+        }
+        glEnd();
+    }
+    // Radial lines (lines of longitude) from the throat out to the rim.
+    for (int s = 0; s < radialSegments; ++s) {
+        const double theta = 2.0 * kPi * s / radialSegments;
+        const double cosT = std::cos(theta), sinT = std::sin(theta);
+        glBegin(GL_LINE_STRIP);
+        for (int i = 0; i <= ringSegments; ++i) {
+            const double rho = Rho(i);
+            glVertex3d(center.x + rho * cosT, center.y + Height(rho), center.z + rho * sinT);
+        }
+        glEnd();
+    }
+}
+
 void Renderer::DrawSphere(double radius, const glm::vec3& color, int rings, int sectors) const {
     glColor3f(color.r, color.g, color.b);
     for (int r = 0; r < rings; ++r) {
@@ -95,6 +137,114 @@ void Renderer::DrawSphere(const glm::dvec3& center, double radius, const glm::ve
     glPopMatrix();
 }
 
+void Renderer::DrawEllipsoid(const glm::dvec3& center, const glm::dvec3& primaryAxisDirection,
+                              double primarySemiAxis, double lateralSemiAxis, const glm::vec3& color, int rings,
+                              int sectors) const {
+    const double len = glm::length(primaryAxisDirection);
+    const glm::dvec3 yAxis = len > 1e-9 ? primaryAxisDirection / len : glm::dvec3(0.0, 1.0, 0.0);
+
+    // Build an orthonormal right-handed basis with yAxis as the "pole"
+    // axis -- DrawSphere's unit sphere varies latitude (its `rings`
+    // argument) along +-Y and longitude (`sectors`) around the XZ plane,
+    // so aligning Y with the desired stretch direction and then scaling
+    // Y by primarySemiAxis / X,Z by lateralSemiAxis turns it into a
+    // spheroid stretched the right way without needing a different mesh.
+    glm::dvec3 worldUpHint = std::abs(yAxis.y) < 0.99 ? glm::dvec3(0.0, 1.0, 0.0) : glm::dvec3(1.0, 0.0, 0.0);
+    const glm::dvec3 xAxis = glm::normalize(glm::cross(worldUpHint, yAxis));
+    const glm::dvec3 zAxis = glm::cross(xAxis, yAxis);
+
+    const float basis[16] = {
+        static_cast<float>(xAxis.x), static_cast<float>(xAxis.y), static_cast<float>(xAxis.z), 0.0f,
+        static_cast<float>(yAxis.x), static_cast<float>(yAxis.y), static_cast<float>(yAxis.z), 0.0f,
+        static_cast<float>(zAxis.x), static_cast<float>(zAxis.y), static_cast<float>(zAxis.z), 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f,
+    };
+
+    glPushMatrix();
+    glTranslated(center.x, center.y, center.z);
+    glMultMatrixf(basis);
+    glScaled(lateralSemiAxis, primarySemiAxis, lateralSemiAxis);
+    DrawSphere(1.0, color, rings, sectors);
+    glPopMatrix();
+}
+
+void Renderer::DrawShadedSphere(const glm::dvec3& center, double radius, const glm::vec3& color,
+                                 const glm::dvec3& lightDirection, int rings, int sectors) const {
+    const glm::dvec3 lightDir =
+        glm::length(lightDirection) > 1e-9 ? glm::normalize(lightDirection) : glm::dvec3(0.0, 0.0, 1.0);
+    constexpr double kAmbient = 0.25; // matches Jet::JetRenderer's shader exactly (ambient floor + Lambertian term)
+
+    for (int r = 0; r < rings; ++r) {
+        const double lat0 = kPi * (-0.5 + static_cast<double>(r) / rings);
+        const double lat1 = kPi * (-0.5 + static_cast<double>(r + 1) / rings);
+        const double y0 = std::sin(lat0), yr0 = std::cos(lat0);
+        const double y1 = std::sin(lat1), yr1 = std::cos(lat1);
+
+        glBegin(GL_QUAD_STRIP);
+        for (int s = 0; s <= sectors; ++s) {
+            const double lng = 2.0 * kPi * static_cast<double>(s) / sectors;
+            const double x = std::cos(lng), z = std::sin(lng);
+
+            const glm::dvec3 n0(x * yr0, y0, z * yr0); // unit-sphere normal == unit-radius local position
+            const double shade0 = kAmbient + (1.0 - kAmbient) * std::max(0.0, glm::dot(n0, -lightDir));
+            glColor3f(static_cast<float>(color.r * shade0), static_cast<float>(color.g * shade0),
+                      static_cast<float>(color.b * shade0));
+            glVertex3d(center.x + radius * n0.x, center.y + radius * n0.y, center.z + radius * n0.z);
+
+            const glm::dvec3 n1(x * yr1, y1, z * yr1);
+            const double shade1 = kAmbient + (1.0 - kAmbient) * std::max(0.0, glm::dot(n1, -lightDir));
+            glColor3f(static_cast<float>(color.r * shade1), static_cast<float>(color.g * shade1),
+                      static_cast<float>(color.b * shade1));
+            glVertex3d(center.x + radius * n1.x, center.y + radius * n1.y, center.z + radius * n1.z);
+        }
+        glEnd();
+    }
+}
+
+void Renderer::DrawShadedEllipsoid(const glm::dvec3& center, const glm::dvec3& primaryAxisDirection,
+                                    double primarySemiAxis, double lateralSemiAxis, const glm::vec3& color,
+                                    const glm::dvec3& lightDirection, int rings, int sectors) const {
+    const double len = glm::length(primaryAxisDirection);
+    const glm::dvec3 yAxis = len > 1e-9 ? primaryAxisDirection / len : glm::dvec3(0.0, 1.0, 0.0);
+    const glm::dvec3 worldUpHint = std::abs(yAxis.y) < 0.99 ? glm::dvec3(0.0, 1.0, 0.0) : glm::dvec3(1.0, 0.0, 0.0);
+    const glm::dvec3 xAxis = glm::normalize(glm::cross(worldUpHint, yAxis));
+    const glm::dvec3 zAxis = glm::cross(xAxis, yAxis);
+
+    const glm::dvec3 lightDir =
+        glm::length(lightDirection) > 1e-9 ? glm::normalize(lightDirection) : glm::dvec3(0.0, 0.0, 1.0);
+    constexpr double kAmbient = 0.25;
+
+    const auto EmitVertex = [&](double x, double y, double z) {
+        const glm::dvec3 localUnit(x, y, z); // unit-sphere local coords, pre-stretch
+        const glm::dvec3 worldPos = center + xAxis * (x * lateralSemiAxis) + yAxis * (y * primarySemiAxis) +
+                                     zAxis * (z * lateralSemiAxis);
+        // Approximate normal: the UNSTRETCHED local normal rotated into
+        // world space (see this method's header comment for why this
+        // isn't the exact ellipsoid normal once the two semi-axes diverge).
+        const glm::dvec3 worldNormal = glm::normalize(xAxis * localUnit.x + yAxis * localUnit.y + zAxis * localUnit.z);
+        const double shade = kAmbient + (1.0 - kAmbient) * std::max(0.0, glm::dot(worldNormal, -lightDir));
+        glColor3f(static_cast<float>(color.r * shade), static_cast<float>(color.g * shade),
+                  static_cast<float>(color.b * shade));
+        glVertex3d(worldPos.x, worldPos.y, worldPos.z);
+    };
+
+    for (int r = 0; r < rings; ++r) {
+        const double lat0 = kPi * (-0.5 + static_cast<double>(r) / rings);
+        const double lat1 = kPi * (-0.5 + static_cast<double>(r + 1) / rings);
+        const double y0 = std::sin(lat0), yr0 = std::cos(lat0);
+        const double y1 = std::sin(lat1), yr1 = std::cos(lat1);
+
+        glBegin(GL_QUAD_STRIP);
+        for (int s = 0; s <= sectors; ++s) {
+            const double lng = 2.0 * kPi * static_cast<double>(s) / sectors;
+            const double x = std::cos(lng), z = std::sin(lng);
+            EmitVertex(x * yr0, y0, z * yr0);
+            EmitVertex(x * yr1, y1, z * yr1);
+        }
+        glEnd();
+    }
+}
+
 void Renderer::DrawWireSphere(double radius, const glm::vec3& color, int rings, int sectors) const {
     glColor3f(color.r, color.g, color.b);
     for (int r = 1; r < rings; ++r) {
@@ -117,6 +267,14 @@ void Renderer::DrawWireSphere(double radius, const glm::vec3& color, int rings, 
         }
         glEnd();
     }
+}
+
+void Renderer::DrawWireSphere(const glm::dvec3& center, double radius, const glm::vec3& color, int rings,
+                               int sectors) const {
+    glPushMatrix();
+    glTranslated(center.x, center.y, center.z);
+    DrawWireSphere(radius, color, rings, sectors);
+    glPopMatrix();
 }
 
 unsigned int Renderer::LoadTexture(const std::string& path) const {

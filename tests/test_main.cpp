@@ -8,8 +8,16 @@ void RunGeodesicTests();
 void RunDeflectionTests();
 void RunShadowTests();
 void RunDiskTests();
+void RunKerrTests();
+void RunBinaryTests();
+void RunPlanetTests();
 #ifdef BH_CUDA_AVAILABLE
 void RunGpuRenderTests();
+void RunKerrGpuRenderTests();
+void RunBinaryGpuRenderTests();
+#endif
+#ifdef BH_PLANET_CUDA_AVAILABLE
+void RunPlanetGpuTests();
 #endif
 
 int main() {
@@ -31,9 +39,28 @@ int main() {
     std::printf("\n=== Accretion disk: orbital velocity, redshift, temperature (Stage 6) ===\n");
     RunDiskTests();
 
+    std::printf("\n=== Kerr (rotating) black hole: horizons, ISCO, photon orbits, geodesics ===\n");
+    RunKerrTests();
+
+    std::printf("\n=== Binary black holes (approximate superposed lensing) ===\n");
+    RunBinaryTests();
+
+    std::printf("\n=== Planetary destruction: materials, tidal/Roche diagnostics, fracture ===\n");
+    RunPlanetTests();
+
 #ifdef BH_CUDA_AVAILABLE
     std::printf("\n=== CPU vs GPU render comparison (Stage 7) ===\n");
     RunGpuRenderTests();
+
+    std::printf("\n=== Kerr CPU vs GPU render comparison ===\n");
+    RunKerrGpuRenderTests();
+
+    std::printf("\n=== Binary CPU vs GPU render comparison ===\n");
+    RunBinaryGpuRenderTests();
+#endif
+#ifdef BH_PLANET_CUDA_AVAILABLE
+    std::printf("\n=== Planetary destruction: CPU vs GPU step agreement ===\n");
+    RunPlanetGpuTests();
 #endif
 
     const int failures = TestFramework::FailureCount();

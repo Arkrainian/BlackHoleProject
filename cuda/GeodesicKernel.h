@@ -55,6 +55,60 @@ struct KernelGeodesicConfig {
     bool diskClockwise = true;
 };
 
+// Mirrors Physics::KerrGeodesicConfig (Physics/KerrGeodesicSolver.h) --
+// same reasoning as KernelGeodesicConfig above for keeping this a separate
+// plain struct. No schwarzschildRadius field (Kerr's horizon depends on
+// spin too, computed device-side from Physics::Kerr::OuterHorizonSim); no
+// recordPath (the kernel never records paths, matching KernelGeodesicConfig).
+struct KernelKerrConfig {
+    float captureMultiplier = 1.001f;
+    float escapeRadius = 1.0e4f;
+    float baseLambdaStep = 0.02f;
+    float minLambdaStep = 1.0e-5f;
+    float maxLambdaStep = 5.0e4f;
+    int maxSteps = 8000;
+    bool checkDisk = false;
+    float diskInnerRadius = 6.0f;
+    float diskOuterRadius = 26.0f;
+};
+
+// Mirrors Physics::BinaryGeodesicConfig (Physics/BinaryGeodesicSolver.h).
+// No recordPath (the kernel never records paths); body positions/masses
+// are passed separately (KernelBinaryBodies below) rather than embedded
+// here, since they're derived host-side from Physics::BinarySystem's
+// current orbital phase each frame, not part of the tuning config itself.
+struct KernelBinaryConfig {
+    float escapeRadius = 1.0e4f;
+    float baseStep = 0.05f;
+    float minStep = 1.0e-4f;
+    float maxStep = 1.0e4f;
+    int maxSteps = 20000;
+
+    // Each body's own thin equatorial (z=0) disk -- see
+    // Physics::BinaryGeodesicConfig for the coplanar-with-the-orbit
+    // simplification this makes.
+    bool checkDisk = false;
+    float disk1InnerRadius = 6.0f, disk1OuterRadius = 26.0f;
+    float disk2InnerRadius = 6.0f, disk2OuterRadius = 26.0f;
+};
+
+// The two masses' current positions and GM values -- computed host-side
+// from Physics::BinarySystem::Position1()/Position2()/SchwarzschildRadius*
+// once per frame (the "frozen lens" snapshot, same as the CPU solver takes)
+// rather than recomputed per-thread on the device from an orbital phase.
+// captureRadiusN is already captureMultiplier * SchwarzschildRadiusN -- the
+// multiplication happens host-side (CUDATracer.cpp), not here, so this
+// struct only ever carries the final values the kernel compares against.
+// rsN (the UN-multiplied Schwarzschild radius) is also carried separately,
+// since the disk redshift formula needs the bare rs, not the capture
+// radius.
+struct KernelBinaryBodies {
+    KernelVec3 position1, position2;
+    float gm1 = 1.0f, gm2 = 1.0f;
+    float rs1 = 2.0f, rs2 = 2.0f;
+    float captureRadius1 = 2.0f, captureRadius2 = 2.0f;
+};
+
 // Mirrors Physics::PhotonFate.
 enum class KernelFate : int { Active = 0, Captured = 1, Escaped = 2, Unresolved = 3 };
 
@@ -64,6 +118,10 @@ struct KernelPixelResult {
     bool hitDisk = false;
     float diskHitRadius = 0.0f;
     float diskRedshiftFactor = 1.0f;
+    // Binary-only: which body's disk was hit (0 or 1) -- see
+    // Physics::PhotonTraceResult::diskBodyIndex. Unused (stays 0) for
+    // Schwarzschild/Kerr, which only ever have one body anyway.
+    int diskBodyIndex = 0;
 };
 
 // Traces one photon geodesic per pixel on the GPU (one CUDA thread per
@@ -84,6 +142,27 @@ struct KernelPixelResult {
 // top of the kernel's own, genuinely fast, GPU time).
 const KernelPixelResult* LaunchGeodesicKernel(const KernelCameraFrame& camera, const KernelGeodesicConfig& config,
                                                int width, int height);
+
+// Same contract as LaunchGeodesicKernel (same persistent pinned-buffer
+// pattern, same KernelPixelResult output type -- the two share their
+// buffers, since only one of them is ever launched per frame), but traces
+// through general (non-equatorial) Kerr spacetime via
+// Physics::KerrGeodesicMath's Carter-constant formulation instead of the
+// Schwarzschild u(phi) reduction -- see TracePhotonKerrDevice in
+// geodesic_kernel.cu, which mirrors Physics::TracePhotonKerr
+// (KerrGeodesicSolver.cpp) step for step. spin is the dimensionless Kerr
+// parameter a* (already clamped to +-0.998 by the caller, same convention
+// as BlackHole::Spin()).
+const KernelPixelResult* LaunchKerrGeodesicKernel(const KernelCameraFrame& camera, const KernelKerrConfig& config,
+                                                   float spin, int width, int height);
+
+// Same contract again, this time for the approximate binary-black-hole
+// scheme (see Physics/BinaryGeodesicSolver.h for what "approximate" means
+// here and why) -- TracePhotonBinaryDevice in geodesic_kernel.cu mirrors
+// Physics::TracePhotonBinary (BinaryGeodesicSolver.cpp) step for step,
+// the same porting approach LaunchKerrGeodesicKernel used.
+const KernelPixelResult* LaunchBinaryGeodesicKernel(const KernelCameraFrame& camera, const KernelBinaryConfig& config,
+                                                     const KernelBinaryBodies& bodies, int width, int height);
 
 // True if a CUDA device was found and initialized successfully; false (with
 // LaunchGeodesicKernel never called) otherwise -- checked once by

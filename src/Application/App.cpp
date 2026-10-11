@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -24,13 +25,17 @@
 #include <chrono>
 
 #include "Astronomy/AccretionDisk.h"
+#include "Astronomy/PlanetBody.h"
 #include "Astronomy/StarBody.h"
 #include "Astronomy/StarField.h"
 #include "Jet/FlightCamera.h"
 #include "Jet/FlightPhysics.h"
 #include "Jet/InputHandler.h"
 #include "Jet/JetRenderer.h"
+#include "Physics/BinaryGeodesicSolver.h"
 #include "Physics/BlackHole.h"
+#include "Physics/KerrGeodesicSolver.h"
+#include "Physics/KerrMetric.h"
 #include "Physics/Constants.h"
 #include "Physics/GeodesicSolver.h"
 #include "Physics/NewtonianSimulation.h"
@@ -46,6 +51,8 @@
 using Physics::BlackHole;
 using Physics::GeodesicConfig;
 using Physics::IntegratorMethod;
+using Physics::KerrGeodesicConfig;
+using Physics::TracePhotonKerr;
 using Physics::NewtonianSimulation;
 using Physics::NewtonianSimulationConfig;
 using Physics::ParticleFate;
@@ -251,6 +258,37 @@ RayTracing::CameraFrame BuildCameraFrame(const Rendering::Camera& camera, int re
 // hardcoded constant so it can be raised or lowered for different hardware.
 constexpr int kDefaultMaxRenderPixels = 1'500'000;
 
+// Kerr's per-step cost is much higher than Schwarzschild's -- every RK4
+// stage needs its own sin/cos pair (KerrGeodesicMath::RK4Step), where
+// Schwarzschild's u(phi) RK4Step is pure polynomial arithmetic -- so
+// reusing the Schwarzschild live-render step budget (8000, see
+// PerformRender's geodesicConfig.maxSteps) for Kerr would let rays near
+// the photon sphere (i.e. the shadow boundary -- a performance-critical
+// RING of pixels, not a rare case) burn many times more work per pixel
+// before resolving. This smaller cap bounds that worst case directly;
+// any ray that doesn't resolve within it renders UNRESOLVED (black,
+// visually indistinguishable from CAPTURED at the shadow edge), so the
+// visual cost is a marginally thicker shadow boundary, not a visible
+// artifact.
+constexpr int kKerrLiveMaxSteps = 1500;
+
+// Same reasoning as kKerrLiveMaxSteps above, for binary mode: TWO shadow
+// boundaries now (one per mass) instead of one, each a performance-
+// critical ring of pixels where the adaptive step shrinks and a ray can
+// burn through many steps before resolving. escapeRadius is also capped
+// well below BinaryGeodesicConfig's 1e4 default -- visually, a ray that's
+// already this far from both masses is just heading to the starfield in
+// a straight line, so there's nothing to gain from tracing it further,
+// only step-count cost.
+constexpr int kBinaryLiveMaxSteps = 1200;
+// Must stay comfortably above the camera's own max orbit distance (300,
+// see the Orbit-mode mouse-wheel clamp in App::Run) -- an escapeRadius
+// smaller than the camera's own distance from the origin would make the
+// very first integration step register as "escaped" trivially, before
+// the ray has gone anywhere (the exact mistake tests/test_binary.cpp's
+// own history already caught once this project).
+constexpr double kBinaryLiveEscapeRadius = 600.0;
+
 std::pair<int, int> ComputeRenderResolution(int fbWidth, int fbHeight, double scalePercent, int maxRenderPixels) {
     const double scale = scalePercent / 100.0;
     int w = std::max(1, static_cast<int>(fbWidth * scale));
@@ -289,7 +327,15 @@ glm::vec3 SamplePointSource(const glm::dvec3& direction, const glm::dvec3& sourc
 // photon paths/impact parameters/deflection angles/closest approach for
 // the actual camera-perspective rays that build the Einstein ring, rather
 // than the flat-beam rays used for the Stage 1/2 comparison plot.
-std::vector<PhotonTraceResult> BuildCameraDebugRays(const RayTracing::CameraFrame& frame, int count) {
+//
+// spin: routes through TracePhotonKerr instead of TracePhoton when
+// nonzero, exactly like RayTracing::RenderImage does for the actual
+// lensed render -- this used to always call TracePhoton regardless of
+// the black hole's spin, which silently showed Schwarzschild debug rays
+// (and a Schwarzschild b) while the actual Stage 3 render next to it was
+// using Kerr physics. Fixed alongside adding the Photon Inspector below,
+// since both share this same "which solver for the current spin" need.
+std::vector<PhotonTraceResult> BuildCameraDebugRays(const RayTracing::CameraFrame& frame, int count, double spin) {
     std::vector<PhotonTraceResult> traces;
     traces.reserve(count);
 
@@ -300,13 +346,104 @@ std::vector<PhotonTraceResult> BuildCameraDebugRays(const RayTracing::CameraFram
     config.maxSteps = 20000;
     config.basePhiStep = 0.01;
 
+    KerrGeodesicConfig kerrConfig;
+    kerrConfig.recordPath = true;
+    kerrConfig.maxPathPoints = 500;
+    kerrConfig.escapeRadius = 1.0e4;
+    kerrConfig.maxSteps = 20000;
+
     for (int i = 0; i < count; ++i) {
         const double t = count > 1 ? static_cast<double>(i) / (count - 1) : 0.5;
         const double ndcY = (t * 2.0 - 1.0) * frame.tanHalfFovY;
         const glm::dvec3 direction = glm::normalize(frame.forward + ndcY * frame.up);
-        traces.push_back(TracePhoton(frame.position, direction, config));
+        traces.push_back(spin != 0.0 ? TracePhotonKerr(frame.position, direction, spin, kerrConfig)
+                                      : TracePhoton(frame.position, direction, config));
     }
     return traces;
+}
+
+// Photon Inspector: traces exactly ONE ray, picked by NDC position within
+// the current camera frame (same NDC convention RayTracing::RenderImage
+// uses per-pixel), with full path recording -- this is the single-ray
+// counterpart to BuildCameraDebugRays' fan of rays along one scanline,
+// letting the user target any point in the image (including off the
+// vertical centerline, e.g. the asymmetric part of a Kerr shadow) rather
+// than only a fixed 1D sweep.
+PhotonTraceResult TraceInspectorRay(const RayTracing::CameraFrame& frame, double ndcX, double ndcY, double spin) {
+    const glm::dvec3 direction = glm::normalize(frame.forward + ndcX * frame.aspect * frame.tanHalfFovY * frame.right +
+                                                 ndcY * frame.tanHalfFovY * frame.up);
+    if (spin != 0.0) {
+        KerrGeodesicConfig kerrConfig;
+        kerrConfig.recordPath = true;
+        kerrConfig.maxPathPoints = 2000;
+        kerrConfig.escapeRadius = 1.0e4;
+        kerrConfig.maxSteps = 20000;
+        return TracePhotonKerr(frame.position, direction, spin, kerrConfig);
+    }
+    GeodesicConfig config;
+    config.recordPath = true;
+    config.maxPathPoints = 2000;
+    config.escapeRadius = 1.0e4;
+    config.maxSteps = 20000;
+    config.basePhiStep = 0.01;
+    return TracePhoton(frame.position, direction, config);
+}
+
+// Scientific Plots: one sample of the deflection-angle-vs-impact-parameter
+// sweep, both numerically ray-traced (same solver the render uses) and
+// from the closed-form weak-field formula (docs/physics.md Sec. 7) --
+// the interactive counterpart to docs/validation.md's fixed table.
+struct DeflectionSample {
+    float b = 0.0f;
+    float numericalDeflection = 0.0f; // radians; 0 if the ray didn't escape (captured/unresolved)
+    float analyticDeflection = 0.0f;  // Schwarzschild weak-field formula, regardless of spin -- see caller
+    bool escaped = false;
+};
+
+// Launches each ray from r0=1e5 (effectively "from infinity", same
+// convention as docs/validation.md) at a flat beam toward the hole, exactly
+// like the existing Stage 1/2 comparison and BuildCameraDebugRays already
+// do, just sweeping b instead of fixing it. spin routes to TracePhotonKerr
+// exactly like everywhere else in this file. The analytic curve is
+// DELIBERATELY always the spin-less Schwarzschild formula (2*rs/b plus the
+// next-order PPN term) even when spin != 0 -- with spin on, the gap
+// between the two curves IS the frame-dragging signature (prograde deflects
+// less, retrograde more, than a non-rotating hole of the same mass), a real
+// physical effect to show, not an error to hide by deriving a spin-corrected
+// reference curve.
+std::vector<DeflectionSample> BuildDeflectionSweep(double bMin, double bMax, int count, double spin) {
+    std::vector<DeflectionSample> samples;
+    samples.reserve(count);
+
+    const double r0 = 1.0e5;
+    const double rs = BlackHole::SchwarzschildRadiusSim();
+
+    GeodesicConfig config;
+    config.escapeRadius = 1.0e6;
+    config.maxSteps = 50000;
+    config.basePhiStep = 0.01;
+
+    KerrGeodesicConfig kerrConfig;
+    kerrConfig.escapeRadius = 1.0e6;
+    kerrConfig.maxSteps = 50000;
+
+    for (int i = 0; i < count; ++i) {
+        const double t = count > 1 ? static_cast<double>(i) / (count - 1) : 0.0;
+        const double b = bMin + t * (bMax - bMin);
+
+        const PhotonTraceResult result =
+            spin != 0.0 ? TracePhotonKerr(glm::dvec3(-r0, b, 0.0), glm::dvec3(1.0, 0.0, 0.0), spin, kerrConfig)
+                        : TracePhoton(glm::dvec3(-r0, b, 0.0), glm::dvec3(1.0, 0.0, 0.0), config);
+
+        DeflectionSample s;
+        s.b = static_cast<float>(b);
+        s.escaped = result.fate == PhotonFate::ESCAPED;
+        s.numericalDeflection = s.escaped ? static_cast<float>(std::abs(result.totalDeflectionAngle)) : 0.0f;
+        s.analyticDeflection =
+            static_cast<float>(2.0 * rs / b + (15.0 * glm::pi<double>() / 16.0) * (rs / b) * (rs / b));
+        samples.push_back(s);
+    }
+    return samples;
 }
 
 } // namespace
@@ -365,6 +502,12 @@ int App::Run() {
     UiMode uiMode = UiMode::Simple;
     std::string activePreset = "Black Hole"; // which Simple-mode preset is currently framed up
     double blackHoleMassSolar = blackHole.MassSolarMasses(); // shared by the Simple and Advanced mass sliders
+    double blackHoleSpin = 0.0; // a* = Jc/(GM^2); 0 = Schwarzschild (default), see Advanced > Spacetime
+
+    // --- Binary black holes (approximate, see Physics/BinaryGeodesicSolver.h) ---
+    bool binaryModeEnabled = false;
+    Physics::BinarySystem binarySystem;
+    bool binaryOrbitAnimated = true;
 
     ScenarioParams scenarioParams;
     NewtonianSimulationConfig simConfig;
@@ -380,6 +523,7 @@ int App::Run() {
     bool paused = false;
     int stepsPerFrame = 2;
     bool showGrid = true;
+    bool showWarpedGrid = false; // Flamm's-paraboloid funnel surface, see Renderer::DrawFlammParaboloid
     bool showAnalyticCurve = true;
     bool showHorizon = true;
     bool showNewtonianTrajectories = true;
@@ -443,10 +587,39 @@ int App::Run() {
     int cameraDebugRayCount = 21;
     std::vector<PhotonTraceResult> cameraDebugRays;
 
+    // --- Photon Inspector: a single, precisely-targeted ray, with its
+    // full conserved quantities/path -- see TraceInspectorRay. Recomputed
+    // live every frame the panel is open (one ray is negligible cost),
+    // not cached behind a button, so dragging the NDC sliders updates the
+    // readout and the 3D path immediately.
+    bool showPhotonInspector = false;
+    double inspectorNdcX = 0.0;
+    double inspectorNdcY = 0.3;
+    bool inspectorShowPath = true;
+    PhotonTraceResult inspectorResult;
+
+    // --- Scientific Plots: deflection-angle sweep state (see
+    // BuildDeflectionSweep) -- button-triggered, not recomputed live like
+    // the Photon Inspector above, since a sweep is dozens of full ray
+    // traces (expensive in Kerr mode specifically, see HANDOFF.md Session
+    // 5's lag fix) rather than just one. ---
+    double plotBMin = 4.0;
+    double plotBMax = 20.0;
+    int plotSampleCount = 60;
+    std::vector<DeflectionSample> deflectionSweep;
+
     // --- Stage 6: accretion disk state ---
     bool diskEnabled = false;
     Astronomy::AccretionDiskSettings diskSettings;
     Astronomy::AccretionDisk accretionDisk(diskSettings, blackHole.MassKg());
+
+    // Body 2's own disk, in binary mode -- same diskEnabled/diskSettings
+    // toggle and relativistic-effects flag as body 1's above (no separate
+    // UI needed), but its own AccretionDisk instance since it has its own
+    // mass (-> its own real Kelvin scale) and its own radii, scaled from
+    // diskSettings' values by body 2's Schwarzschild radius relative to
+    // body 1's (see PerformRender).
+    Astronomy::AccretionDisk accretionDisk2(diskSettings, blackHole.MassKg());
 
     // --- Stars: user-spawned tidal-disruption test bodies (see
     // Astronomy/StarBody.h) -- each is a small cluster of particles that
@@ -469,6 +642,73 @@ int App::Run() {
         const double circularSpeed = std::sqrt(1.0 / starSpawnRadius); // Newtonian v_circ, GM=1 sim units
         const glm::dvec3 velocity = tangential * (circularSpeed * starOrbitalSpeedFraction);
         stars.emplace_back(position, velocity);
+    };
+
+    // --- Planets: user-spawned tidal-disruption bodies with an actual
+    // spring-network cohesion model (see Astronomy/PlanetBody.h). Unlike
+    // stars, a planet resists deformation until its internal springs are
+    // stressed past the chosen material's strength, so whether/how it
+    // fractures depends on the chosen composition and initial condition,
+    // not just on distance from the hole.
+    std::vector<Astronomy::PlanetBody> planets;
+    // Tuned (not an arbitrary default) so the plain "Add Planet" button
+    // actually shows a fracture within ~20-25 seconds of real time rather
+    // than needing ~40s before anything visibly happens: at the old default
+    // (20.0, 0.55) a rocky planet DOES eventually fracture, but takes
+    // roughly twice as long to start breaking (measured via a scripted
+    // probe against PlanetBody directly, not guessed).
+    double planetSpawnRadius = 14.0;           // sim units
+    double planetOrbitalSpeedFraction = 0.7;   // fraction of local Newtonian circular speed
+    double planetMassEarths = 1.0;             // Earth masses
+    double planetMaterialStrengthMultiplier = 1.0; // scales the chosen preset's materialStrength
+    int planetParticleCount = 90;
+    Physics::PlanetComposition planetComposition = Physics::PlanetComposition::Rocky;
+    std::mt19937 planetSpawnRng(std::random_device{}());
+
+    constexpr double kEarthMassKg = 5.972e24;
+
+    auto SpawnPlanetWith = [&](double spawnRadius, double orbitalSpeedFraction) {
+        std::uniform_real_distribution<double> azimuthDist(0.0, 2.0 * glm::pi<double>());
+        const double azimuth = azimuthDist(planetSpawnRng);
+        const glm::dvec3 radial(std::cos(azimuth), 0.0, std::sin(azimuth));
+        const glm::dvec3 position = radial * spawnRadius;
+        const glm::dvec3 tangential(-std::sin(azimuth), 0.0, std::cos(azimuth));
+        const double circularSpeed = std::sqrt(1.0 / spawnRadius); // Newtonian v_circ, GM=1 sim units
+        const glm::dvec3 velocity = tangential * (circularSpeed * orbitalSpeedFraction);
+
+        Astronomy::PlanetBodySettings settings;
+        settings.particleCount = planetParticleCount;
+        settings.totalMassKg = planetMassEarths * kEarthMassKg;
+        settings.material = Physics::PlanetMaterial::Preset(planetComposition);
+        settings.material.materialStrength *= planetMaterialStrengthMultiplier;
+        planets.emplace_back(position, velocity, settings);
+    };
+    auto SpawnPlanet = [&]() { SpawnPlanetWith(planetSpawnRadius, planetOrbitalSpeedFraction); };
+
+    // One-click initial-condition presets (spec 28.19, subset): each sets
+    // the spawn distance/speed/composition together and immediately spawns
+    // a planet, rather than just filling in the sliders, so a click always
+    // produces something to watch.
+    const double planetIsco = 3.0 * Physics::BlackHole::SchwarzschildRadiusSim();
+    auto SpawnPlanetPresetStableOrbit = [&]() {
+        planetComposition = Physics::PlanetComposition::Rocky;
+        SpawnPlanetWith(60.0, 1.0);
+    };
+    auto SpawnPlanetPresetCloseFlyby = [&]() {
+        planetComposition = Physics::PlanetComposition::Rocky;
+        SpawnPlanetWith(planetIsco * 2.5, 0.85);
+    };
+    auto SpawnPlanetPresetRockyDisruption = [&]() {
+        planetComposition = Physics::PlanetComposition::Rocky;
+        SpawnPlanetWith(planetIsco * 1.6, 0.5);
+    };
+    auto SpawnPlanetPresetIcyDisruption = [&]() {
+        planetComposition = Physics::PlanetComposition::Icy;
+        SpawnPlanetWith(planetIsco * 1.6, 0.5);
+    };
+    auto SpawnPlanetPresetDirectInfall = [&]() {
+        planetComposition = Physics::PlanetComposition::Rocky;
+        SpawnPlanetWith(planetIsco * 3.0, 0.0);
     };
 
     double lastMouseX = 0.0, lastMouseY = 0.0;
@@ -543,6 +783,39 @@ int App::Run() {
         renderSettings.geodesicConfig.diskOuterRadius = diskSettings.outerRadius;
         renderSettings.geodesicConfig.diskClockwise = diskSettings.clockwise;
 
+        // Kerr mode (see Advanced > Spacetime): routes every pixel through
+        // the Kerr geodesic solver instead of the Schwarzschild one, on
+        // either CPU (RayTracing::RenderImage) or GPU (RenderImageCUDA ->
+        // TraceKerrPhotonsKernel) -- see HANDOFF.md Session 4.
+        renderSettings.spin = blackHole.Spin();
+        renderSettings.kerrConfig.escapeRadius = renderSettings.geodesicConfig.escapeRadius;
+        renderSettings.kerrConfig.maxSteps = kKerrLiveMaxSteps;
+        renderSettings.kerrConfig.baseLambdaStep = 0.05; // looser than the 0.02 default -- same speed/accuracy tradeoff as geodesicConfig.basePhiStep above
+        renderSettings.kerrConfig.checkDisk = diskEnabled;
+        renderSettings.kerrConfig.diskInnerRadius = diskSettings.innerRadius;
+        renderSettings.kerrConfig.diskOuterRadius = diskSettings.outerRadius;
+
+        // Binary black holes (see Advanced > Binary Black Holes): takes
+        // priority over Kerr/Schwarzschild when enabled -- a rotating
+        // member of a binary isn't modeled. Each body gets its own disk,
+        // reusing the SAME diskEnabled/diskSettings the single-body modes
+        // use (see accretionDisk2's declaration) rather than a separate
+        // set of sliders -- body 2's radii are scaled by its Schwarzschild
+        // radius relative to body 1's, preserving the same "radius in
+        // units of r_s" the user actually set.
+        renderSettings.binaryEnabled = binaryModeEnabled;
+        renderSettings.binarySystem = binarySystem;
+        renderSettings.binaryConfig.escapeRadius = kBinaryLiveEscapeRadius;
+        renderSettings.binaryConfig.maxSteps = kBinaryLiveMaxSteps;
+        renderSettings.binaryConfig.checkDisk = diskEnabled;
+        renderSettings.binaryConfig.disk1InnerRadius = diskSettings.innerRadius;
+        renderSettings.binaryConfig.disk1OuterRadius = diskSettings.outerRadius;
+        {
+            const double rs2OverRs1 = binarySystem.massRatio; // SchwarzschildRadius2()/SchwarzschildRadius1()
+            renderSettings.binaryConfig.disk2InnerRadius = diskSettings.innerRadius * rs2OverRs1;
+            renderSettings.binaryConfig.disk2OuterRadius = diskSettings.outerRadius * rs2OverRs1;
+        }
+
         const RayTracing::CameraFrame frame = BuildCameraFrame(camera, w, h);
         const glm::dvec3 sourceDirection = frame.forward; // Stage 4: always collinear, see SamplePointSource
 
@@ -556,11 +829,19 @@ int App::Run() {
 
         accretionDisk.SetSettings(diskSettings);
         accretionDisk.SetBlackHoleMassKg(blackHole.MassKg());
+        {
+            Astronomy::AccretionDiskSettings disk2Settings = diskSettings;
+            disk2Settings.innerRadius = renderSettings.binaryConfig.disk2InnerRadius;
+            disk2Settings.outerRadius = renderSettings.binaryConfig.disk2OuterRadius;
+            accretionDisk2.SetSettings(disk2Settings);
+            accretionDisk2.SetBlackHoleMassKg(blackHole.MassKg() * binarySystem.massRatio);
+        }
         const RayTracing::DiskSampler diskSampler = [&](const PhotonTraceResult& hit) {
-            const double emittedTemperature = accretionDisk.Temperature(hit.diskHitRadius);
+            const Astronomy::AccretionDisk& whichDisk = (hit.diskBodyIndex == 1) ? accretionDisk2 : accretionDisk;
+            const double emittedTemperature = whichDisk.Temperature(hit.diskHitRadius);
             const double observedTemperature =
                 diskSettings.relativisticEffects ? emittedTemperature * hit.diskRedshiftFactor : emittedTemperature;
-            return accretionDisk.EmittedColor(observedTemperature);
+            return whichDisk.EmittedColor(observedTemperature);
         };
 
         const auto t0 = std::chrono::steady_clock::now();
@@ -938,6 +1219,20 @@ int App::Run() {
                 "scripted stretching, just ~28 particles each falling under the exact same physics "
                 "as everything else here. Switch to Advanced mode to tune its starting orbit.");
 
+            ImGui::Separator();
+            if (ImGui::Button("Add Planet")) {
+                SpawnPlanet();
+            }
+            ImGui::SameLine();
+            if (!planets.empty() && ImGui::Button("Clear Planets")) {
+                planets.clear();
+            }
+            ImGui::TextWrapped(
+                "Drops a planet held together by an actual spring network -- it visibly stretches "
+                "and, if tidal stress overcomes the chosen material's strength, fractures into "
+                "tracked fragments. Switch to Advanced mode for material presets, encounter "
+                "presets, and live diagnostics.");
+
             ImGui::TextWrapped("Tip: drag with the left mouse button to look around -- the light bends in real time as you move. Scroll to zoom.");
             if (ImGui::Button("Show every control (Advanced mode)")) {
                 uiMode = UiMode::Advanced;
@@ -963,6 +1258,67 @@ int App::Run() {
             HelpTooltip("How much mass the black hole has, in units of our Sun's mass. Heavier = larger Schwarzschild radius, but the SHAPE of everything you see stays the same (it's all scale-invariant) -- only the physical size in kilometers changes.");
             ImGui::Text("Schwarzschild radius r_s = 2GM/c^2 = %.3e km", blackHole.SchwarzschildRadiusMeters() / 1000.0);
             ImGui::Text("(In simulation units, r_s is always exactly 2.0 -- see Physics/Constants.h)");
+
+            ImGui::Separator();
+            if (SliderDouble("Spin a* = Jc/(GM^2)", &blackHoleSpin, -0.998, 0.998, "%.3f")) {
+                blackHole.SetSpin(blackHoleSpin);
+            }
+            HelpTooltip(
+                "Dimensionless spin; 0 is the non-rotating Schwarzschild hole above every other stage was "
+                "built against. Nonzero switches ray tracing to the Kerr geodesic solver (frame dragging, "
+                "an ergosphere, a prograde/retrograde-asymmetric shadow) -- runs on GPU when available, same "
+                "as Schwarzschild mode, via a separate CUDA kernel.");
+            if (blackHole.IsRotating()) {
+                const double a = blackHole.Spin();
+                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "Kerr mode active (a*=%.3f).", a);
+                ImGui::Text("Outer horizon r+ = %.4f   Inner horizon r- = %.4f (sim units)",
+                             Physics::Kerr::OuterHorizonSim(a), Physics::Kerr::InnerHorizonSim(a));
+                ImGui::Text("Equatorial ergosphere r = %.4f (always 2M, independent of spin)",
+                             Physics::Kerr::ErgosphereRadiusSim(a, 0.0));
+                ImGui::Text("Photon orbit: prograde r = %.4f   retrograde r = %.4f",
+                             Physics::Kerr::EquatorialPhotonOrbitRadiusSim(a, true),
+                             Physics::Kerr::EquatorialPhotonOrbitRadiusSim(a, false));
+                ImGui::Text("ISCO: prograde r = %.4f   retrograde r = %.4f",
+                             Physics::Kerr::EquatorialIscoRadiusSim(a, true), Physics::Kerr::EquatorialIscoRadiusSim(a, false));
+                ImGui::TextWrapped(
+                    "The accretion disk below is assumed prograde (co-rotating with the spin) in Kerr "
+                    "mode -- physically standard (Lense-Thirring torquing aligns a real disk with the "
+                    "spin), so its own rotation-direction toggle is ignored here.");
+            }
+        }
+
+        if (ImGui::CollapsingHeader("Binary Black Holes (approximate)")) {
+            ImGui::Checkbox("Enable binary mode", &binaryModeEnabled);
+            HelpTooltip(
+                "Two orbiting masses instead of one. UNLIKE the Schwarzschild/Kerr modes above, there is "
+                "no exact closed-form solution for two orbiting black holes in general relativity at all -- "
+                "this uses a deliberately approximate scheme instead: each mass bends light via TWICE its "
+                "Newtonian gravitational acceleration (the standard trick that reproduces GR's correct "
+                "weak-field bending angle from a cheap, easy-to-superpose force law), summed across both "
+                "masses. It reproduces the real weak-field deflection formula closely (see "
+                "tests/test_binary.cpp) but does NOT reproduce exact strong-field effects (the real photon "
+                "sphere, critical impact parameter, frame dragging) near either hole. Each body gets its "
+                "own accretion disk, reusing the SAME 'Enable accretion disk' toggle and settings as "
+                "Stage 6 below (body 2's radii scale with its own Schwarzschild radius). Takes priority "
+                "over Kerr spin above when enabled (a rotating member of a binary isn't modeled) -- runs "
+                "on GPU when available, same as Schwarzschild/Kerr, via a separate CUDA kernel.");
+            if (binaryModeEnabled) {
+                SliderDouble("Mass ratio (M2/M1)", &binarySystem.massRatio, 0.05, 1.0, "%.3f");
+                HelpTooltip("Body 1 IS the black hole configured above (same mass slider, same r_s). This is body 2's mass relative to it -- 1.0 means equal masses.");
+                SliderDouble("Separation (sim units)", &binarySystem.separation, 10.0, 150.0, "%.2f");
+                ImGui::Checkbox("Animate orbit", &binaryOrbitAnimated);
+                if (!binaryOrbitAnimated) {
+                    SliderDouble("Orbital phase (rad)", &binarySystem.phase, -glm::pi<double>(), glm::pi<double>(), "%.3f");
+                }
+
+                ImGui::Text("r1 = %.3f   r2 = %.3f   (from the barycenter, which sits at the origin)",
+                             binarySystem.Radius1(), binarySystem.Radius2());
+                ImGui::Text("rs1 = %.3f   rs2 = %.3f   separation/orbital period = %.3f",
+                             binarySystem.SchwarzschildRadius1(), binarySystem.SchwarzschildRadius2(),
+                             binarySystem.OrbitalPeriod());
+                ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+                                    "Binary mode active -- rendering with the approximate superposed-lensing solver.");
+            }
         }
 
         if (ImGui::CollapsingHeader("Scenario", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -989,6 +1345,15 @@ int App::Run() {
         }
 
         ImGui::Checkbox("Show grid", &showGrid);
+        ImGui::Checkbox("Show Flamm's paraboloid (spacetime curvature funnel)", &showWarpedGrid);
+        HelpTooltip(
+            "The classic embedding-diagram 'funnel' around each black hole: a surface of revolution "
+            "whose shape follows the exact formula for the real Schwarzschild spatial embedding "
+            "(y = -2*sqrt(r_s*(rho-r_s)), rho = distance from the hole), flaring out from a vertical-"
+            "tangent throat right at the horizon to nearly flat far away. This is a genuine textbook "
+            "result, but it's a 2D ANALOGY: a 2D surface embedded in 3D space standing in for 4D "
+            "spacetime curvature, not a literal picture of it. In binary mode, each body gets its own "
+            "funnel.");
         ImGui::Checkbox("Show analytic Kepler reference", &showAnalyticCurve);
         ImGui::Checkbox("Show black hole horizon", &showHorizon);
         ImGui::Checkbox("Show Newtonian trajectories (Stage 1)", &showNewtonianTrajectories);
@@ -1139,7 +1504,6 @@ int App::Run() {
             } else {
                 ImGui::TextDisabled("GPU (CUDA): not compiled in this build (configure with -DBH_ENABLE_CUDA=ON)");
             }
-
             if (ImGui::Button(liveMode ? "Render Now (force refresh)" : "Render Now")) {
                 PerformRender();
                 needsRerender = false;
@@ -1159,6 +1523,19 @@ int App::Run() {
                 renderSettings.geodesicConfig.diskInnerRadius = diskSettings.innerRadius;
                 renderSettings.geodesicConfig.diskOuterRadius = diskSettings.outerRadius;
                 renderSettings.geodesicConfig.diskClockwise = diskSettings.clockwise;
+
+                // Mirrors PerformRender: with spin != 0, both sides of this
+                // comparison exercise the Kerr solver instead (CPU
+                // TracePhotonKerr vs. the GPU TraceKerrPhotonsKernel) -- the
+                // comparison is meaningful either way, since RenderImage/
+                // RenderImageCUDA both branch on the SAME renderSettings.spin.
+                renderSettings.spin = blackHole.Spin();
+                renderSettings.kerrConfig.escapeRadius = renderSettings.geodesicConfig.escapeRadius;
+                renderSettings.kerrConfig.maxSteps = kKerrLiveMaxSteps;
+                renderSettings.kerrConfig.baseLambdaStep = 0.05;
+                renderSettings.kerrConfig.checkDisk = diskEnabled;
+                renderSettings.kerrConfig.diskInnerRadius = diskSettings.innerRadius;
+                renderSettings.kerrConfig.diskOuterRadius = diskSettings.outerRadius;
 
                 const RayTracing::CameraFrame frame = BuildCameraFrame(camera, w, h);
                 const glm::dvec3 sourceDirection = frame.forward;
@@ -1247,7 +1624,7 @@ int App::Run() {
             }
             if (ImGui::Button("Trace Camera Debug Rays") || (showCameraDebugRays && cameraDebugRays.empty())) {
                 const RayTracing::CameraFrame frame = BuildCameraFrame(camera, 320, 180);
-                cameraDebugRays = BuildCameraDebugRays(frame, cameraDebugRayCount);
+                cameraDebugRays = BuildCameraDebugRays(frame, cameraDebugRayCount, blackHole.Spin());
             }
 
             if (!cameraDebugRays.empty() && ImGui::BeginTable("CameraRayDebugTable", 5,
@@ -1273,6 +1650,70 @@ int App::Run() {
                     ImGui::Text("%d", p.steps);
                 }
                 ImGui::EndTable();
+            }
+        }
+
+        ImGui::Separator();
+        if (ImGui::CollapsingHeader("Photon Inspector", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Checkbox("Enable", &showPhotonInspector);
+            HelpTooltip(
+                "Pick exactly one ray by its position in the rendered image (NDC, "
+                "-1 to 1 in each axis -- 0,0 is image center) and see everything the "
+                "solver actually tracked for it: its conserved quantities, how many "
+                "integration steps it took, and how it ended up. Updates live as you "
+                "drag the sliders -- useful for pointing at a specific feature (the "
+                "shadow edge, a lensed star, the Kerr shadow's flattened side) and "
+                "seeing the real numbers behind it, not just the picture.");
+
+            if (showPhotonInspector) {
+                SliderDouble("Pixel X (NDC)", &inspectorNdcX, -1.0, 1.0, "%.3f");
+                SliderDouble("Pixel Y (NDC)", &inspectorNdcY, -1.0, 1.0, "%.3f");
+                ImGui::Checkbox("Show this ray's path in the 3D debug view", &inspectorShowPath);
+
+                const auto [iw, ih] = ComputeRenderResolution(fbWidth, fbHeight, renderScalePercent, maxRenderPixels);
+                const RayTracing::CameraFrame inspectorFrame = BuildCameraFrame(camera, iw, ih);
+                inspectorResult = TraceInspectorRay(inspectorFrame, inspectorNdcX, inspectorNdcY, blackHole.Spin());
+
+                const glm::vec3 fateColor = ColorForPhotonFate(inspectorResult.fate);
+                ImGui::TextColored(ImVec4(fateColor.r, fateColor.g, fateColor.b, 1.0f), "Fate: %s",
+                                    PhotonFateName(inspectorResult.fate));
+                ImGui::Text("Steps taken: %d", inspectorResult.steps);
+                ImGui::Text("Closest approach: %.5f sim units", inspectorResult.closestApproach);
+                ImGui::Text("Impact parameter b = |L_z / E|: %.5f", inspectorResult.impactParameter);
+
+                if (blackHole.IsRotating()) {
+                    ImGui::Text("Conserved quantities (Kerr, Carter's constant formulation):");
+                    ImGui::Text("  E (energy)        = %.6f", inspectorResult.kerrEnergyE);
+                    ImGui::Text("  L_z (ang. mom.)   = %.6f", inspectorResult.kerrAngularMomentumLz);
+                    ImGui::Text("  Q (Carter const.) = %.6f", inspectorResult.kerrCarterQ);
+                    HelpTooltip(
+                        "Q=0 means this ray stays in the equatorial plane for its whole "
+                        "path (no polar motion) -- generic rays off the equator have Q!=0. "
+                        "See docs/physics.md Sec. 10 for the governing equations these "
+                        "satisfy.");
+                } else {
+                    ImGui::Text("(Schwarzschild mode: only b is tracked -- E and L_z separately "
+                                "don't matter for a non-rotating hole's null geodesics.)");
+                }
+
+                if (inspectorResult.fate == PhotonFate::ESCAPED) {
+                    const glm::dvec3 d = inspectorResult.escapeDirection;
+                    ImGui::Text("Escaped toward direction (%.3f, %.3f, %.3f) -- sampling the sky there.",
+                                d.x, d.y, d.z);
+                }
+                if (inspectorResult.hitDisk) {
+                    ImGui::Text("Hit the accretion disk at r = %.4f (redshift factor g = %.4f)",
+                                inspectorResult.diskHitRadius, inspectorResult.diskRedshiftFactor);
+                }
+                if (inspectorResult.fate == PhotonFate::UNRESOLVED) {
+                    ImGui::TextDisabled(
+                        "Unresolved: hit the step budget before escaping or being captured -- "
+                        "typically a ray passing extremely close to the photon sphere/critical "
+                        "impact parameter. Rendered as part of the shadow either way.");
+                }
+                if (inspectorShowPath && viewLensedRender) {
+                    ImGui::TextDisabled("(Switch to the 3D debug view -- uncheck 'Show lensed render' above -- to see the path.)");
+                }
             }
         }
 
@@ -1307,6 +1748,107 @@ int App::Run() {
         }
 
         ImGui::Separator();
+        if (ImGui::CollapsingHeader("Scientific Plots", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextWrapped(
+                "Interactive counterparts to docs/validation.md's fixed tables -- computed live from "
+                "the SAME solvers the render uses, not textbook curves drawn for illustration.");
+
+            ImGui::SeparatorText("Deflection angle vs. impact parameter");
+            SliderDouble("b min", &plotBMin, 3.0, 50.0, "%.2f");
+            SliderDouble("b max", &plotBMax, 3.0, 50.0, "%.2f");
+            ImGui::SliderInt("Sample count", &plotSampleCount, 10, 150);
+            HelpTooltip(
+                "Each sample is a full ray trace (from r=1e5, effectively 'from infinity'), not an "
+                "approximation -- more samples means more traces, which costs more time, especially "
+                "in Kerr mode. Button-triggered rather than live for that reason.");
+            if (ImGui::Button("Compute Deflection Sweep")) {
+                deflectionSweep =
+                    BuildDeflectionSweep(std::min(plotBMin, plotBMax), std::max(plotBMin, plotBMax),
+                                         plotSampleCount, blackHole.Spin());
+            }
+            if (!deflectionSweep.empty()) {
+                std::vector<float> numerical, analytic;
+                numerical.reserve(deflectionSweep.size());
+                analytic.reserve(deflectionSweep.size());
+                double maxAbsErrorAtEscaped = 0.0;
+                int escapedCount = 0;
+                for (const DeflectionSample& s : deflectionSweep) {
+                    numerical.push_back(s.numericalDeflection);
+                    analytic.push_back(s.analyticDeflection);
+                    if (s.escaped) {
+                        maxAbsErrorAtEscaped =
+                            std::max(maxAbsErrorAtEscaped,
+                                     static_cast<double>(std::abs(s.numericalDeflection - s.analyticDeflection)));
+                        ++escapedCount;
+                    }
+                }
+                ImGui::PlotLines("Numerical (rad)", numerical.data(), static_cast<int>(numerical.size()), 0,
+                                  nullptr, 0.0f, FLT_MAX, ImVec2(0, 100));
+                ImGui::PlotLines("Schwarzschild weak-field formula (rad)", analytic.data(),
+                                  static_cast<int>(analytic.size()), 0, nullptr, 0.0f, FLT_MAX, ImVec2(0, 100));
+                ImGui::Text("b range: [%.3f, %.3f] sim units, %d samples, %d escaped (rest captured/unresolved)",
+                            plotBMin, plotBMax, static_cast<int>(deflectionSweep.size()), escapedCount);
+                if (blackHole.IsRotating()) {
+                    ImGui::TextColored(
+                        ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
+                        "Spin is ON: the gap between the two curves above is a REAL physical effect "
+                        "(the Kerr spin correction/frame dragging), not numerical error -- the analytic "
+                        "curve is always the SPIN-LESS Schwarzschild formula, kept fixed as a reference "
+                        "so this gap is visible rather than hidden.");
+                } else {
+                    ImGui::Text("Max |numerical - analytic| among escaped samples: %.6f rad", maxAbsErrorAtEscaped);
+                }
+            }
+
+            ImGui::SeparatorText("Gravitational time dilation (lapse factor) vs. radius");
+            HelpTooltip(
+                "How much slower a clock runs at radius r compared to a distant observer's: "
+                "sqrt(f(r)) for Schwarzschild (an exact static-observer result), or the analogous "
+                "ZAMO lapse (equatorial plane) for Kerr. 1.0 far away, 0 at the horizon.");
+            {
+                constexpr int kLapseSamples = 80;
+                const double rStart =
+                    (blackHole.IsRotating() ? Physics::Kerr::OuterHorizonSim(blackHole.Spin())
+                                             : BlackHole::SchwarzschildRadiusSim()) *
+                    1.01;
+                const double rEnd = 30.0;
+                std::vector<float> lapseValues(kLapseSamples);
+                for (int i = 0; i < kLapseSamples; ++i) {
+                    const double t = static_cast<double>(i) / (kLapseSamples - 1);
+                    const double r = rStart + t * (rEnd - rStart);
+                    const double lapse = blackHole.IsRotating()
+                                              ? Physics::Kerr::ZamoLapse(r, 0.0, 1.0, blackHole.Spin())
+                                              : std::sqrt(Physics::Schwarzschild::LapseFactor(
+                                                    r, BlackHole::SchwarzschildRadiusSim()));
+                    lapseValues[i] = static_cast<float>(lapse);
+                }
+                ImGui::PlotLines("Lapse factor (d(tau)/dt)", lapseValues.data(), kLapseSamples, 0, nullptr, 0.0f,
+                                  1.0f, ImVec2(0, 100));
+                ImGui::Text("r range: [%.3f, %.3f] sim units (1.01x horizon to 30)", rStart, rEnd);
+            }
+
+            if (diskEnabled) {
+                ImGui::SeparatorText("Accretion disk temperature profile");
+                constexpr int kTempSamples = 80;
+                std::vector<float> tempValues(kTempSamples);
+                double maxT = 0.0;
+                for (int i = 0; i < kTempSamples; ++i) {
+                    const double t = static_cast<double>(i) / (kTempSamples - 1);
+                    const double r = diskSettings.innerRadius + t * (diskSettings.outerRadius - diskSettings.innerRadius);
+                    const double T = accretionDisk.Temperature(r);
+                    tempValues[i] = static_cast<float>(T);
+                    maxT = std::max(maxT, T);
+                }
+                ImGui::PlotLines("Temperature (dimensionless shape)", tempValues.data(), kTempSamples, 0, nullptr,
+                                  0.0f, static_cast<float>(maxT * 1.1), ImVec2(0, 100));
+                ImGui::Text("r range: [%.3f, %.3f] sim units, inner-edge Kelvin scale ~ %.3e K",
+                            diskSettings.innerRadius, diskSettings.outerRadius, accretionDisk.PeakKelvin());
+            } else {
+                ImGui::TextDisabled("(Enable the accretion disk above to see its temperature profile here.)");
+            }
+        }
+
+        ImGui::Separator();
         ImGui::Text("Stars: tidal disruption");
         {
             ImGui::TextWrapped(
@@ -1338,6 +1880,104 @@ int App::Run() {
             }
             ImGui::Text("Active stars: %d (%d particles not yet consumed)", static_cast<int>(stars.size()), remainingParticles);
         }
+
+        ImGui::Separator();
+        ImGui::Text("Planets: tidal deformation and fracture");
+        {
+            ImGui::TextWrapped(
+                "Each planet is a lattice of particles connected by breakable springs -- it "
+                "resists deformation until internal spring strain exceeds its material's "
+                "strength, then fractures into tracked fragments. The tidal-acceleration and "
+                "Roche-limit numbers below are the weak-field Newtonian diagnostics from spec "
+                "28.3/28.4: informative reference values, not switches that themselves trigger "
+                "destruction -- what actually happens is whatever the spring network decides.");
+
+            const bool planetGpuAvailable = Astronomy::PlanetBody::GpuAvailable();
+            if (planetGpuAvailable) {
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "GPU (CUDA) active for planet physics");
+            } else {
+#ifdef BH_PLANET_CUDA_AVAILABLE
+                ImGui::TextDisabled("No CUDA GPU found -- planet physics runs on CPU.");
+#else
+                ImGui::TextDisabled("Running on CPU (built without CUDA).");
+#endif
+            }
+            HelpTooltip("At the particle counts below (tens to low hundreds), the GPU path is NOT expected to be faster than the CPU path -- it exists so particle count can go much higher while staying real-time, not to speed up small planets. See HANDOFF.md for the measurement this is based on.");
+
+            const char* compositionNames[] = {"Rocky", "Iron-rich", "Icy", "Gas giant", "Differentiated (approx.)"};
+            int compositionIndex = static_cast<int>(planetComposition);
+            if (ImGui::Combo("Composition", &compositionIndex, compositionNames,
+                              static_cast<int>(sizeof(compositionNames) / sizeof(compositionNames[0])))) {
+                planetComposition = static_cast<Physics::PlanetComposition>(compositionIndex);
+            }
+            HelpTooltip("What the planet is made of -- sets its reference density, how stiff its internal springs are, and (most importantly for how it comes apart) how much strain a spring can take before it snaps. Icy and gas-giant bodies fracture far earlier than rocky or iron-rich ones.");
+
+            SliderDouble("Mass (Earth masses)", &planetMassEarths, 0.01, 1000.0, "%.3f");
+            HelpTooltip("Only used for the tidal-acceleration/Roche-limit diagnostics below and to split mass across fragments -- the planet's own gravity does not pull on itself (self-gravity isn't modeled this milestone; see HANDOFF.md).");
+            {
+                // Raised only when the GPU path is actually active -- a
+                // CPU-only build/machine keeps the original 20-250 range,
+                // which is already the sane real-time ceiling for a
+                // per-frame CPU loop; pushing particle count into the
+                // thousands is the one thing the GPU path actually buys
+                // over the CPU path at this scale (see the status text
+                // above).
+                const int maxParticles = planetGpuAvailable ? 2000 : 250;
+                if (planetParticleCount > maxParticles) planetParticleCount = maxParticles;
+                int particleCountInt = planetParticleCount;
+                if (ImGui::SliderInt("Particle count (resolution)", &particleCountInt, 20, maxParticles)) {
+                    planetParticleCount = particleCountInt;
+                }
+            }
+            HelpTooltip("How many particles/springs make up the next planet you spawn (existing planets keep whatever resolution they were created with). More particles = finer fragments, more cost.");
+            SliderDouble("Material strength multiplier", &planetMaterialStrengthMultiplier, 0.1, 3.0, "%.2f");
+            HelpTooltip("Scales the chosen composition's fracture-strain threshold -- below 1.0 makes the next planet you spawn more brittle than its preset, above 1.0 tougher.");
+
+            SliderDouble("Spawn radius", &planetSpawnRadius, planetIsco, 100.0, "%.2f");
+            HelpTooltip("How far from the black hole (sim units) a newly-added planet starts. Closer in = stronger, faster tidal stress.");
+            SliderDouble("Orbital speed (fraction of circular)", &planetOrbitalSpeedFraction, 0.0, 1.3, "%.2f");
+            HelpTooltip("0 = radial plunge. 1.0 = circular (would never fall in, ignoring tidal effects). 0.4-0.7 gives an elliptical dive that tends to actually fracture the planet.");
+
+            if (ImGui::Button("Add Planet")) {
+                SpawnPlanet();
+            }
+            ImGui::SameLine();
+            if (!planets.empty() && ImGui::Button("Clear Planets")) {
+                planets.clear();
+            }
+
+            ImGui::TextWrapped("Initial-condition presets (spec 28.19, representative subset):");
+            if (ImGui::Button("Stable orbit")) SpawnPlanetPresetStableOrbit();
+            ImGui::SameLine();
+            if (ImGui::Button("Close flyby")) SpawnPlanetPresetCloseFlyby();
+            ImGui::SameLine();
+            if (ImGui::Button("Direct infall")) SpawnPlanetPresetDirectInfall();
+            if (ImGui::Button("Rocky disruption")) SpawnPlanetPresetRockyDisruption();
+            ImGui::SameLine();
+            if (ImGui::Button("Icy disruption")) SpawnPlanetPresetIcyDisruption();
+            HelpTooltip("Stable orbit: far out, near-circular -- should stay intact. Close flyby: closer, still fast -- mild stretching. Direct infall: radial plunge from moderate distance. Rocky/Icy disruption: the same close, slow encounter with two different materials, to compare how differently they come apart.");
+
+            int fragmentCount = 0, capturedParticles = 0, escapedFragments = 0, liveParticles = 0;
+            for (const Astronomy::PlanetBody& planet : planets) {
+                fragmentCount += static_cast<int>(planet.Fragments().size());
+                for (const Astronomy::PlanetFragment& fragment : planet.Fragments()) {
+                    if (fragment.escaped) ++escapedFragments;
+                }
+                for (const Astronomy::PlanetParticle& particle : planet.Particles()) {
+                    if (particle.consumed) ++capturedParticles;
+                    else ++liveParticles;
+                }
+            }
+            ImGui::Text("Active planets: %d  |  fragments: %d  |  escaped fragments: %d",
+                        static_cast<int>(planets.size()), fragmentCount, escapedFragments);
+            ImGui::Text("Particles: %d live, %d captured", liveParticles, capturedParticles);
+
+            if (!planets.empty()) {
+                const Astronomy::PlanetBody& latest = planets.back();
+                ImGui::Text("Most recent planet -- tidal accel (diagnostic): %.4e sim units  |  Roche limit (diagnostic): %.3f sim units",
+                            latest.LastTidalAccelerationSim(), latest.LastRocheLimitSim());
+            }
+        }
         } // uiMode == Advanced
 
         ImGui::End();
@@ -1364,6 +2004,25 @@ int App::Run() {
             stars.erase(std::remove_if(stars.begin(), stars.end(),
                                         [](const Astronomy::StarBody& star) { return star.IsFullyConsumed(); }),
                         stars.end());
+
+            for (Astronomy::PlanetBody& planet : planets) {
+                if (!planet.UpdateGPU(dt, blackHole)) {
+                    planet.Update(dt, blackHole);
+                }
+            }
+            planets.erase(std::remove_if(planets.begin(), planets.end(),
+                                          [](const Astronomy::PlanetBody& planet) { return planet.IsFullyConsumedOrDispersed(); }),
+                          planets.end());
+        }
+
+        // Deliberately NOT gated on `paused` -- that flag is the Stage 1
+        // Newtonian-simulation pause toggle; binary mode has its own,
+        // independent "Animate orbit" checkbox, and gating it behind an
+        // unrelated Stage 1 control would silently freeze the binary's
+        // motion for anyone who happened to have Stage 1 paused without
+        // realizing it affected a completely different feature.
+        if (binaryModeEnabled && binaryOrbitAnimated) {
+            binarySystem.AdvancePhase(dt);
         }
 
         const int width = fbWidth, height = fbHeight; // set earlier this frame, before PerformRender used them
@@ -1385,6 +2044,116 @@ int App::Run() {
             }
         };
 
+        // Draws every planet as solid shapes rather than a sparse point
+        // cloud, so it actually reads as "a planet" instead of a handful of
+        // dots: while still a single intact fragment, it's one solid
+        // spheroid stretched along the radial direction from the black
+        // hole (DrawEllipsoid) -- a direct visualization of the same tidal
+        // stretching StarBody's dots only implied. Once it has fractured
+        // (Fragments().size() > 1), each fragment with enough live
+        // particles to read as a chunk (>=4) is drawn as its own solid
+        // sphere sized to its current spread, flying apart independently;
+        // smaller debris falls back to points+trails, same as before,
+        // since a 1-3 particle "chunk" would just look like a tiny warty
+        // sphere rather than debris. Colored per-fragment (a deterministic
+        // shade of the material's base color) so broken-off pieces read as
+        // visually distinct. Shared between the overlay pass and the debug
+        // 3D view, same rationale as DrawStars; drawSprings additionally
+        // overlays the live spring lattice (only meaningful/used in the
+        // debug view, where the solid shapes don't fight with the
+        // ray-traced background for the depth buffer).
+        const auto DrawPlanets = [&](bool drawSprings) {
+            for (const Astronomy::PlanetBody& planet : planets) {
+                const glm::vec3 base = planet.BaseColor();
+                const auto& particles = planet.Particles();
+                const auto& fragments = planet.Fragments();
+                const bool stillIntact = fragments.size() <= 1;
+
+                if (drawSprings) {
+                    for (const Astronomy::PlanetSpring& spring : planet.Springs()) {
+                        if (spring.broken) continue;
+                        const Astronomy::PlanetParticle& pa = particles[static_cast<size_t>(spring.a)];
+                        const Astronomy::PlanetParticle& pb = particles[static_cast<size_t>(spring.b)];
+                        if (pa.consumed || pb.consumed) continue;
+                        std::vector<glm::dvec3> edge{pa.position, pb.position};
+                        renderer.DrawPath(edge, base * 0.6f, 1.0f);
+                    }
+                }
+
+                for (const Astronomy::PlanetFragment& fragment : fragments) {
+                    if (fragment.particleIndices.empty()) continue;
+
+                    glm::dvec3 com(0.0);
+                    double mass = 0.0;
+                    int liveCount = 0;
+                    for (int index : fragment.particleIndices) {
+                        const Astronomy::PlanetParticle& p = particles[static_cast<size_t>(index)];
+                        if (p.consumed) continue;
+                        com += p.position * p.mass;
+                        mass += p.mass;
+                        ++liveCount;
+                    }
+                    if (liveCount == 0 || mass <= 0.0) continue;
+                    com /= mass;
+
+                    const int fragmentId = std::max(0, fragment.id);
+                    const float shade = 0.55f + 0.45f * static_cast<float>((fragmentId * 37) % 11) / 10.0f;
+                    const glm::vec3 color = base * shade;
+
+                    if (liveCount < 4) {
+                        // Too few particles to read as a solid chunk --
+                        // draw as debris points+trails instead.
+                        for (int index : fragment.particleIndices) {
+                            const Astronomy::PlanetParticle& p = particles[static_cast<size_t>(index)];
+                            if (p.consumed) continue;
+                            if (p.trail.size() >= 2) renderer.DrawPath(p.trail, color, 1.5f);
+                            renderer.DrawPoint(p.position, color, 4.0f);
+                        }
+                        continue;
+                    }
+
+                    if (stillIntact) {
+                        // Still one whole body: a spheroid stretched along
+                        // the radial direction from the black hole, sized
+                        // from the actual particle spread (so it visibly
+                        // elongates as tidal stress increases, rather than
+                        // just uniformly inflating).
+                        const glm::dvec3 radialDir = glm::length(com) > 1e-6 ? glm::normalize(com) : glm::dvec3(0.0, 1.0, 0.0);
+                        double radialExtent = 0.0, lateralExtent = 0.0;
+                        for (int index : fragment.particleIndices) {
+                            const Astronomy::PlanetParticle& p = particles[static_cast<size_t>(index)];
+                            if (p.consumed) continue;
+                            const glm::dvec3 offset = p.position - com;
+                            const double alongRadial = glm::dot(offset, radialDir);
+                            radialExtent = std::max(radialExtent, std::abs(alongRadial));
+                            const glm::dvec3 lateralOffset = offset - radialDir * alongRadial;
+                            lateralExtent = std::max(lateralExtent, glm::length(lateralOffset));
+                        }
+                        const double radialSemiAxis = std::max(0.2, radialExtent * 1.15);
+                        const double lateralSemiAxis = std::max(0.2, lateralExtent * 1.15);
+                        // radialDir already IS the direction from the
+                        // black hole (the scene's one light source, at the
+                        // origin) to this body -- reused directly as the
+                        // light direction, same convention Jet::JetRenderer
+                        // already uses.
+                        renderer.DrawShadedEllipsoid(com, radialDir, radialSemiAxis, lateralSemiAxis, color, radialDir);
+                    } else {
+                        // Already a separate broken-off piece: an
+                        // (isotropic) solid sphere sized to its own spread.
+                        double maxDist = 0.0;
+                        for (int index : fragment.particleIndices) {
+                            const Astronomy::PlanetParticle& p = particles[static_cast<size_t>(index)];
+                            if (p.consumed) continue;
+                            maxDist = std::max(maxDist, glm::length(p.position - com));
+                        }
+                        const double radius = std::max(0.15, maxDist * 1.15);
+                        const glm::dvec3 lightDir = glm::length(com) > 1e-6 ? glm::normalize(com) : glm::dvec3(0.0, 1.0, 0.0);
+                        renderer.DrawShadedSphere(com, radius, color, lightDir, 8, 12);
+                    }
+                }
+            }
+        };
+
         if (viewLensedRender && lensedTextureWidth > 0) {
             glViewport(0, 0, width, height);
             glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -1397,7 +2166,7 @@ int App::Run() {
             // background. The jet is lit from the black hole's direction --
             // it's the only light source in this scene.
             const bool jetVisible = camera.mode == Rendering::Camera::Mode::Jet && jetRenderer.IsLoaded();
-            if (jetVisible || !stars.empty()) {
+            if (jetVisible || !stars.empty() || !planets.empty()) {
                 renderer.BeginOverlayPass(camera, aspect);
                 if (jetVisible) {
                     const glm::vec3 lightDirection = glm::length(jetPhysics.position) > 1e-4f
@@ -1407,19 +2176,65 @@ int App::Run() {
                                       camera.ProjectionMatrix(aspect), lightDirection);
                 }
                 DrawStars();
+                DrawPlanets(false);
             }
         } else {
             renderer.BeginFrame(camera, aspect, width, height);
             DrawStars();
+            DrawPlanets(true);
 
             if (showGrid) {
                 renderer.DrawGrid(40.0, 40, glm::vec3(0.15f, 0.15f, 0.2f));
             }
-            if (showHorizon) {
-                renderer.DrawSphere(BlackHole::SchwarzschildRadiusSim(), glm::vec3(0.0f, 0.0f, 0.0f));
-                renderer.DrawWireSphere(BlackHole::SchwarzschildRadiusSim(), glm::vec3(0.6f, 0.1f, 0.1f));
+            if (showWarpedGrid) {
+                const glm::vec3 funnelColor(0.3f, 0.55f, 0.9f);
+                if (binaryModeEnabled) {
+                    // Capped well under the separation so the two funnels
+                    // don't visually swallow each other at close range by
+                    // default -- purely a display choice, not a physical
+                    // cutoff (the real embedding keeps extending outward).
+                    const double outerRadius = std::min(20.0, binarySystem.separation * 0.45);
+                    renderer.DrawFlammParaboloid(binarySystem.Position1(), binarySystem.SchwarzschildRadius1(),
+                                                  outerRadius, funnelColor);
+                    renderer.DrawFlammParaboloid(binarySystem.Position2(), binarySystem.SchwarzschildRadius2(),
+                                                  outerRadius, funnelColor);
+                } else {
+                    renderer.DrawFlammParaboloid(glm::dvec3(0.0), BlackHole::SchwarzschildRadiusSim(), 20.0,
+                                                  funnelColor);
+                }
             }
-            if (showPhotonSphere) {
+            if (showHorizon) {
+                if (binaryModeEnabled) {
+                    const glm::dvec3 pos1 = binarySystem.Position1();
+                    const glm::dvec3 pos2 = binarySystem.Position2();
+                    renderer.DrawSphere(pos1, binarySystem.SchwarzschildRadius1(), glm::vec3(0.0f, 0.0f, 0.0f));
+                    renderer.DrawWireSphere(pos1, binarySystem.SchwarzschildRadius1(), glm::vec3(0.6f, 0.1f, 0.1f));
+                    renderer.DrawSphere(pos2, binarySystem.SchwarzschildRadius2(), glm::vec3(0.0f, 0.0f, 0.0f));
+                    renderer.DrawWireSphere(pos2, binarySystem.SchwarzschildRadius2(), glm::vec3(0.1f, 0.3f, 0.8f));
+
+                    // Orbit paths, so the motion is visible at a glance
+                    // (and even while paused) -- sampled circles at each
+                    // body's own orbital radius, not scripted decoration.
+                    constexpr int kOrbitSamples = 96;
+                    std::vector<glm::dvec3> orbit1, orbit2;
+                    orbit1.reserve(kOrbitSamples + 1);
+                    orbit2.reserve(kOrbitSamples + 1);
+                    for (int i = 0; i <= kOrbitSamples; ++i) {
+                        const double t = 2.0 * glm::pi<double>() * i / kOrbitSamples;
+                        orbit1.push_back(binarySystem.Radius1() * glm::dvec3(std::cos(t), std::sin(t), 0.0));
+                        orbit2.push_back(-binarySystem.Radius2() * glm::dvec3(std::cos(t), std::sin(t), 0.0));
+                    }
+                    renderer.DrawPath(orbit1, glm::vec3(0.6f, 0.1f, 0.1f), 1.0f);
+                    renderer.DrawPath(orbit2, glm::vec3(0.1f, 0.3f, 0.8f), 1.0f);
+                } else {
+                    renderer.DrawSphere(BlackHole::SchwarzschildRadiusSim(), glm::vec3(0.0f, 0.0f, 0.0f));
+                    renderer.DrawWireSphere(BlackHole::SchwarzschildRadiusSim(), glm::vec3(0.6f, 0.1f, 0.1f));
+                }
+            }
+            if (showPhotonSphere && !binaryModeEnabled) {
+                // No exact photon-sphere formula for binary mode (see
+                // docs/physics.md Sec. 11) -- skipped there rather than
+                // drawn at a misleading single-body value.
                 renderer.DrawWireSphere(BlackHole::PhotonSphereRadiusSim(), glm::vec3(0.9f, 0.75f, 0.2f), 12, 24);
             }
 
@@ -1469,6 +2284,17 @@ int App::Run() {
                     const glm::dvec3 sourceDirection = glm::normalize(-camera.Position());
                     std::vector<glm::dvec3> alignmentLine = {glm::dvec3(0.0), sourceDirection * 60.0};
                     renderer.DrawPath(alignmentLine, glm::vec3(1.0f, 1.0f, 0.4f), 1.5f);
+                }
+            }
+
+            if (showPhotonInspector && inspectorShowPath && !inspectorResult.path.empty()) {
+                // Bright magenta, thicker than the other debug-ray colors
+                // (which are fate-colored, same as everything else) so
+                // the one specifically-targeted ray stands out from any
+                // sweep of debug rays also being shown at the same time.
+                renderer.DrawPath(inspectorResult.path, glm::vec3(1.0f, 0.2f, 0.9f), 3.0f);
+                if (!inspectorResult.path.empty()) {
+                    renderer.DrawPoint(inspectorResult.path.front(), glm::vec3(1.0f, 1.0f, 1.0f), 7.0f);
                 }
             }
         }

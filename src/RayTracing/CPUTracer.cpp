@@ -6,6 +6,8 @@
 
 using Physics::PhotonFate;
 using Physics::TracePhoton;
+using Physics::TracePhotonBinary;
+using Physics::TracePhotonKerr;
 
 namespace RayTracing {
 
@@ -26,7 +28,12 @@ std::vector<glm::vec3> RenderImage(const CameraFrame& camera, const RenderSettin
             const double ndcY = (1.0 - (y + 0.5) / settings.height * 2.0) * camera.tanHalfFovY;
 
             const glm::dvec3 direction = glm::normalize(camera.forward + ndcX * camera.right + ndcY * camera.up);
-            const Physics::PhotonTraceResult result = TracePhoton(camera.position, direction, settings.geodesicConfig);
+            const Physics::PhotonTraceResult result =
+                settings.binaryEnabled
+                    ? TracePhotonBinary(camera.position, direction, settings.binarySystem, settings.binaryConfig)
+                : settings.spin != 0.0
+                    ? TracePhotonKerr(camera.position, direction, settings.spin, settings.kerrConfig)
+                    : TracePhoton(camera.position, direction, settings.geodesicConfig);
 
             glm::vec3 color(0.0f); // captured or unresolved -> the black hole's shadow
             if (result.hitDisk && disk) {
