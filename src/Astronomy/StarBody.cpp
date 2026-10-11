@@ -49,17 +49,19 @@ StarBody::StarBody(const glm::dvec3& centerPosition, const glm::dvec3& centerVel
     }
 }
 
-void StarBody::Update(double deltaTime) {
+void StarBody::Update(double deltaTime, const Physics::BinarySystem* binary) {
     const double rs = Physics::BlackHole::SchwarzschildRadiusSim();
 
     for (StarParticle& particle : m_particles) {
         if (particle.consumed) continue;
 
-        const glm::dvec3 acceleration = Physics::StaticObserverGravityAccelSim(particle.position);
+        const glm::dvec3 acceleration = binary ? binary->GravityAccelSim(particle.position)
+                                                 : Physics::StaticObserverGravityAccelSim(particle.position);
         particle.velocity += acceleration * deltaTime;
         particle.position += particle.velocity * deltaTime;
 
-        if (glm::length(particle.position) < rs) {
+        const bool consumed = binary ? binary->IsCaptured(particle.position) : glm::length(particle.position) < rs;
+        if (consumed) {
             particle.consumed = true;
             continue;
         }

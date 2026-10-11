@@ -34,7 +34,36 @@ glm::dvec3 RandomPointInSphere(std::mt19937& rng, double radius) {
 // tidal encounter -- i.e. the lattice has time to actually resist before
 // the planet has already fallen past the hole. Not a measured material
 // constant; documented approximation per spec 28.5.
-constexpr double kBaseSpringStiffness = 400.0;
+constexpr double kBaseSpringStiffness = 0.025;
+
+// Standalone, tuned sim-unit self-gravity force constant -- NOT derived
+// from the real (other particle mass / black hole mass) / r^2 formula; see
+// PlanetBodySettings::selfGravityStrength's comment for why. Tuned
+// (scripted probe against PlanetBody, not guessed) so that two fragments
+// separated by a few sim units, drifting apart slowly after a fracture,
+// visibly pull back together within several seconds of sim time -- strong
+// enough to matter once the much-stronger tidal/spring forces have died
+// down (e.g. a fragment coasting far from the hole), weak enough that it
+// doesn't noticeably fight the spring lattice while a planet is still
+// intact and close to the hole.
+constexpr double kSelfGravityCoefficient = 6.0;
+
+// Self-gravity only applies between particles farther apart than this
+// factor times the planet's initialRadius -- i.e. only once they've
+// drifted outside the original intact body's own scale. Without this cutoff,
+// self-gravity's 1/r^2 law would also act at the lattice's own (short)
+// rest-length separations, directly fighting the spring lattice there; at
+// the spring stiffness this had to be tuned down to for explicit-Euler
+// numerical stability (see kBaseSpringStiffness), that fight destabilizes
+// even an intact, otherwise-stable planet almost immediately (confirmed
+// via scripted probe, not guessed). Particles are seeded within a sphere
+// of radius initialRadius, so any two particles in a freshly-spawned,
+// still-intact planet can be up to 2*initialRadius apart (opposite sides
+// of that sphere) -- 2.5x stays safely beyond that (confirmed stable via
+// probe for an undisrupted planet, including at the smaller initialRadius
+// values that first exposed this edge case at a lower factor) while still
+// reaching particles/fragments that have genuinely drifted apart.
+constexpr double kSelfGravityMinDistanceFactor = 2.5;
 
 // Number of nearest neighbors each particle connects to when the lattice is
 // built. Enough to resist bending/shearing, not so many that the one-time
@@ -140,8 +169,70 @@ void PlanetBody::ApplySpringForces(std::vector<glm::dvec3>& accel) const {
         // Equal and opposite -- no momentum is created by a spring, only
         // exchanged between its two ends (this is what the momentum-
         // conservation test checks).
-        accel[static_cast<size_t>(spring.a)] += force / pa.mass;
-        accel[static_cast<size_t>(spring.b)] -= force / pb.mass;
+        //
+        // Divides by each particle's MASS FRACTION of the planet
+        // (pa.mass / totalMassKg, typically ~1/particleCount), NOT its raw
+        // kilogram mass. kBaseSpringStiffness is a freely-tuned sim-unit
+        // constant (not calibrated to real N/m), and Physics::
+        // StaticObserverGravityAccelSim -- the gravity every particle also
+        // feels -- is a pure sim-unit acceleration with no mass term at
+        // all (test-particle convention). Dividing a sim-unit force by a
+        // REAL kilogram mass (~10^22-10^24 for an Earth-scale planet)
+        // would make the resulting acceleration ~15-20 orders of magnitude
+        // smaller than gravity -- i.e. the spring would do essentially
+        // nothing, and any apparent "deformation" would actually just be
+        // StarBody-style unopposed differential gravity. Using the mass
+        // FRACTION instead keeps spring and gravity accelerations on the
+        // same sim-unit scale regardless of what real-world mass the UI's
+        // "Mass (Earth masses)" slider is set to.
+        const double massFractionA = m_settings.totalMassKg > 0.0 ? pa.mass / m_settings.totalMassKg : 1.0;
+        const double massFractionB = m_settings.totalMassKg > 0.0 ? pb.mass / m_settings.totalMassKg : 1.0;
+        accel[static_cast<size_t>(spring.a)] += force / massFractionA;
+        accel[static_cast<size_t>(spring.b)] -= force / massFractionB;
+    }
+}
+
+void PlanetBody::ApplySelfGravity(std::vector<glm::dvec3>& accel) const {
+    if (!m_settings.selfGravityEnabled) return;
+    const int n = static_cast<int>(m_particles.size());
+    const double coefficient = kSelfGravityCoefficient * m_settings.selfGravityStrength;
+    if (coefficient <= 0.0 || m_settings.totalMassKg <= 0.0) return;
+
+    // Minimum separation below which self-gravity is skipped entirely --
+    // see kSelfGravityMinDistanceFactor's own comment for why: without
+    // this, self-gravity's 1/r^2 law competes directly with the spring
+    // lattice at its own (short) rest lengths, which (at the stiffness
+    // this had to be tuned down to for numerical stability -- see
+    // kBaseSpringStiffness's comment) causes runaway collapse even at an
+    // intact, otherwise-stable planet. Beyond this distance -- i.e.
+    // between particles that have actually drifted apart, such as two
+    // separated fragments after a fracture -- it applies normally.
+    const double minDistanceSq =
+        (kSelfGravityMinDistanceFactor * m_settings.initialRadius) * (kSelfGravityMinDistanceFactor * m_settings.initialRadius);
+
+    // Direct O(N^2) summation -- see PlanetBodySettings::selfGravityStrength
+    // and this constant's own comment for why this uses a standalone
+    // tuned force law rather than the real mass-ratio formula. Consumed
+    // particles are excluded as SOURCES (their mass is frozen at the
+    // horizon, not still part of the live body) but not as receivers --
+    // the loop already skips updating a consumed particle's acceleration
+    // downstream in Update(), so computing it here is harmless, just
+    // unused.
+    for (int i = 0; i < n; ++i) {
+        const PlanetParticle& pi = m_particles[static_cast<size_t>(i)];
+        if (pi.consumed) continue;
+        glm::dvec3 pull(0.0);
+        for (int j = 0; j < n; ++j) {
+            if (j == i) continue;
+            const PlanetParticle& pj = m_particles[static_cast<size_t>(j)];
+            if (pj.consumed) continue;
+            const glm::dvec3 delta = pj.position - pi.position;
+            const double rSq = glm::dot(delta, delta);
+            if (rSq < minDistanceSq) continue;
+            const double massFraction = pj.mass / m_settings.totalMassKg;
+            pull += delta * (coefficient * massFraction / (rSq * std::sqrt(rSq)));
+        }
+        accel[static_cast<size_t>(i)] += pull;
     }
 }
 
@@ -228,16 +319,19 @@ void PlanetBody::RebuildFragments() {
     m_fragmentsDirty = false;
 }
 
-void PlanetBody::Update(double deltaTime, const Physics::BlackHole& blackHole) {
+void PlanetBody::Update(double deltaTime, const Physics::BlackHole& blackHole, const Physics::BinarySystem* binary) {
+    m_massCapturedThisStep = 0.0;
     const double rs = Physics::BlackHole::SchwarzschildRadiusSim();
     const int n = static_cast<int>(m_particles.size());
 
     std::vector<glm::dvec3> accel(static_cast<size_t>(n), glm::dvec3(0.0));
     for (int i = 0; i < n; ++i) {
         if (m_particles[static_cast<size_t>(i)].consumed) continue;
-        accel[static_cast<size_t>(i)] = Physics::StaticObserverGravityAccelSim(m_particles[static_cast<size_t>(i)].position);
+        const glm::dvec3& pos = m_particles[static_cast<size_t>(i)].position;
+        accel[static_cast<size_t>(i)] = binary ? binary->GravityAccelSim(pos) : Physics::StaticObserverGravityAccelSim(pos);
     }
     ApplySpringForces(accel);
+    ApplySelfGravity(accel);
 
     for (int i = 0; i < n; ++i) {
         PlanetParticle& particle = m_particles[static_cast<size_t>(i)];
@@ -246,9 +340,11 @@ void PlanetBody::Update(double deltaTime, const Physics::BlackHole& blackHole) {
         particle.velocity += accel[static_cast<size_t>(i)] * deltaTime;
         particle.position += particle.velocity * deltaTime;
 
-        if (glm::length(particle.position) < rs) {
+        const bool consumed = binary ? binary->IsCaptured(particle.position) : glm::length(particle.position) < rs;
+        if (consumed) {
             particle.consumed = true;
             m_fragmentsDirty = true;
+            m_massCapturedThisStep += particle.mass;
         }
     }
 
@@ -289,7 +385,14 @@ void PlanetBody::FinishStep(const Physics::BlackHole& blackHole) {
 }
 
 #ifdef BH_PLANET_CUDA_AVAILABLE
-bool PlanetBody::UpdateGPU(double deltaTime, const Physics::BlackHole& blackHole) {
+bool PlanetBody::UpdateGPU(double deltaTime, const Physics::BlackHole& blackHole, const Physics::BinarySystem* binary) {
+    // The GPU kernel only knows the single-hole gravity/capture law --
+    // rather than silently running the wrong physics fast, binary mode
+    // always falls back to the (binary-aware) CPU Update() path. See this
+    // method's header comment.
+    if (binary) return false;
+
+    m_massCapturedThisStep = 0.0;
     const int n = static_cast<int>(m_particles.size());
     if (n == 0) return true;
 
@@ -329,13 +432,17 @@ bool PlanetBody::UpdateGPU(double deltaTime, const Physics::BlackHole& blackHole
     }
 
     const double stiffness = kBaseSpringStiffness * m_settings.material.stiffnessScale;
+    const double selfGravityCoefficient = kSelfGravityCoefficient * m_settings.selfGravityStrength;
     const bool ok = CudaPlanetSim::RunPlanetStepCUDA(
         positions.data(), velocities.data(), masses.data(), consumed.data(), n,
         springCount > 0 ? springA.data() : nullptr, springCount > 0 ? springB.data() : nullptr,
         springCount > 0 ? springRestLengths.data() : nullptr, springCount > 0 ? springBroken.data() : nullptr,
         springCount, static_cast<float>(Physics::BlackHole::SchwarzschildRadiusSim()),
         static_cast<float>(stiffness), static_cast<float>(m_settings.material.dampingFactor),
-        static_cast<float>(m_settings.material.materialStrength), static_cast<float>(deltaTime));
+        static_cast<float>(m_settings.material.materialStrength), static_cast<float>(deltaTime),
+        m_settings.selfGravityEnabled, static_cast<float>(selfGravityCoefficient),
+        static_cast<float>(m_settings.totalMassKg),
+        static_cast<float>(kSelfGravityMinDistanceFactor * m_settings.initialRadius));
     if (!ok) return false;
 
     // Precision note: a particle already consumed before this call round-
@@ -350,6 +457,8 @@ bool PlanetBody::UpdateGPU(double deltaTime, const Physics::BlackHole& blackHole
                                  positions[static_cast<size_t>(i) * 3 + 2]);
         p.velocity = glm::dvec3(velocities[static_cast<size_t>(i) * 3 + 0], velocities[static_cast<size_t>(i) * 3 + 1],
                                  velocities[static_cast<size_t>(i) * 3 + 2]);
+        const bool newlyConsumed = !p.consumed && consumed[static_cast<size_t>(i)] != 0;
+        if (newlyConsumed) m_massCapturedThisStep += p.mass;
         p.consumed = consumed[static_cast<size_t>(i)] != 0;
     }
     for (int i = 0; i < springCount; ++i) {
@@ -371,7 +480,8 @@ bool PlanetBody::UpdateGPU(double deltaTime, const Physics::BlackHole& blackHole
 }
 bool PlanetBody::GpuAvailable() { return CudaPlanetSim::PlanetCudaDeviceAvailable(); }
 #else
-bool PlanetBody::UpdateGPU(double /*deltaTime*/, const Physics::BlackHole& /*blackHole*/) { return false; }
+bool PlanetBody::UpdateGPU(double /*deltaTime*/, const Physics::BlackHole& /*blackHole*/,
+                            const Physics::BinarySystem* /*binary*/) { return false; }
 bool PlanetBody::GpuAvailable() { return false; }
 #endif
 

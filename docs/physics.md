@@ -470,6 +470,23 @@ Binary mode takes priority over Kerr spin when both are configured (a
 rotating member of a binary isn't modeled) — see the Advanced-mode
 "Binary Black Holes" panel.
 
+**Stars and planets in binary mode.** `Physics::BinarySystem::
+GravityAccelSim`/`IsCaptured` extend the single-hole `StaticObserverGravityAccelSim`
+law to sum both bodies' own pull at their own current positions (same
+"doubled Newtonian" superposition the photon solver above already uses),
+and check capture against both bodies' own horizons rather than a single
+`length(position) < rs` at the origin. `Astronomy::StarBody::Update` and
+`Astronomy::PlanetBody::Update`/`UpdateGPU` take an optional
+`BinarySystem*`; `App.cpp` passes the active one whenever binary mode is
+on. Before this, a star or planet spawned in binary mode still only felt
+a single phantom mass pulling it toward the (now-empty) barycenter,
+regardless of where the two actual, visually rendered bodies were — a
+real bug, not a documented approximation, fixed in Session 15 (see
+`HANDOFF.md`). `PlanetBody::UpdateGPU` does not attempt a binary-aware
+GPU kernel — it returns `false` (falls back to the CPU path) whenever a
+binary system is passed in, so binary-mode planets always run on CPU
+rather than silently running the wrong (single-hole) physics fast.
+
 **Flamm's paraboloid (conceptual, not exclusive to binary mode).**
 `Rendering::Renderer::DrawFlammParaboloid` draws the debug 3D view's
 classic embedding-diagram "funnel": a wireframe surface of revolution
@@ -557,16 +574,73 @@ tracer (no "force CPU"/"force GPU" toggle). `BuildSpringLattice` (one-time,
 at construction) and `RebuildFragments` (union-find, sequential-shaped)
 deliberately stay CPU-only in both paths.
 
-**What this milestone deliberately omits** (see `HANDOFF.md` for the
-continuation plan): planetary self-gravity among fragments/particles (the
-springs are a stand-in for it, not a simulation of it — real self-gravity
-would also let large fragments gravitationally reaccumulate, which a broken
-spring lattice cannot do); differentiated internal layers behaving
-differently (`PlanetComposition::Differentiated` is one averaged material,
-not a core/mantle/crust structure); coupling captured debris into
-`AccretionDisk`'s actual mass/temperature (its `Mdot` is still purely a UI
-slider); batching multiple simultaneously-spawned planets into one combined
-GPU kernel launch (today it's one launch per planet per frame); and
+**A correctness fix, worth recording explicitly.** `ApplySpringForces`
+originally divided each spring's force by the particle's REAL kilogram
+mass (`PlanetParticle::mass`, ~10²²–10²⁴ kg for an Earth-scale planet) to
+turn it into an acceleration. `kBaseSpringStiffness` is a freely-tuned
+sim-unit constant, not calibrated to real N/m, and
+`Physics::StaticObserverGravityAccelSim` (the gravity every particle also
+feels) is a pure sim-unit acceleration with no mass term at all
+(test-particle convention) — dividing a sim-unit force by a real kilogram
+mass made spring accelerations roughly 15–20 orders of magnitude smaller
+than gravity, i.e. springs did essentially nothing. Deformation/fracture
+was consequently driven almost entirely by unopposed differential gravity
+(StarBody's own mechanism), not genuine spring resistance, despite this
+doc's and the code's original claim that deformation was "a direct
+consequence of stress in this lattice." Fixed by dividing by each
+particle's MASS FRACTION of the planet (`mass / totalMassKg`, typically
+~1/particleCount) instead — see `ApplySpringForces`'s own comment.
+`kBaseSpringStiffness` and every preset/default spawn distance tuned
+against the old (non-functional) spring force were re-tuned afterward
+(scripted probes, not guesses) against the corrected physics, including
+a drop from `400.0` to `0.025` — most of that drop is needed for explicit
+semi-implicit-Euler numerical stability at the corrected force scale
+(confirmed via probe: a distant, otherwise-stable planet would
+spuriously shatter at higher values), not because the spring is meant to
+be weak.
+
+**Self-gravity (`PlanetBody::ApplySelfGravity`).** Particles/fragments
+optionally attract each other directly — this is what lets separated
+fragments drift back together after a fracture, which the spring lattice
+alone cannot do once broken (spec 28.10). The physically-exact formula for
+this sim's `GM_bh=1` unit convention works out to roughly
+`(other particle's mass in kg / black hole's mass in kg) / r²` — at any
+black hole mass this app's slider allows, that ratio against an
+Earth-scale planet is far too small to ever visibly matter, and the ratio
+itself spans many orders of magnitude across that slider range, so no
+fixed multiplier on the real formula could land in a visible range
+everywhere. Self-gravity therefore uses a standalone, tuned sim-unit force
+constant (`kSelfGravityCoefficient`, same spirit as the spring system's
+own `kBaseSpringStiffness`) scaled by `PlanetBodySettings::
+selfGravityStrength` — a deliberately exaggerated, clearly-labeled effect,
+not the real physics. It is also skipped entirely between particles closer
+together than `2.5×initialRadius` (`kSelfGravityMinDistanceFactor`):
+without that cutoff, self-gravity's `1/r²` law directly fights the spring
+lattice at its own (short) rest lengths, and at the stiffness the springs
+had to be tuned down to for numerical stability, that fight destabilizes
+even an intact, otherwise-stable planet almost immediately (confirmed via
+probe). Only beyond that scale — e.g. two genuinely separated fragments —
+does it apply, which is exactly the reaccumulation effect it's for.
+
+**Tidal disruption flare (`Astronomy::TidalDisruptionFlare`, debris → disk
+coupling, spec 28.12/28.13).** Captured planetary mass temporarily boosts
+`AccretionDiskSettings::eddingtonFraction` above the user's own slider
+value, decaying back to baseline with a fixed exponential time constant.
+This is an explicitly simplified stand-in for the real fallback-accretion
+light curve a tidal disruption event actually produces (classically a
+`t^-5/3` decline, Rees 1988) — not an attempt to reproduce that curve. The
+boost is applied to a per-frame copy of the user's disk settings, never
+mutating the slider-backed value itself, so it cleanly disappears as it
+decays. Single/Kerr-hole scope only — not coupled in binary mode.
+
+**What this milestone still omits** (see `HANDOFF.md` for the
+continuation plan): differentiated internal layers behaving differently
+(`PlanetComposition::Differentiated` is one averaged material, not a
+core/mantle/crust structure); batching multiple simultaneously-spawned
+planets into one combined GPU kernel launch (today it's one launch per
+planet per frame, and self-gravity is the first O(N²) GPU kernel this
+project has — still trivial at the current particle ceilings but the
+thing to revisit first if those ceilings ever rise); and
 Kerr/binary-hole-aware capture (both stars and planets check only the
 single-hole Schwarzschild radius).
 

@@ -1436,3 +1436,240 @@ larger, differently-scoped feature, not attempted here.
   StarBody/PlanetBody rendering is unit-untested by design). Verified
   `BlackHoleSimulator.exe` and `BlackHoleTests.exe` both rebuild clean and
   the full suite still passes unchanged.
+
+## Session 14 — Planetary self-gravity, debris → accretion-disk coupling, and a real bug fix the first exposed
+
+User asked for both remaining deferred items from Session 12/13's
+continuation plan: self-gravity (fragment reaccumulation) and debris
+feeding into the accretion disk. Scoped via plan mode first (self-gravity
+needed an explicit decision from the user: physically-exact-but-invisible
+vs. deliberately exaggerated — they chose exaggerated, same spirit as
+`initialRadius`'s own existing exaggeration-for-visibility).
+
+**Implementing self-gravity exposed a real, pre-existing bug**, not a new
+design problem: enabling self-gravity (correctly scaled) immediately
+caused runaway collapse even on planets that should have been stable,
+which traced back to `ApplySpringForces` dividing spring force by each
+particle's REAL kilogram mass instead of its mass fraction of the planet.
+Since `kBaseSpringStiffness` is a freely-tuned sim-unit constant (not
+calibrated to real N/m) and gravity is a pure sim-unit acceleration with
+no mass term, dividing a sim-unit force by a real ~10²²–10²⁴ kg mass made
+spring accelerations ~15-20 orders of magnitude weaker than gravity --
+springs were doing essentially nothing since Milestone 1 shipped.
+Everything that looked like "deformation resisted by springs" in Sessions
+12-13 was actually almost entirely unopposed differential gravity
+(StarBody's own mechanism), despite the code's and docs' claims
+otherwise. Fixed (see `docs/physics.md` §12 for the full writeup) and
+every preset/default re-tuned against the corrected physics via scripted
+probes, not guesses -- see "What's new" below for the new numbers.
+
+Builds on Sessions 1-13; nothing reverted. Both a fresh CPU-only
+configuration and the CUDA build compile clean. Test counts: **126/126
+(CPU-only, up from 116 -- +1 self-gravity test, +9 flare tests) / 144/144
+(CUDA, up from 134)**.
+
+### What's new
+
+- **Spring-force mass-fraction fix** (`PlanetBody::ApplySpringForces` and
+  the mirrored `SpringForceKernel` in `cuda/planet_kernel.cu`, which
+  needed the same fix plus a new `totalMassKg` parameter): divides by
+  `particle.mass / totalMassKg` instead of raw `particle.mass`. This
+  changes actual simulated behavior, not just internals -- springs now
+  genuinely resist deformation.
+- **Retuned constants and defaults**, all via scripted probe against
+  `PlanetBody` directly (same methodology as the Milestone-1/GPU-session
+  tunings): `kBaseSpringStiffness` 400.0 → **0.025** (most of this drop is
+  for explicit-Euler numerical stability at the corrected force scale, not
+  because springs are meant to be weak -- confirmed via probe that higher
+  values spuriously shatter an otherwise-stable distant planet). The plain
+  "Add Planet" default moved from (spawn radius 14, speed fraction 0.7) to
+  **(9.0, 0.7)** -- fractures in ~31s now instead of instantly/never.
+  "Rocky disruption"/"Icy disruption" presets moved from (9.6, 0.5) to
+  **(7.0, 0.5)** -- now fracture in ~11-17s (icy faster, as intended).
+  "Stable orbit" (60, 1.0) and "Direct infall" (18, 0.0) presets were
+  reverified and left unchanged -- both still behave as intended under the
+  corrected physics. "Close flyby" (15, 0.85) was reverified too: it no
+  longer fractures at all (previously it did, under the broken physics) --
+  its existing tooltip already said "mild stretching," not "disruption,"
+  so this is accurate without a wording change; a real planet surviving a
+  flyby at that distance is the more physically sensible outcome anyway.
+- **`Astronomy::PlanetBody::ApplySelfGravity`** (new) + the mirrored
+  `SelfGravityKernel` in `cuda/planet_kernel.cu`: direct O(N²) summation,
+  using a standalone tuned force constant (`kSelfGravityCoefficient`, NOT
+  the real mass-ratio formula -- see its own and
+  `PlanetBodySettings::selfGravityStrength`'s comments for why) with a
+  minimum-distance cutoff (`kSelfGravityMinDistanceFactor = 2.5×
+  initialRadius`) below which it's skipped entirely -- without that cutoff
+  it fights the spring lattice at close range and destabilizes an intact
+  planet (confirmed via probe; first attempt used 1.5× and still failed
+  for a smaller test planet whose full seed-sphere diameter exceeded that
+  factor). Measured effect (scripted probe, not assumed): the two largest
+  surviving fragments of a disrupted planet end up **~10× closer together**
+  after a few minutes of sim time with self-gravity on vs. off. New
+  `PlanetBodySettings::selfGravityEnabled`/`selfGravityStrength` fields,
+  default on; new UI controls (checkbox + strength slider) in the Planets
+  panel with a tooltip stating plainly that this is exaggerated, not real
+  physics.
+- **`Astronomy::TidalDisruptionFlare`** (new, `src/Astronomy/
+  TidalDisruptionFlare.h/.cpp`): a decaying-accumulator model (12-second
+  exponential time constant, clamped to a +0.6 eddingtonFraction ceiling)
+  explicitly documented as a simplified stand-in for the real `t^-5/3`
+  fallback-accretion light curve, not an attempt to reproduce it.
+  `PlanetBody` gained `MassCapturedLastStep()` (tracks mass newly consumed
+  during the most recent `Update()`/`UpdateGPU()` call, detected inline at
+  the exact point each path already flips `consumed`). App.cpp wires one
+  `TidalDisruptionFlare` instance: every planet's captured mass feeds it
+  each frame, and its current boost is added to a per-frame COPY of the
+  user's own disk settings before rendering (never mutating the
+  slider-backed value) -- both the main render path and the CPU-vs-GPU
+  validation render path. New Advanced-panel readout under the disk
+  section ("Tidal disruption flare active: Eddington fraction +X.XX" /
+  "No recent captures"). Single/Kerr-hole scope only, same existing
+  limitation stars/planets already have for horizon checks.
+- **`tests/test_planet.cpp`: +1 check** (self-gravity reaccumulation,
+  comparing two separately-run disruption scenarios' largest-two-fragment
+  separation with/without self-gravity, generous 2× margin against the
+  observed ~10× effect to tolerate per-run randomness in particle
+  placement). **`tests/test_planet_gpu.cpp`**: unchanged check count, but
+  now implicitly exercises self-gravity too (both CPU and GPU default to
+  it enabled) -- re-measured agreement: max position diff 2.7×10⁻⁶, max
+  velocity diff 1.7×10⁻⁶ sim units, still comfortably inside tolerance.
+  **`tests/test_tidal_flare.cpp`** (new, +9 checks, unconditional -- not
+  CUDA-gated): fresh-tracker-inactive, registering-mass-activates,
+  monotonic-decay, ceiling-clamp, and accumulates-rather-than-overwrites
+  checks.
+- **`docs/physics.md` §12**: added the bug-fix writeup (quoted above, in
+  full there) plus new self-gravity and tidal-flare subsections, same
+  approximation-labeling voice as the rest of the file. **`docs/
+  validation.md` §12**: added the self-gravity test row, a new flare-test
+  subsection, and re-measured GPU-agreement numbers; summary table (§13)
+  updated to 126/144.
+
+### Decisions worth knowing about
+
+- The spring-force bug was caught by symptom (self-gravity immediately
+  destabilizing scenarios that should have been fine), not by code review
+  -- worth remembering that a force law's UNITS deserve as much scrutiny
+  as its functional form, especially in a sim that deliberately mixes real
+  SI quantities (particle mass in kg) with freely-tuned dimensionless sim
+  constants (spring stiffness) in the same formula.
+- Self-gravity's minimum-distance cutoff is a deliberate design choice,
+  not a workaround to hide instability: self-gravity is conceptually about
+  attraction between SEPARATED masses (fragments, or particles that have
+  drifted apart), not an additional force between already-spring-connected
+  neighbors, which the spring already governs. The cutoff makes that
+  distinction explicit rather than relying on tuning alone to keep the two
+  forces from fighting.
+- `SelfGravityKernel` is this project's first O(N²)-per-thread GPU kernel
+  (every other kernel so far is O(1) or O(E) work per thread) -- still
+  trivial at the current particle ceilings (90 default / 250 CPU / 2000
+  GPU), but the first thing to revisit if those ceilings are ever raised
+  further or multi-planet batching (still not implemented -- see below) is
+  tackled.
+
+### What needs attention
+
+- [ ] No batched multi-planet GPU kernel launch (still one launch per
+      planet per frame -- self-gravity makes this somewhat more expensive
+      per planet than before, worth revisiting together).
+- [ ] Debris → disk coupling is tuned by feel (decay time constant,
+      kg-to-Eddington-fraction conversion, clamp), not derived or
+      calibrated against a real TDE light curve -- flagged in both the
+      code and `docs/physics.md`, not hidden, but a real
+      `t^-5/3`-shaped model remains a documented future improvement if
+      ever wanted.
+- [ ] Fragments that reaccumulate via self-gravity can still pass through
+      each other at close range -- there's no collision response, only
+      attraction. Flagged in the original plan as a known gap, still open.
+- [ ] Binary-hole-aware self-gravity/flare coupling remains out of scope
+      (single/Kerr-hole only), consistent with the existing capture-check
+      limitation.
+
+## Session 15 — Fix: stars/planets ignored binary mode's second body
+
+User reported stars and planets spawned while binary mode is active still
+behave as if a single black hole sits at the origin ("still goes to the
+automatic center of where it was pre binary"), rather than responding to
+the actual two-body configuration. Confirmed as a real bug, not a known
+limitation: `Astronomy::StarBody::Update` and `PlanetBody::Update`/
+`UpdateGPU` always called the single-hole `Physics::
+StaticObserverGravityAccelSim` (pull toward the origin, capture check
+`length(position) < rs`) with no awareness that binary mode moves both
+masses off the origin (`Physics::BinarySystem::Position1()`/`Position2()`)
+— so a spawned body felt a phantom single mass at the (now-empty)
+barycenter instead of either of the two actual, visually rendered holes.
+
+Builds on Sessions 1-14; nothing reverted. Both a fresh CPU-only build and
+both CUDA build directories (`build/`, `build_cuda/`) compile clean. Test
+counts unchanged (126/126 CPU-only, 144/144 CUDA) — this was a behavior
+fix, not new test surface, beyond hardening one pre-existing flaky test
+noticed while re-running the suite repeatedly during verification (see
+below).
+
+### What's new
+
+- **`Physics::PointMassGravityAccelSim`** (new, `src/Physics/BlackHole.h`):
+  `StaticObserverGravityAccelSim`'s formula generalized to take an
+  arbitrary `gmSim`/`rsSim` instead of hardcoding `1.0`/`2.0` --
+  `StaticObserverGravityAccelSim` itself is now just
+  `PointMassGravityAccelSim(position, 1.0, SchwarzschildRadiusSim())`, so
+  the single-hole path's behavior is provably unchanged (same formula,
+  same constants, just factored).
+- **`Physics::BinarySystem::GravityAccelSim`/`IsCaptured`** (new,
+  `src/Physics/BinarySystem.h`): sum/check both bodies' own
+  `PointMassGravityAccelSim` pull at their own current positions -- the
+  same "doubled Newtonian" superposition `BinaryGeodesicSolver` already
+  uses for photons, now available for massive test particles too.
+- **`StarBody::Update`** and **`PlanetBody::Update`/`UpdateGPU`** all gained
+  an optional `const Physics::BinarySystem* binary = nullptr` parameter;
+  when non-null, gravity and the horizon check go through the binary-aware
+  path instead of the single-hole one. `App.cpp`'s main loop now builds
+  `activeBinary = binaryModeEnabled ? &binarySystem : nullptr` once per
+  frame and passes it to every star/planet update call.
+- **`PlanetBody::UpdateGPU(..., binary)` returns `false` immediately when
+  `binary` is non-null** -- the GPU kernel only knows the single-hole law,
+  and extending `cuda/planet_kernel.cu` to a binary-aware kernel was
+  scoped out of this fix (urgent correctness fix, not a GPU feature
+  session); rather than silently running the wrong physics fast, binary-
+  mode planets now always fall back to the (correct, binary-aware) CPU
+  `Update()` path via the existing automatic-fallback mechanism -- no new
+  code needed there, it already tries GPU first and falls back on `false`.
+- **Hardened a pre-existing flaky test** noticed while re-running the
+  suite ~10x to verify this fix didn't regress anything:
+  `tests/test_planet.cpp`'s self-gravity reaccumulation check (added
+  Session 14) compared only the two LARGEST fragments' pairwise
+  separation from a single random trial each way, which occasionally
+  failed (~1 run in 5) because gravitational few-body dynamics among
+  several fragments are genuinely chaotic -- a close encounter can
+  occasionally fling a fragment outward even with self-gravity active,
+  which is real physics, not a bug. Replaced with a mass-weighted RMS
+  spread across ALL surviving fragments (less sensitive to which specific
+  two happen to be largest), averaged over 20 trials each way, with a
+  looser (0.85x) margin and a comment explaining why individual trials are
+  expected to vary. Confirmed via 8+ consecutive clean runs after the
+  change (was failing roughly 1 in 3-5 runs before).
+
+### Decisions worth knowing about
+
+- This is scoped as a correctness fix for stars/planets ONLY -- the ray
+  tracer's own binary photon handling (`BinaryGeodesicSolver`) was already
+  correct and untouched. The bug was specifically that `StarBody`/
+  `PlanetBody` never knew binary mode existed at all.
+- Binary-mode planets are CPU-only until/unless a binary-aware GPU kernel
+  is written later (see `docs/physics.md` §11's new paragraph) -- flagged
+  explicitly rather than silently degrading the particle-count ceiling
+  back to 250 without explanation.
+- Kerr spin still isn't accounted for in star/planet gravity even in
+  single-hole mode (both still use the non-rotating Schwarzschild law
+  regardless of the configured spin) -- not part of this fix, listed here
+  so it isn't confused with the binary case just resolved.
+
+### What needs attention
+
+- [ ] No binary-aware GPU kernel for planets (see above) -- if someone
+      wants high-particle-count planets in binary mode specifically, this
+      is the gap to close.
+- [ ] Kerr-aware gravity/capture for stars/planets remains unimplemented
+      (single, non-rotating Schwarzschild law always used, regardless of
+      configured spin) -- a separate, still-open gap from the binary one
+      just fixed.

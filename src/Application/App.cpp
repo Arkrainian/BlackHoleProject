@@ -26,6 +26,7 @@
 
 #include "Astronomy/AccretionDisk.h"
 #include "Astronomy/PlanetBody.h"
+#include "Astronomy/TidalDisruptionFlare.h"
 #include "Astronomy/StarBody.h"
 #include "Astronomy/StarField.h"
 #include "Jet/FlightCamera.h"
@@ -652,18 +653,32 @@ int App::Run() {
     // not just on distance from the hole.
     std::vector<Astronomy::PlanetBody> planets;
     // Tuned (not an arbitrary default) so the plain "Add Planet" button
-    // actually shows a fracture within ~20-25 seconds of real time rather
-    // than needing ~40s before anything visibly happens: at the old default
-    // (20.0, 0.55) a rocky planet DOES eventually fracture, but takes
-    // roughly twice as long to start breaking (measured via a scripted
-    // probe against PlanetBody directly, not guessed).
-    double planetSpawnRadius = 14.0;           // sim units
+    // actually shows a fracture within well under a minute of real time --
+    // re-measured (scripted probe against PlanetBody directly) after a
+    // correctness fix to the spring force's mass handling (see
+    // ApplySpringForces's comment: it previously divided by each
+    // particle's real KILOGRAM mass instead of its mass FRACTION of the
+    // planet, making spring forces ~15-20 orders of magnitude weaker than
+    // gravity -- i.e. springs were doing essentially nothing). With that
+    // fixed, springs genuinely resist deformation now, so a planet needs a
+    // noticeably closer/faster encounter than before to actually fracture.
+    double planetSpawnRadius = 9.0;            // sim units
     double planetOrbitalSpeedFraction = 0.7;   // fraction of local Newtonian circular speed
     double planetMassEarths = 1.0;             // Earth masses
     double planetMaterialStrengthMultiplier = 1.0; // scales the chosen preset's materialStrength
     int planetParticleCount = 90;
     Physics::PlanetComposition planetComposition = Physics::PlanetComposition::Rocky;
+    bool planetSelfGravityEnabled = true;
+    double planetSelfGravityStrength = 1.0; // deliberately exaggerated/tuned, not physically exact -- see PlanetBody.h
     std::mt19937 planetSpawnRng(std::random_device{}());
+
+    // Captured planetary debris temporarily brightens/heats the accretion
+    // disk -- a simplified "tidal disruption flare" (spec 28.12/28.13),
+    // not the real fallback-accretion light curve; see
+    // TidalDisruptionFlare.h. Single/Kerr-hole scope only, same existing
+    // limitation stars/planets already have for their horizon checks --
+    // binary mode isn't coupled.
+    Astronomy::TidalDisruptionFlare tidalFlare;
 
     constexpr double kEarthMassKg = 5.972e24;
 
@@ -681,6 +696,8 @@ int App::Run() {
         settings.totalMassKg = planetMassEarths * kEarthMassKg;
         settings.material = Physics::PlanetMaterial::Preset(planetComposition);
         settings.material.materialStrength *= planetMaterialStrengthMultiplier;
+        settings.selfGravityEnabled = planetSelfGravityEnabled;
+        settings.selfGravityStrength = planetSelfGravityStrength;
         planets.emplace_back(position, velocity, settings);
     };
     auto SpawnPlanet = [&]() { SpawnPlanetWith(planetSpawnRadius, planetOrbitalSpeedFraction); };
@@ -698,13 +715,16 @@ int App::Run() {
         planetComposition = Physics::PlanetComposition::Rocky;
         SpawnPlanetWith(planetIsco * 2.5, 0.85);
     };
+    // 7.0 (not an isco multiple -- just the closest-in, fastest-fracturing
+    // point short of a radial plunge that was actually probed) is tuned
+    // the same way planetSpawnRadius's default is -- see its comment.
     auto SpawnPlanetPresetRockyDisruption = [&]() {
         planetComposition = Physics::PlanetComposition::Rocky;
-        SpawnPlanetWith(planetIsco * 1.6, 0.5);
+        SpawnPlanetWith(7.0, 0.5);
     };
     auto SpawnPlanetPresetIcyDisruption = [&]() {
         planetComposition = Physics::PlanetComposition::Icy;
-        SpawnPlanetWith(planetIsco * 1.6, 0.5);
+        SpawnPlanetWith(7.0, 0.5);
     };
     auto SpawnPlanetPresetDirectInfall = [&]() {
         planetComposition = Physics::PlanetComposition::Rocky;
@@ -827,7 +847,16 @@ int App::Run() {
                   })
                 : RayTracing::BackgroundSampler([&](const glm::dvec3& dir) { return starField.Sample(dir); });
 
-        accretionDisk.SetSettings(diskSettings);
+        {
+            // Tidal disruption flare boost applied on top of the user's
+            // own slider-backed diskSettings, never mutating it directly --
+            // the boost disappears cleanly as it decays without disturbing
+            // their chosen baseline. Single/Kerr-hole scope only (not
+            // added to disk2Settings below) -- see tidalFlare's own comment.
+            Astronomy::AccretionDiskSettings effectiveDiskSettings = diskSettings;
+            effectiveDiskSettings.eddingtonFraction += tidalFlare.EddingtonFractionBoost();
+            accretionDisk.SetSettings(effectiveDiskSettings);
+        }
         accretionDisk.SetBlackHoleMassKg(blackHole.MassKg());
         {
             Astronomy::AccretionDiskSettings disk2Settings = diskSettings;
@@ -1548,7 +1577,11 @@ int App::Run() {
                           })
                         : RayTracing::BackgroundSampler([&](const glm::dvec3& dir) { return starField.Sample(dir); });
 
-                accretionDisk.SetSettings(diskSettings);
+                {
+                    Astronomy::AccretionDiskSettings effectiveDiskSettings = diskSettings;
+                    effectiveDiskSettings.eddingtonFraction += tidalFlare.EddingtonFractionBoost();
+                    accretionDisk.SetSettings(effectiveDiskSettings);
+                }
                 accretionDisk.SetBlackHoleMassKg(blackHole.MassKg());
                 const RayTracing::DiskSampler diskSampler = [&](const PhotonTraceResult& hit) {
                     const double emittedTemperature = accretionDisk.Temperature(hit.diskHitRadius);
@@ -1745,6 +1778,15 @@ int App::Run() {
             needsRerender |= SliderDouble("Radiative efficiency (eta)", &diskSettings.radiativeEfficiency, 0.01, 0.4, "%.2f");
             HelpTooltip("Fraction of accreted rest-mass energy radiated away (eta = L / Mdot*c^2). 0.1 is the standard thin-disk (Shakura-Sunyaev) value; a rapidly spinning hole can reach ~0.3-0.4.");
             ImGui::Text("Disk inner-edge temperature: %.0f K (mass-dependent -- see tooltips above)", accretionDisk.PeakKelvin());
+
+            if (tidalFlare.IsActive()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
+                                    "Tidal disruption flare active: Eddington fraction +%.3f (decaying)",
+                                    tidalFlare.EddingtonFractionBoost());
+            } else {
+                ImGui::TextDisabled("No recent planetary debris captured -- no flare boost.");
+            }
+            HelpTooltip("Captured planetary debris (from the Planets panel below) temporarily boosts the disk's effective Eddington fraction above, then decays back to the slider's own value over several seconds -- a simplified stand-in for a real tidal-disruption-event fallback light curve (spec 28.12/28.13), not an exact one. Single-hole/Kerr mode only.");
         }
 
         ImGui::Separator();
@@ -1933,6 +1975,13 @@ int App::Run() {
             SliderDouble("Material strength multiplier", &planetMaterialStrengthMultiplier, 0.1, 3.0, "%.2f");
             HelpTooltip("Scales the chosen composition's fracture-strain threshold -- below 1.0 makes the next planet you spawn more brittle than its preset, above 1.0 tougher.");
 
+            ImGui::Checkbox("Self-gravity", &planetSelfGravityEnabled);
+            HelpTooltip("Lets separated fragments pull back toward each other after a fracture, instead of drifting apart forever. This is a DELIBERATELY EXAGGERATED effect, not the real physical self-gravity -- at any black hole mass this app allows, a planet's actual self-gravity (roughly its mass divided by the black hole's mass) is far too small to ever visibly matter, so this uses a standalone tuned strength instead of the real formula.");
+            if (planetSelfGravityEnabled) {
+                SliderDouble("Self-gravity strength", &planetSelfGravityStrength, 0.0, 5.0, "%.2f");
+                HelpTooltip("1.0 is the tuned default (fragments noticeably drift back together over several seconds once other forces die down). Higher = faster/stronger reaccumulation; 0 behaves like self-gravity off.");
+            }
+
             SliderDouble("Spawn radius", &planetSpawnRadius, planetIsco, 100.0, "%.2f");
             HelpTooltip("How far from the black hole (sim units) a newly-added planet starts. Closer in = stronger, faster tidal stress.");
             SliderDouble("Orbital speed (fraction of circular)", &planetOrbitalSpeedFraction, 0.0, 1.3, "%.2f");
@@ -1998,21 +2047,31 @@ int App::Run() {
                 simulation.Step();
             }
 
+            // Binary mode moves both masses off the origin (see
+            // Physics::BinarySystem) -- stars/planets need to feel BOTH
+            // bodies' gravity and check capture against both, or they
+            // behave as if a single invisible hole still sits at the
+            // (now-empty) barycenter instead of responding to the two
+            // actual bodies on screen.
+            const Physics::BinarySystem* activeBinary = binaryModeEnabled ? &binarySystem : nullptr;
+
             for (Astronomy::StarBody& star : stars) {
-                star.Update(dt);
+                star.Update(dt, activeBinary);
             }
             stars.erase(std::remove_if(stars.begin(), stars.end(),
                                         [](const Astronomy::StarBody& star) { return star.IsFullyConsumed(); }),
                         stars.end());
 
             for (Astronomy::PlanetBody& planet : planets) {
-                if (!planet.UpdateGPU(dt, blackHole)) {
-                    planet.Update(dt, blackHole);
+                if (!planet.UpdateGPU(dt, blackHole, activeBinary)) {
+                    planet.Update(dt, blackHole, activeBinary);
                 }
+                tidalFlare.RegisterCapturedMass(planet.MassCapturedLastStep());
             }
             planets.erase(std::remove_if(planets.begin(), planets.end(),
                                           [](const Astronomy::PlanetBody& planet) { return planet.IsFullyConsumedOrDispersed(); }),
                           planets.end());
+            tidalFlare.Update(dt);
         }
 
         // Deliberately NOT gated on `paused` -- that flag is the Stage 1

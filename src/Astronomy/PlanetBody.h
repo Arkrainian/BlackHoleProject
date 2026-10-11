@@ -4,6 +4,7 @@
 
 #include <glm/glm.hpp>
 
+#include "Physics/BinarySystem.h"
 #include "Physics/BlackHole.h"
 #include "Physics/PlanetMaterial.h"
 
@@ -85,6 +86,25 @@ struct PlanetBodySettings {
     int particleCount = 90;
 
     Physics::PlanetMaterial material;
+
+    // Whether separated fragments/particles attract each other at all, and
+    // by how much. Deliberately NOT the physically-exact self-gravity
+    // formula scaled by this factor -- the real formula (derived from this
+    // sim's GM_bh=1 unit convention) works out to roughly
+    // (other particle's mass in kg / black hole's mass in kg) / r^2, which
+    // for an Earth-scale planet around any black hole mass this app's
+    // slider allows is so small it would never visibly do anything (and
+    // the ratio spans many orders of magnitude across that slider range,
+    // so no fixed multiplier on the real formula could ever land in a
+    // visible range everywhere). Instead PlanetBody::ApplySelfGravity uses
+    // a standalone, tuned sim-unit force constant -- same spirit as the
+    // spring system's own kBaseSpringStiffness, which is also tuned for
+    // behavior rather than measured -- and this field simply scales that
+    // constant. 1.0 is the tuned default; the UI is free to dial it up or
+    // down, but even "off" (selfGravityEnabled=false) is a legitimate,
+    // physically-honest choice given how negligible the real effect is.
+    bool selfGravityEnabled = true;
+    double selfGravityStrength = 1.0;
 };
 
 // A planet, modeled as a cluster of point-mass particles connected by a
@@ -102,18 +122,22 @@ struct PlanetBodySettings {
 // permanently; connected components of the remaining lattice are tracked as
 // Fragments.
 //
+// Particles/fragments also optionally attract each other directly
+// (PlanetBodySettings::selfGravityEnabled, ApplySelfGravity) -- this is
+// what lets separated fragments drift back together after a fracture,
+// which the spring lattice alone cannot do once broken. See
+// PlanetBodySettings::selfGravityStrength's comment for why this is a
+// deliberately exaggerated, tuned effect rather than the (essentially
+// unmeasurable) physically-exact formula.
+//
 // Explicitly NOT modeled this milestone (see HANDOFF.md for the
 // continuation plan):
-//   - Planetary self-gravity: fragments/particles do not attract each
-//     other. In reality self-gravity is what the springs here stand in
-//     for approximately -- real self-gravity would also let large
-//     fragments gravitationally reaccumulate, which this lattice cannot
-//     reproduce once broken.
 //   - Differentiated internal layers (core/mantle/crust behaving
 //     differently): PlanetComposition::Differentiated is approximated as a
 //     single averaged material, not a layered structure.
-//   - Kerr/binary-hole-aware capture: like StarBody, the capture check uses
-//     only the single-hole Schwarzschild radius.
+//   - Kerr-aware capture: gravity/capture still use the non-rotating
+//     Schwarzschild law even when the configured black hole has spin
+//     (binary mode IS handled -- see Update/UpdateGPU's `binary` parameter).
 class PlanetBody {
 public:
     PlanetBody(const glm::dvec3& centerPosition, const glm::dvec3& centerVelocity,
@@ -122,8 +146,14 @@ public:
     // Integrates every non-consumed particle one step (gravity + spring
     // forces, semi-implicit Euler -- same integration style as
     // StarBody/Jet::FlightPhysics), checks for new fractures, and rebuilds
-    // the fragment list if the lattice topology changed.
-    void Update(double deltaTime, const Physics::BlackHole& blackHole);
+    // the fragment list if the lattice topology changed. binary, when
+    // non-null, switches gravity and the horizon check to pull toward/
+    // check against BOTH of the binary system's bodies at their own
+    // current positions instead of a single mass at the origin -- see
+    // StarBody::Update's matching parameter for why this matters (without
+    // it, a planet spawned in binary mode behaves as if a single invisible
+    // hole still sits at the barycenter).
+    void Update(double deltaTime, const Physics::BlackHole& blackHole, const Physics::BinarySystem* binary = nullptr);
 
     // Same physics, same result (within float-vs-double rounding -- see
     // cuda/PlanetKernel.h), but the gravity/spring/integration/fracture math
@@ -132,10 +162,13 @@ public:
     // instance's state is left completely untouched -- the caller should
     // fall back to Update() for this frame) when the project wasn't built
     // with BH_ENABLE_CUDA, or no CUDA device is available, or the GPU call
-    // itself failed. There is no "force GPU" mode and no separate "force
+    // itself failed, OR binary is non-null -- the GPU kernel only knows the
+    // single-hole law; binary mode deliberately always falls back to the
+    // (binary-aware) CPU path rather than silently running the wrong
+    // physics fast. There is no "force GPU" mode and no separate "force
     // CPU" toggle -- same automatic-fallback-only philosophy the ray tracer
     // already uses (see RayTracing::CudaAvailable's call sites in App.cpp).
-    bool UpdateGPU(double deltaTime, const Physics::BlackHole& blackHole);
+    bool UpdateGPU(double deltaTime, const Physics::BlackHole& blackHole, const Physics::BinarySystem* binary = nullptr);
 
     // True if this build was compiled with BH_ENABLE_CUDA AND a CUDA device
     // was found at runtime -- i.e. whether UpdateGPU() can be expected to
@@ -163,9 +196,18 @@ public:
     double LastTidalAccelerationSim() const { return m_lastTidalAccel; }
     double LastRocheLimitSim() const { return m_lastRocheLimit; }
 
+    // Total mass (kg) of particles that crossed the horizon during the
+    // MOST RECENT Update()/UpdateGPU() call -- zero if none did. Reset at
+    // the start of every step. Intended for a caller (App.cpp) to feed
+    // into Astronomy::TidalDisruptionFlare so captured planetary debris
+    // visibly affects the accretion disk; not accumulated across steps by
+    // this class itself.
+    double MassCapturedLastStep() const { return m_massCapturedThisStep; }
+
 private:
     void BuildSpringLattice();
     void ApplySpringForces(std::vector<glm::dvec3>& accel) const;
+    void ApplySelfGravity(std::vector<glm::dvec3>& accel) const;
     void CheckFractures();
     void RebuildFragments();
 
@@ -184,6 +226,7 @@ private:
     double m_lastTidalAccel = 0.0;
     double m_lastRocheLimit = 0.0;
     bool m_fragmentsDirty = true;
+    double m_massCapturedThisStep = 0.0;
 };
 
 } // namespace Astronomy

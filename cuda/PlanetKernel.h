@@ -52,14 +52,26 @@ bool PlanetCudaDeviceAvailable();
 // per-step constants PlanetBody::Update/ApplySpringForces/CheckFractures
 // already compute from Physics::BlackHole and PlanetMaterial -- passed in
 // rather than recomputed device-side.
+// selfGravityEnabled/selfGravityCoefficient/totalMassKg: mirrors
+// PlanetBody::ApplySelfGravity's direct-summation formula exactly (see its
+// own comment for why selfGravityCoefficient is a standalone tuned
+// constant, not the real mass-ratio self-gravity formula) -- totalMassKg
+// is the planet's total mass (kg), used the same way ApplySelfGravity uses
+// it to keep the per-particle pull resolution-invariant.
 //
 // Returns false, leaving every array byte-for-byte unmodified, if no CUDA
 // device is available or an allocation/launch/copy failed -- the caller
 // (PlanetBody::UpdateGPU) falls back to the CPU Update() path for that
 // frame in that case.
+// selfGravityMinDistance: self-gravity is skipped between particle pairs
+// closer together than this (sim units) -- mirrors PlanetBody::
+// ApplySelfGravity's own cutoff exactly (see its comment for why this
+// exists: without it, self-gravity fights the spring lattice at its own
+// short rest lengths and destabilizes an otherwise-intact planet).
 bool RunPlanetStepCUDA(float* positionsXYZ, float* velocitiesXYZ, const float* masses, unsigned char* consumedFlags,
                         int particleCount, const int* springA, const int* springB, const float* springRestLengths,
                         unsigned char* springBroken, int springCount, float schwarzschildRadius, float stiffness,
-                        float damping, float materialStrength, float dt);
+                        float damping, float materialStrength, float dt, bool selfGravityEnabled,
+                        float selfGravityCoefficient, float totalMassKg, float selfGravityMinDistance);
 
 } // namespace CudaPlanetSim

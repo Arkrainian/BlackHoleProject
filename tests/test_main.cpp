@@ -11,6 +11,7 @@ void RunDiskTests();
 void RunKerrTests();
 void RunBinaryTests();
 void RunPlanetTests();
+void RunTidalFlareTests();
 #ifdef BH_CUDA_AVAILABLE
 void RunGpuRenderTests();
 void RunKerrGpuRenderTests();
@@ -47,6 +48,9 @@ int main() {
 
     std::printf("\n=== Planetary destruction: materials, tidal/Roche diagnostics, fracture ===\n");
     RunPlanetTests();
+
+    std::printf("\n=== Tidal disruption flare (debris -> accretion disk coupling) ===\n");
+    RunTidalFlareTests();
 
 #ifdef BH_CUDA_AVAILABLE
     std::printf("\n=== CPU vs GPU render comparison (Stage 7) ===\n");

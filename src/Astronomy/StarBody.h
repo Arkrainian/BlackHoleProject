@@ -4,6 +4,8 @@
 
 #include <glm/glm.hpp>
 
+#include "Physics/BinarySystem.h"
+
 namespace Astronomy {
 
 // One particle of a StarBody -- see StarBody below for why a star is a
@@ -61,8 +63,15 @@ public:
 
     // Integrates every non-consumed particle one step (semi-implicit Euler,
     // matching Jet::FlightPhysics's integration style) and marks any that
-    // crossed the horizon as consumed.
-    void Update(double deltaTime);
+    // crossed the horizon as consumed. binary, when non-null, switches
+    // both the gravity law and the horizon check to pull toward/check
+    // against BOTH of the binary system's bodies at their own current
+    // positions (Physics::BinarySystem::GravityAccelSim/IsCaptured)
+    // instead of a single mass at the origin -- pass it whenever binary
+    // mode is active, or the star will behave as if an invisible single
+    // hole still sits at the barycenter instead of responding to the two
+    // actual bodies on screen.
+    void Update(double deltaTime, const Physics::BinarySystem* binary = nullptr);
 
     bool IsFullyConsumed() const;
     const std::vector<StarParticle>& Particles() const { return m_particles; }

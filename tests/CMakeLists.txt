@@ -9,6 +9,7 @@ add_executable(BlackHoleTests
     test_kerr.cpp
     test_binary.cpp
     test_planet.cpp
+    test_tidal_flare.cpp
 )
 target_link_libraries(BlackHoleTests PRIVATE bh_physics bh_astronomy)
 

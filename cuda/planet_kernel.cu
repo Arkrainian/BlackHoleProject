@@ -55,6 +55,37 @@ __global__ void GravityKernel(const float* positions, float* accel, int particle
     StoreVec3(accel, i, PlanetGravityAccel(LoadVec3(positions, i), rs));
 }
 
+// Mirrors Astronomy::PlanetBody::ApplySelfGravity exactly: direct O(N^2)
+// summation (one thread per particle, each thread loops over every other
+// particle -- no atomics needed, each thread owns its own accel[i] slot),
+// using the SAME standalone tuned force constant (not the real mass-ratio
+// self-gravity formula -- see PlanetKernel.h's comment on this function's
+// parameters, and PlanetBody.cpp's kSelfGravityCoefficient comment, for
+// why). Adds onto whatever GravityKernel already wrote into accel[i].
+__global__ void SelfGravityKernel(const float* positions, const unsigned char* consumed, const float* masses,
+                                   float* accel, int particleCount, float coefficient, float totalMassKg,
+                                   float minDistanceSq) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= particleCount) return;
+    if (consumed[i]) return;
+
+    const float3 pi = LoadVec3(positions, i);
+    float3 pull = make_float3(0.0f, 0.0f, 0.0f);
+    for (int j = 0; j < particleCount; ++j) {
+        if (j == i || consumed[j]) continue;
+        const float3 delta = LoadVec3(positions, j) - pi;
+        const float rSq = Dot3(delta, delta);
+        // Skip particles still within the planet's own intact scale --
+        // see Astronomy::PlanetBody::ApplySelfGravity's comment (this
+        // mirrors it exactly) for why.
+        if (rSq < minDistanceSq) continue;
+        const float massFraction = masses[j] / totalMassKg;
+        const float scale = coefficient * massFraction / (rSq * sqrtf(rSq));
+        pull = pull + scale * delta;
+    }
+    StoreVec3(accel, i, LoadVec3(accel, i) + pull);
+}
+
 // Mirrors PlanetBody::ApplySpringForces exactly: Hooke's-law force plus
 // axial damping, split equally/oppositely between the two endpoints.
 // atomicAdd is required (not a plain +=) because two springs sharing a
@@ -62,7 +93,7 @@ __global__ void GravityKernel(const float* positions, float* accel, int particle
 __global__ void SpringForceKernel(const float* positions, const float* velocities, const float* masses,
                                    const unsigned char* consumed, const int* springA, const int* springB,
                                    const float* restLengths, const unsigned char* broken, int springCount,
-                                   float stiffness, float damping, float* accel) {
+                                   float stiffness, float damping, float totalMassKg, float* accel) {
     const int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= springCount) return;
     if (broken[s]) return;
@@ -85,14 +116,18 @@ __global__ void SpringForceKernel(const float* positions, const float* velocitie
     const float forceMagnitude = stiffness * strain + damping * stiffness * relativeVelocityAlongAxis;
     const float3 force = forceMagnitude * direction;
 
-    const float massA = masses[a];
-    const float massB = masses[b];
-    atomicAdd(&accel[a * 3 + 0], force.x / massA);
-    atomicAdd(&accel[a * 3 + 1], force.y / massA);
-    atomicAdd(&accel[a * 3 + 2], force.z / massA);
-    atomicAdd(&accel[b * 3 + 0], -force.x / massB);
-    atomicAdd(&accel[b * 3 + 1], -force.y / massB);
-    atomicAdd(&accel[b * 3 + 2], -force.z / massB);
+    // Mass FRACTION of the planet, not raw kilograms -- see
+    // Astronomy::PlanetBody::ApplySpringForces's comment (this mirrors it
+    // exactly) for why dividing by real kg mass would make spring forces
+    // ~15-20 orders of magnitude weaker than gravity.
+    const float massFractionA = totalMassKg > 0.0f ? masses[a] / totalMassKg : 1.0f;
+    const float massFractionB = totalMassKg > 0.0f ? masses[b] / totalMassKg : 1.0f;
+    atomicAdd(&accel[a * 3 + 0], force.x / massFractionA);
+    atomicAdd(&accel[a * 3 + 1], force.y / massFractionA);
+    atomicAdd(&accel[a * 3 + 2], force.z / massFractionA);
+    atomicAdd(&accel[b * 3 + 0], -force.x / massFractionB);
+    atomicAdd(&accel[b * 3 + 1], -force.y / massFractionB);
+    atomicAdd(&accel[b * 3 + 2], -force.z / massFractionB);
 }
 
 // Semi-implicit Euler, same order as the CPU path: velocity updated from
@@ -232,7 +267,8 @@ bool PlanetCudaDeviceAvailable() {
 bool RunPlanetStepCUDA(float* positionsXYZ, float* velocitiesXYZ, const float* masses, unsigned char* consumedFlags,
                         int particleCount, const int* springA, const int* springB, const float* springRestLengths,
                         unsigned char* springBroken, int springCount, float schwarzschildRadius, float stiffness,
-                        float damping, float materialStrength, float dt) {
+                        float damping, float materialStrength, float dt, bool selfGravityEnabled,
+                        float selfGravityCoefficient, float totalMassKg, float selfGravityMinDistance) {
     if (particleCount <= 0) return true;
     if (!EnsureParticleBuffers(static_cast<size_t>(particleCount))) return false;
     if (springCount > 0 && !EnsureSpringBuffers(static_cast<size_t>(springCount))) return false;
@@ -255,11 +291,17 @@ bool RunPlanetStepCUDA(float* positionsXYZ, float* velocitiesXYZ, const float* m
     const int particleBlocks = (particleCount + kBlockSize - 1) / kBlockSize;
     GravityKernel<<<particleBlocks, kBlockSize>>>(g_dPositions, g_dAccel, particleCount, schwarzschildRadius);
 
+    if (selfGravityEnabled && totalMassKg > 0.0f) {
+        SelfGravityKernel<<<particleBlocks, kBlockSize>>>(g_dPositions, g_dConsumed, g_dMasses, g_dAccel,
+                                                           particleCount, selfGravityCoefficient, totalMassKg,
+                                                           selfGravityMinDistance * selfGravityMinDistance);
+    }
+
     if (springCount > 0) {
         const int springBlocks = (springCount + kBlockSize - 1) / kBlockSize;
         SpringForceKernel<<<springBlocks, kBlockSize>>>(g_dPositions, g_dVelocities, g_dMasses, g_dConsumed, g_dSpringA,
                                                          g_dSpringB, g_dSpringRestLengths, g_dSpringBroken, springCount,
-                                                         stiffness, damping, g_dAccel);
+                                                         stiffness, damping, totalMassKg, g_dAccel);
     }
 
     IntegrateKernel<<<particleBlocks, kBlockSize>>>(g_dPositions, g_dVelocities, g_dAccel, g_dConsumed, particleCount,

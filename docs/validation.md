@@ -456,10 +456,10 @@ there's simply less for float-vs-double rounding to disagree about.
 
 (`tests/test_gpu_render.cpp`)
 
-## 12. Planetary destruction (Milestone 1)
+## 12. Planetary destruction (Milestone 1 + self-gravity + disk coupling)
 
 Validates `Physics::PlanetMaterial`, `Physics::TidalForceModel`, and
-`Astronomy::PlanetBody` (`tests/test_planet.cpp`, 18 checks):
+`Astronomy::PlanetBody` (`tests/test_planet.cpp`, 19 checks):
 
 | Check | What it confirms |
 |---|---|
@@ -472,33 +472,49 @@ Validates `Physics::PlanetMaterial`, `Physics::TidalForceModel`, and
 | Fragment mass conservation | Sum of all fragment masses equals the planet's original total mass, after disruption |
 | Momentum conservation | A two-particle planet far from the hole (negligible tidal gradient) conserves total momentum to within integration error over 200 steps |
 | Orbital stability | A rocky planet on a distant (`r=200`), near-circular orbit never spuriously fractures over 2000 steps and stays a single fragment |
+| **Self-gravity reaccumulation** | A planet disrupted into surviving fragments ends up with its two largest fragments noticeably closer together (>2× tighter, in practice ~10×) with self-gravity on than off, after 3 minutes of sim time |
 
 (`tests/test_planet.cpp`, `RunPlanetTests`)
+
+### Tidal disruption flare (debris → accretion-disk coupling)
+
+`tests/test_tidal_flare.cpp` (`RunTidalFlareTests`, 9 checks, built in
+every configuration — not CUDA-gated) validates
+`Astronomy::TidalDisruptionFlare`'s decaying-accumulator model: a fresh
+tracker is inactive with zero boost; registering captured mass activates
+it and produces a positive boost; repeated `Update()` calls with no new
+captures monotonically decay the boost (never increases on its own, never
+goes negative); an enormous single capture event is clamped to the
+documented ceiling (0.6); and registering mass twice produces a larger
+boost than once (accumulates rather than overwrites).
+
+(`tests/test_tidal_flare.cpp`, `RunTidalFlareTests`)
 
 ### GPU acceleration (`cuda/planet_kernel.cu`, CUDA builds only)
 
 `tests/test_planet_gpu.cpp` (`RunPlanetGpuTests`, 6 checks, only
 built/run when `BH_ENABLE_CUDA`) validates `PlanetBody::UpdateGPU` against
-the CPU `Update()` path it mirrors: one planet is constructed once, then
-copied into a CPU instance and a GPU instance (so both start from
-bit-identical particle positions/velocities/spring lattice — separately
-constructing two instances wouldn't be comparable, since particle
-placement is randomized per construction), then each is stepped 20 times
-through its respective path and compared.
+the CPU `Update()` path it mirrors (self-gravity included — both default
+to enabled): one planet is constructed once, then copied into a CPU
+instance and a GPU instance (so both start from bit-identical particle
+positions/velocities/spring lattice — separately constructing two
+instances wouldn't be comparable, since particle placement is randomized
+per construction), then each is stepped 20 times through its respective
+path and compared.
 
 | Check | Result |
 |---|---|
 | `UpdateGPU` succeeds every step | ✅ |
 | Particle count stays equal | ✅ |
-| Max position difference (20 steps, float vs. double) | **3.2×10⁻⁶** sim units |
-| Max velocity difference (20 steps, float vs. double) | **6.2×10⁻⁸** sim units |
+| Max position difference (20 steps, float vs. double) | **2.7×10⁻⁶** sim units |
+| Max velocity difference (20 steps, float vs. double) | **1.7×10⁻⁶** sim units |
 | Consumed-particle agreement | ✅ (0 mismatches) |
 | Broken-spring count agreement | ✅ |
 
 The measured float-vs-double divergence (micro-units, after 20 steps at a
-~14-sim-unit orbit) is far inside the test's tolerance (10⁻²) — consistent
-with the Kerr/binary ray-tracing kernels' own CPU/GPU agreement, which use
-the same float-precision tradeoff.
+~9-sim-unit orbit, self-gravity included) is far inside the test's
+tolerance (10⁻²) — consistent with the Kerr/binary ray-tracing kernels'
+own CPU/GPU agreement, which use the same float-precision tradeoff.
 
 (`tests/test_planet_gpu.cpp`, `RunPlanetGpuTests`)
 
@@ -514,13 +530,14 @@ the same float-precision tradeoff.
 | Accretion disk (Stage 6) | 9 | ✅ |
 | Kerr (rotating) black holes — closed-form + geodesic regression + weak-field spin-orbit deflection | 35 | ✅ |
 | Binary black holes (approximate) — orbital mechanics + single-mass reduction + capture/symmetry + disks | 25 | ✅ |
-| Planetary destruction (Milestone 1) — materials, tidal/Roche diagnostics, fracture, fragments | 18 | ✅ |
-| **Total (default `build.bat`, no CUDA)** | **116** | **0 failures** |
+| Planetary destruction — materials, tidal/Roche diagnostics, fracture, fragments, self-gravity reaccumulation | 19 | ✅ |
+| Tidal disruption flare (debris → accretion-disk coupling) | 9 | ✅ |
+| **Total (default `build.bat`, no CUDA)** | **126** | **0 failures** |
 | CPU vs. GPU render comparison, Schwarzschild (Stage 7, `-DBH_ENABLE_CUDA=ON` only) | 4 | ✅ |
 | CPU vs. GPU render comparison, Kerr (`-DBH_ENABLE_CUDA=ON` only) | 4 | ✅ |
 | CPU vs. GPU render comparison, binary (`-DBH_ENABLE_CUDA=ON` only) | 4 | ✅ |
 | Planetary destruction, CPU vs. GPU step agreement (`-DBH_ENABLE_CUDA=ON` only) | 6 | ✅ |
-| **Total (`build_cuda.bat`)** | **134** | **0 failures** |
+| **Total (`build_cuda.bat`)** | **144** | **0 failures** |
 
 CPU vs. GPU correctness (Stage 7, and now Kerr and binary modes too)
 has automated coverage (`tests/test_gpu_render.cpp`, `RunGpuRenderTests`

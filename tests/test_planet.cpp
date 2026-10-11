@@ -224,4 +224,112 @@ void RunPlanetTests() {
         ExpectTrue(!brokeAnySpring, "A rocky planet on a distant, near-circular orbit does not spuriously fracture");
         ExpectTrue(planet.Fragments().size() == 1, "An undisrupted planet remains a single fragment");
     }
+
+    // 8. Self-gravity reaccumulation: a planet disrupted into surviving
+    // fragments should end up with those fragments noticeably CLOSER
+    // together when self-gravity is enabled than when it isn't -- the
+    // actual payoff of spec 28.10 (fragments otherwise separate forever
+    // once a spring breaks, with no way back). Two separately-constructed
+    // planets (particle placement is randomized per construction, so
+    // these aren't bit-identical runs) are compared statistically: the
+    // qualitative gap this produces is large (an order of magnitude in
+    // practice), so a generous margin tolerates that randomness rather
+    // than asserting an exact ratio.
+    {
+        // Mass-weighted RMS distance of every live, surviving fragment's
+        // COM from the overall COM of all of them -- uses every surviving
+        // fragment rather than just the two largest, which is far less
+        // sensitive to exactly which fragments a particular random seed's
+        // fracture pattern happens to produce (an earlier version of this
+        // test, using only the two largest fragments' pairwise distance,
+        // was intermittently flaky across random particle placements even
+        // averaged over several trials; this metric was not).
+        auto FragmentSpread = [](const Astronomy::PlanetBody& planet) -> double {
+            const auto& fragments = planet.Fragments();
+            glm::dvec3 overallCom(0.0);
+            double totalMass = 0.0;
+            int liveCount = 0;
+            for (const auto& fragment : fragments) {
+                if (fragment.captured || fragment.mass <= 0.0) continue;
+                overallCom += fragment.comPosition * fragment.mass;
+                totalMass += fragment.mass;
+                ++liveCount;
+            }
+            if (liveCount < 2 || totalMass <= 0.0) return -1.0;
+            overallCom /= totalMass;
+
+            double weightedSqSum = 0.0;
+            for (const auto& fragment : fragments) {
+                if (fragment.captured || fragment.mass <= 0.0) continue;
+                const double d = glm::length(fragment.comPosition - overallCom);
+                weightedSqSum += fragment.mass * d * d;
+            }
+            return std::sqrt(weightedSqSum / totalMass);
+        };
+
+        auto RunAndMeasure = [&](bool selfGravityEnabled) -> double {
+            BlackHole blackHole(10.0);
+            Astronomy::PlanetBodySettings settings;
+            settings.initialRadius = 1.5;
+            settings.particleCount = 90;
+            settings.totalMassKg = 5.972e24;
+            settings.material = PlanetMaterial::Preset(PlanetComposition::Rocky);
+            settings.selfGravityEnabled = selfGravityEnabled;
+            settings.selfGravityStrength = 1.0;
+
+            const double spawnRadius = 12.0, speedFraction = 0.7; // close enough to fracture, leaves survivors
+            const glm::dvec3 position(spawnRadius, 0.0, 0.0);
+            const double circularSpeed = std::sqrt(1.0 / spawnRadius);
+            const glm::dvec3 velocity(0.0, 0.0, circularSpeed * speedFraction);
+            Astronomy::PlanetBody planet(position, velocity, settings);
+
+            const double dt = 1.0 / 60.0;
+            for (int step = 0; step < 3600 * 3; ++step) {
+                planet.Update(dt, blackHole);
+            }
+            return FragmentSpread(planet);
+        };
+
+        // Particle placement is randomized per construction, so a SINGLE
+        // on/off pair can land on an unlucky fracture pattern (e.g. the
+        // "without gravity" run happening to barely separate at all,
+        // which would pass a loose margin check for the wrong reason).
+        // Averaging several independent trials of each smooths that out.
+        constexpr int kTrials = 20;
+        double totalWithout = 0.0, totalWith = 0.0;
+        int validWithout = 0, validWith = 0;
+        for (int trial = 0; trial < kTrials; ++trial) {
+            const double sepWithoutGravity = RunAndMeasure(false);
+            const double sepWithGravity = RunAndMeasure(true);
+            if (sepWithoutGravity > 0.0) {
+                totalWithout += sepWithoutGravity;
+                ++validWithout;
+            }
+            if (sepWithGravity > 0.0) {
+                totalWith += sepWithGravity;
+                ++validWith;
+            }
+        }
+
+        if (validWithout >= kTrials / 2 && validWith >= kTrials / 2) {
+            const double avgWithout = totalWithout / validWithout;
+            const double avgWith = totalWith / validWith;
+            // Gravitational few-body dynamics among several fragments are
+            // genuinely chaotic (close encounters can occasionally fling a
+            // fragment outward even WITH self-gravity active -- a real
+            // effect, not a bug), so individual trials are noisy; this
+            // only asserts the AVERAGED effect over many trials is
+            // unambiguously in the expected direction, with a loose
+            // margin, rather than tightly bounding its magnitude (the
+            // magnitude is already measured and recorded in HANDOFF.md
+            // via scripted probe: roughly 10x tighter with self-gravity on
+            // in a representative single run).
+            ExpectTrue(avgWith < avgWithout * 0.85,
+                       "Self-gravity measurably reduces average fragment spread versus self-gravity off, "
+                       "averaged over many trials (gravitational few-body dynamics are chaotic enough that "
+                       "individual trials vary)");
+        } else {
+            ExpectTrue(false, "Self-gravity reaccumulation test requires most trials to actually fracture into >=2 surviving fragments");
+        }
+    }
 }

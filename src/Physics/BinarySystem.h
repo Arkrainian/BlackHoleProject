@@ -5,6 +5,8 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/constants.hpp>
 
+#include "BlackHole.h"
+
 namespace Physics {
 
 // Two point masses in a circular mutual (Newtonian) orbit about their common
@@ -51,6 +53,39 @@ struct BinarySystem {
     glm::dvec3 Position2() const { return -Radius2() * glm::dvec3(std::cos(phase), std::sin(phase), 0.0); }
 
     void AdvancePhase(double dt) { phase += AngularVelocity() * dt; }
+
+    // Binary-aware version of Physics::StaticObserverGravityAccelSim: sums
+    // each body's own PointMassGravityAccelSim pull at its OWN current
+    // position/mass/radius, rather than pulling a test particle toward the
+    // origin as if a single mass sat there. This is what StarBody/
+    // PlanetBody need once binary mode is active -- without it, a star or
+    // planet spawned "around the origin" (the barycenter, still the right
+    // pivot -- see this struct's own Radius1()/Radius2() comment) would
+    // only ever feel a phantom single-hole pull toward that empty point,
+    // never toward either of the two actual, visually rendered masses.
+    // Same "doubled Newtonian" superposition approximation
+    // BinaryGeodesicSolver already uses for photons (see its own header):
+    // not an exact two-body GR solution, just each body's own static-
+    // observer law added together.
+    glm::dvec3 GravityAccelSim(const glm::dvec3& position) const {
+        return PointMassGravityAccelSim(position - Position1(), 1.0, SchwarzschildRadius1()) +
+               PointMassGravityAccelSim(position - Position2(), massRatio, SchwarzschildRadius2());
+    }
+
+    // True if position has crossed EITHER body's own horizon -- the
+    // binary-aware replacement for a single `length(position) < rs`
+    // check. whichBody, if non-null, is set to 0 or 1 to say which.
+    bool IsCaptured(const glm::dvec3& position, int* whichBody = nullptr) const {
+        if (glm::length(position - Position1()) < SchwarzschildRadius1()) {
+            if (whichBody) *whichBody = 0;
+            return true;
+        }
+        if (glm::length(position - Position2()) < SchwarzschildRadius2()) {
+            if (whichBody) *whichBody = 1;
+            return true;
+        }
+        return false;
+    }
 };
 
 } // namespace Physics
