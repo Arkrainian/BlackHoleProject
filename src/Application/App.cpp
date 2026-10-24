@@ -5,8 +5,10 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 // GLEW must be included before any header that drags in GL/gl.h (GLFW's
@@ -25,6 +27,8 @@
 #include <chrono>
 
 #include "Astronomy/AccretionDisk.h"
+#include "Astronomy/Blackbody.h"
+#include "Astronomy/StarTexture.h"
 #include "Astronomy/PlanetBody.h"
 #include "Astronomy/TidalDisruptionFlare.h"
 #include "Astronomy/StarBody.h"
@@ -39,6 +43,8 @@
 #include "Physics/KerrMetric.h"
 #include "Physics/Constants.h"
 #include "Physics/GeodesicSolver.h"
+#include "Physics/MultiBlackHoleSystem.h"
+#include "Physics/MultiBodyGeodesicSolver.h"
 #include "Physics/NewtonianSimulation.h"
 #include "Physics/Photon.h"
 #include "Physics/SchwarzschildMetric.h"
@@ -48,6 +54,10 @@
 #endif
 #include "Rendering/Camera.h"
 #include "Rendering/Renderer.h"
+#include "Physics/GravitySource.h"
+#include "Universe/ExoplanetCatalog.h"
+#include "Universe/MultiStarSystem.h"
+#include "Universe/StarCatalog.h"
 
 using Physics::BlackHole;
 using Physics::GeodesicConfig;
@@ -125,6 +135,106 @@ void HelpTooltip(const char* text) {
         ImGui::PopTextWrapPos();
         ImGui::EndTooltip();
     }
+}
+
+// A dark, slightly warm theme (deep space blue-black with an amber/orange
+// accent, echoing an accretion disk's glow) replacing ImGui's flat default
+// dark palette -- rounded corners, more breathing room between controls, and
+// a clearer visual hierarchy between headers/active state/plain text.
+void ApplyBlackHoleTheme() {
+    ImGuiStyle& style = ImGui::GetStyle();
+
+    style.WindowRounding = 8.0f;
+    style.ChildRounding = 6.0f;
+    style.FrameRounding = 5.0f;
+    style.PopupRounding = 6.0f;
+    style.ScrollbarRounding = 8.0f;
+    style.GrabRounding = 5.0f;
+    style.TabRounding = 5.0f;
+
+    style.WindowPadding = ImVec2(14.0f, 12.0f);
+    style.FramePadding = ImVec2(8.0f, 5.0f);
+    style.ItemSpacing = ImVec2(8.0f, 8.0f);
+    style.ItemInnerSpacing = ImVec2(6.0f, 6.0f);
+    style.IndentSpacing = 18.0f;
+    style.ScrollbarSize = 14.0f;
+    style.GrabMinSize = 10.0f;
+
+    style.WindowBorderSize = 1.0f;
+    style.FrameBorderSize = 0.0f;
+    style.WindowTitleAlign = ImVec2(0.5f, 0.5f);
+
+    ImVec4* colors = style.Colors;
+    const ImVec4 bgDeep      (0.07f, 0.08f, 0.11f, 0.97f);
+    const ImVec4 bgPanel     (0.10f, 0.11f, 0.15f, 1.00f);
+    const ImVec4 bgRaised    (0.14f, 0.15f, 0.20f, 1.00f);
+    const ImVec4 border      (0.24f, 0.22f, 0.20f, 0.55f);
+    const ImVec4 textMain    (0.92f, 0.92f, 0.90f, 1.00f);
+    const ImVec4 textDim     (0.58f, 0.58f, 0.60f, 1.00f);
+    const ImVec4 accent      (0.95f, 0.55f, 0.22f, 1.00f); // accretion-disk amber
+    const ImVec4 accentHover (1.00f, 0.65f, 0.30f, 1.00f);
+    const ImVec4 accentActive(0.85f, 0.45f, 0.15f, 1.00f);
+    const ImVec4 accentDim   (0.95f, 0.55f, 0.22f, 0.35f);
+
+    colors[ImGuiCol_Text]                  = textMain;
+    colors[ImGuiCol_TextDisabled]          = textDim;
+    colors[ImGuiCol_WindowBg]              = bgDeep;
+    colors[ImGuiCol_ChildBg]               = ImVec4(0, 0, 0, 0);
+    colors[ImGuiCol_PopupBg]               = bgPanel;
+    colors[ImGuiCol_Border]                = border;
+    colors[ImGuiCol_BorderShadow]          = ImVec4(0, 0, 0, 0);
+    colors[ImGuiCol_FrameBg]               = bgPanel;
+    colors[ImGuiCol_FrameBgHovered]        = bgRaised;
+    colors[ImGuiCol_FrameBgActive]         = accentDim;
+    colors[ImGuiCol_TitleBg]               = bgDeep;
+    colors[ImGuiCol_TitleBgActive]         = bgPanel;
+    colors[ImGuiCol_TitleBgCollapsed]      = bgDeep;
+    colors[ImGuiCol_MenuBarBg]             = bgPanel;
+    colors[ImGuiCol_ScrollbarBg]           = bgDeep;
+    colors[ImGuiCol_ScrollbarGrab]         = bgRaised;
+    colors[ImGuiCol_ScrollbarGrabHovered]  = accentDim;
+    colors[ImGuiCol_ScrollbarGrabActive]   = accent;
+    colors[ImGuiCol_CheckMark]             = accent;
+    colors[ImGuiCol_SliderGrab]            = accent;
+    colors[ImGuiCol_SliderGrabActive]      = accentHover;
+    colors[ImGuiCol_Button]                = bgRaised;
+    colors[ImGuiCol_ButtonHovered]         = accentDim;
+    colors[ImGuiCol_ButtonActive]          = accent;
+    colors[ImGuiCol_Header]                = bgRaised;
+    colors[ImGuiCol_HeaderHovered]         = accentDim;
+    colors[ImGuiCol_HeaderActive]          = accentActive;
+    colors[ImGuiCol_Separator]             = border;
+    colors[ImGuiCol_SeparatorHovered]      = accent;
+    colors[ImGuiCol_SeparatorActive]       = accentHover;
+    colors[ImGuiCol_ResizeGrip]            = ImVec4(0, 0, 0, 0);
+    colors[ImGuiCol_ResizeGripHovered]     = accentDim;
+    colors[ImGuiCol_ResizeGripActive]      = accent;
+    colors[ImGuiCol_Tab]                   = bgPanel;
+    colors[ImGuiCol_TabHovered]            = accentDim;
+    colors[ImGuiCol_TabActive]             = accentActive;
+    colors[ImGuiCol_TabUnfocused]          = bgPanel;
+    colors[ImGuiCol_TabUnfocusedActive]    = bgRaised;
+    colors[ImGuiCol_PlotLines]             = accent;
+    colors[ImGuiCol_PlotLinesHovered]      = accentHover;
+    colors[ImGuiCol_PlotHistogram]         = accent;
+    colors[ImGuiCol_PlotHistogramHovered]  = accentHover;
+    colors[ImGuiCol_TableHeaderBg]         = bgRaised;
+    colors[ImGuiCol_TableBorderStrong]     = border;
+    colors[ImGuiCol_TableBorderLight]      = ImVec4(border.x, border.y, border.z, 0.3f);
+    colors[ImGuiCol_TableRowBg]            = ImVec4(0, 0, 0, 0);
+    colors[ImGuiCol_TableRowBgAlt]         = ImVec4(1.0f, 1.0f, 1.0f, 0.02f);
+    colors[ImGuiCol_TextSelectedBg]        = accentDim;
+    colors[ImGuiCol_DragDropTarget]        = accent;
+    colors[ImGuiCol_NavHighlight]          = accent;
+}
+
+// A short, bright section label used in Simple mode in place of plain
+// ImGui::Text headings, so the quick-start panel has visible structure at a
+// glance instead of reading as one continuous wall of controls.
+void SectionLabel(const char* text) {
+    ImGui::Dummy(ImVec2(0, 2));
+    ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.22f, 1.0f), "%s", text);
+    ImGui::Separator();
 }
 
 enum class UiMode { Simple, Advanced };
@@ -473,6 +583,19 @@ App::App() {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
+    ApplyBlackHoleTheme();
+
+    // The default embedded font (ProggyClean) is a small pixel font that
+    // gets blurry/chunky scaled up -- load a proper proportional TTF at a
+    // larger size instead, same "load this resource file, fall back to a
+    // built-in default if missing" pattern as the jet model below.
+    ImGuiIO& io = ImGui::GetIO();
+    if (!io.Fonts->AddFontFromFileTTF("resources/fonts/DroidSans.ttf", 19.0f)) {
+        ImFontConfig fallbackConfig;
+        fallbackConfig.SizePixels = 18.0f;
+        io.Fonts->AddFontDefault(&fallbackConfig);
+    }
+
     ImGui_ImplGlfw_InitForOpenGL(m_window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
 }
@@ -505,10 +628,192 @@ int App::Run() {
     double blackHoleMassSolar = blackHole.MassSolarMasses(); // shared by the Simple and Advanced mass sliders
     double blackHoleSpin = 0.0; // a* = Jc/(GM^2); 0 = Schwarzschild (default), see Advanced > Spacetime
 
+    // "M" toggles a standalone Universe/Star Map window regardless of
+    // Simple/Advanced mode or camera mode (Orbit/FreeFly/Jet) -- without
+    // this, reaching the Star Map required switching to Advanced mode and
+    // scrolling to find it, which is a lot of friction for something meant
+    // to be used mid-flight. See the main loop's key-handling block and
+    // DrawUniversePanelContents below.
+    bool showUniverseMapWindow = false;
+    bool universeMapKeyWasDown = false; // edge-detects the M press, same pattern as the jet's Tab/C handling
+
+    // --- Universe / Star Map (see Universe/StarCatalog.h) ---
+    // Real stars/black holes/galaxies at their real distances/masses.
+    // "Traveling" re-points this app's one black-hole-centered scene at a
+    // different real object rather than simulating continuous flight across
+    // light-years, which nothing in this app's camera/physics is built to
+    // do -- see StarCatalog.h's header comment for the full reasoning.
+    const std::vector<Universe::CatalogObject> universeCatalog = Universe::BuildCatalog();
+    const std::vector<Universe::ExoplanetEntry> exoplanetCatalog = Universe::BuildExoplanetCatalog();
+    int universeLocationIndex = -1;  // -1 = Sol (the implicit origin every session starts at) -- kept only for the catalog listbox's own highlight bookkeeping; see currentLocationLy/currentLocationName for the actual "where am I" state, which also has to cover multi-star systems that aren't single catalog entries
+    glm::dvec3 currentLocationLy = glm::dvec3(0.0); // real heliocentric position, in light-years, of wherever the most recent REAL travel (single object or real multi-star system) landed
+    std::string currentLocationName = "Sol (home)";
+    int universeSelectedIndex = 0;   // row currently highlighted in the Star Map table, not yet traveled to
+    bool inStarSystemView = false;   // true after traveling to a Star entry -- no GR metric to render there, see the dedicated render branch below
+    int visitedStarIndex = -1;
+    std::string lastTravelSummary;   // human-readable real distance/light-time for the most recent jump
+
+    // --- Multi-star systems (see Universe/MultiStarSystem.h) ---
+    // A generalization of inStarSystemView to 2+ mutually gravitating
+    // stars, driven by a REAL per-frame Newtonian N-body integration (the
+    // tuned mutual-gravity law in Physics/GravitySource.h, already
+    // validated for exactly this "two stars spiral/swing past each other"
+    // behavior by the existing Mutual Gravity feature) instead of a static
+    // single sphere -- mutually exclusive with inStarSystemView (only one
+    // of the two is ever true at once; both are false in the default
+    // black-hole scene).
+    bool inMultiStarView = false;
+    Universe::MultiStarSystemEntry activeMultiStarSystem;
+    std::vector<glm::dvec3> multiStarPositions;  // visual-scale sim units, barycenter at the origin
+    std::vector<glm::dvec3> multiStarVelocities; // visual-scale sim units/s
+    std::vector<unsigned int> multiStarTextureIds; // one Astronomy::GenerateStarTexture upload per member, regenerated on arrival
+    int proceduralStarCount = 4; // the N-body generator's star-count slider, Universe/Star Map panel
+    unsigned int proceduralSystemSeedCounter = 1; // increments each generation so repeated clicks don't reproduce the same system
+
+    auto UniverseCurrentPositionLy = [&]() -> glm::dvec3 { return currentLocationLy; };
+    // TravelToUniverseIndex itself is defined further down (after the jet
+    // piloting state it also needs to reset on arrival, see there) --
+    // forward-declared via std::function so the UI code below (which is
+    // defined before that point) can still capture and call it.
+    std::function<void(int)> TravelToUniverseIndex;
+    // Same forward-declaration reasoning as TravelToUniverseIndex above --
+    // defined later (after jet piloting state) via ResetJetForArrival.
+    std::function<void(const Universe::MultiStarSystemEntry&)> TravelToMultiStarSystem;
+
+    // Shared body of the Universe/Star Map UI, used both inside the
+    // Advanced-mode "Universe / Star Map" panel and inside the standalone
+    // "M"-toggled window (see showUniverseMapWindow above) -- written once
+    // so pressing M gets the exact same catalog browser/Travel button as
+    // Advanced mode's copy, not a second, independently-drifting UI.
+    auto DrawUniversePanelContents = [&]() {
+        ImGui::TextWrapped(
+            "Real stars, black holes, and galaxies at their real distances/masses (see "
+            "Universe/StarCatalog.h). Selecting a Star or Black Hole entry and pressing 'Travel Here' "
+            "re-points this scene at it -- an instantaneous narrative jump, not simulated faster-than-"
+            "light flight (the real light-travel time is always shown). Galaxy entries are too far and "
+            "too extended for this app's single-point-source renderer to visit; they're listed for real-"
+            "scale distance context only.");
+
+        ImGui::Text("Current location: %s", currentLocationName.c_str());
+        if (!lastTravelSummary.empty()) {
+            ImGui::TextWrapped("%s", lastTravelSummary.c_str());
+        }
+
+        if (ImGui::BeginListBox("##UniverseCatalog", ImVec2(-FLT_MIN, 160.0f))) {
+            for (int i = 0; i < static_cast<int>(universeCatalog.size()); ++i) {
+                const Universe::CatalogObject& obj = universeCatalog[static_cast<size_t>(i)];
+                const char* typeTag = obj.type == Universe::ObjectType::Star ? "[Star]"
+                                      : obj.type == Universe::ObjectType::BlackHoleObj ? "[Black Hole]"
+                                                                                        : "[Galaxy]";
+                char label[160];
+                std::snprintf(label, sizeof(label), "%s %s", typeTag, obj.name);
+                if (ImGui::Selectable(label, universeSelectedIndex == i)) {
+                    universeSelectedIndex = i;
+                }
+            }
+            ImGui::EndListBox();
+        }
+
+        const Universe::CatalogObject& selected = universeCatalog[static_cast<size_t>(universeSelectedIndex)];
+        const double distanceFromHereLy = glm::length(selected.CartesianLy() - UniverseCurrentPositionLy());
+        ImGui::TextWrapped("%s -- %s", selected.name, selected.notes);
+        ImGui::Text("Distance from current location: %.4g ly (light-travel time: %.4g years)",
+                    distanceFromHereLy, distanceFromHereLy);
+        if (selected.type == Universe::ObjectType::Star) {
+            ImGui::Text("Mass %.3g M_sun, surface temperature %.0f K", selected.massSolar, selected.temperatureK);
+        } else if (selected.type == Universe::ObjectType::BlackHoleObj) {
+            ImGui::Text("Mass %.3e M_sun%s", selected.massSolar,
+                        selected.spin != Universe::kUnknownSpin ? " (spin a* known, applied on arrival)" : " (spin not reliably measured)");
+        }
+
+        if (selected.type == Universe::ObjectType::Galaxy) {
+            ImGui::TextDisabled("Not a travel target -- distance context only (see panel description above).");
+        } else if (ImGui::Button("Travel Here")) {
+            TravelToUniverseIndex(universeSelectedIndex);
+        }
+        if (camera.mode == Rendering::Camera::Mode::Jet) {
+            ImGui::TextDisabled("Piloting the Endurance: traveling will carry it along, respawned at the new location.");
+        }
+        if (inStarSystemView) {
+            ImGui::TextWrapped(
+                "Currently in Star System View: a simplified, non-ray-traced scene (this app's GR "
+                "renderer only models black holes) -- travel to a Black Hole entry above to return to "
+                "the full ray-traced view.");
+        }
+
+        ImGui::Separator();
+        ImGui::TextWrapped(
+            "Multi-Star Systems: 2, 3, or N mutually gravitating stars, integrated as a REAL Newtonian "
+            "N-body system every frame (not a scripted animation) -- 2-body settles into an ordinary bound "
+            "orbit; 3+ has no general closed-form solution, so it's genuinely chaotic, the same unsolved "
+            "N-body problem real astrophysics deals with.");
+        if (ImGui::Button("Travel to Alpha Centauri AB (2-body, real)")) {
+            TravelToMultiStarSystem(Universe::BuildAlphaCentauriBinary());
+        }
+        if (ImGui::Button("Travel to Alpha Centauri System (3-body, real)")) {
+            TravelToMultiStarSystem(Universe::BuildAlphaCentauriTriple());
+        }
+        ImGui::SliderInt("Star count##Procedural", &proceduralStarCount, 2, 8);
+        HelpTooltip("How many stars the generated system has. 2 = an ordinary binary; 3+ = a genuinely chaotic N-body system with no closed-form orbit -- not a specific real system, see Universe/MultiStarSystem.h.");
+        if (ImGui::Button("Generate & Travel (N-body)")) {
+            TravelToMultiStarSystem(Universe::GenerateProceduralSystem(proceduralStarCount, proceduralSystemSeedCounter++));
+        }
+        if (inMultiStarView) {
+            ImGui::TextWrapped("Currently in: %s (%s)", activeMultiStarSystem.name.c_str(),
+                                activeMultiStarSystem.isRealSystem ? "real" : "procedural");
+            ImGui::TextWrapped("%s", activeMultiStarSystem.notes.c_str());
+            for (size_t i = 0; i < activeMultiStarSystem.members.size(); ++i) {
+                const Universe::StarMember& member = activeMultiStarSystem.members[i];
+                ImGui::BulletText("%s -- %.2g M_sun, %.0f K", member.name.c_str(), member.massSolar, member.temperatureK);
+            }
+        }
+    };
+
     // --- Binary black holes (approximate, see Physics/BinaryGeodesicSolver.h) ---
     bool binaryModeEnabled = false;
     Physics::BinarySystem binarySystem;
     bool binaryOrbitAnimated = true;
+
+    // --- Extra black holes: freely placed anywhere (not constrained to
+    // BinarySystem's circular orbit), via the free-fly camera -- "fly
+    // there, spawn here" -- see Physics/MultiBlackHoleSystem.h and
+    // Physics/MultiBodyGeodesicSolver.h for the generalized N-body lensing
+    // this activates once 3+ bodies (primary + binary's second body if
+    // also active + these) are in the scene. Capped at
+    // Physics::kMaxLensingBodies - 2 (reserving one slot for the primary
+    // and one for binary mode's second body, even though both aren't
+    // always present) so the fixed-size arrays in MultiBodyGeodesicSolver
+    // never overflow.
+    std::vector<Physics::ExtraBlackHole> extraBlackHoles;
+    constexpr int kMaxExtraBlackHoles = Physics::kMaxLensingBodies - 2;
+    double extraBlackHoleMassSolar = blackHole.MassSolarMasses() * 0.5;
+    double spawnDistanceFromCamera = 15.0; // sim units, shared by every "spawn here" control below
+
+    // Spawns at wherever the free-fly camera is currently looking --
+    // Rendering::Camera::Position()/Forward() are plain const methods that
+    // work regardless of camera mode, so this needs no new camera/picking
+    // infrastructure. Static by default (ExtraBlackHole::velocity = 0) --
+    // see its own comment for why nothing pulls on it.
+    auto SpawnExtraBlackHole = [&]() {
+        if (static_cast<int>(extraBlackHoles.size()) >= kMaxExtraBlackHoles) return;
+        Physics::ExtraBlackHole hole;
+        hole.gmRatio = extraBlackHoleMassSolar / blackHole.MassSolarMasses();
+        hole.position = camera.Position() + camera.Forward() * spawnDistanceFromCamera;
+        extraBlackHoles.push_back(hole);
+    };
+
+    // --- Mutual gravity: lets spawned stars/planets pull on EACH OTHER
+    // (object-level -- each is reduced to a single point mass at its own
+    // center of mass, not full particle-to-particle N-body), so two
+    // spawned bodies can settle into a real binary-star-like mutual orbit
+    // instead of only ever responding to the black hole(s). Off by
+    // default -- existing scenes/presets behave identically unless this is
+    // explicitly turned on. See Physics/GravitySource.h for why this uses
+    // a deliberately exaggerated, tuned force law rather than the real
+    // (and, at any black hole mass this app allows, utterly invisible)
+    // physical mutual gravity.
+    bool mutualGravityEnabled = false;
+    double mutualGravityStrength = 1.0;
 
     ScenarioParams scenarioParams;
     NewtonianSimulationConfig simConfig;
@@ -610,7 +915,7 @@ int App::Run() {
     std::vector<DeflectionSample> deflectionSweep;
 
     // --- Stage 6: accretion disk state ---
-    bool diskEnabled = false;
+    bool diskEnabled = true; // on by default -- a black hole with no visible accretion disk reads as "broken" rather than "quiet" to most people arriving fresh
     Astronomy::AccretionDiskSettings diskSettings;
     Astronomy::AccretionDisk accretionDisk(diskSettings, blackHole.MassKg());
 
@@ -622,6 +927,12 @@ int App::Run() {
     // body 1's (see PerformRender).
     Astronomy::AccretionDisk accretionDisk2(diskSettings, blackHole.MassKg());
 
+    // One more AccretionDisk per extra black hole (see extraBlackHoles
+    // below) -- same reasoning as accretionDisk2's own comment, generalized
+    // from "exactly one extra" to however many are currently placed. Kept
+    // in sync with extraBlackHoles.size() inside PerformRender.
+    std::vector<Astronomy::AccretionDisk> extraAccretionDisks;
+
     // --- Stars: user-spawned tidal-disruption test bodies (see
     // Astronomy/StarBody.h) -- each is a small cluster of particles that
     // free-falls under the same exact gravity law as the jet, so any
@@ -630,7 +941,15 @@ int App::Run() {
     std::vector<Astronomy::StarBody> stars;
     double starSpawnRadius = 20.0;             // sim units
     double starOrbitalSpeedFraction = 0.55;    // fraction of the local Newtonian circular speed; <1 spirals/plunges in
+    // Stars never had a configurable mass before mutual gravity needed one
+    // (see Physics/GravitySource.h) -- defaults to 1 solar mass.
+    double starSpawnMassSolar = 1.0;
     std::mt19937 starSpawnRng(std::random_device{}());
+    auto SpawnStarAt = [&](const glm::dvec3& position, const glm::dvec3& velocity) {
+        Astronomy::StarBodySettings settings;
+        settings.totalMassKg = starSpawnMassSolar * Physics::Constants::SOLAR_MASS_KG;
+        stars.emplace_back(position, velocity, settings);
+    };
     auto SpawnStar = [&]() {
         // Equatorial plane, same convention as the accretion disk, at a
         // random azimuth so repeated spawns don't all land on top of each
@@ -642,7 +961,20 @@ int App::Run() {
         const glm::dvec3 tangential(-std::sin(azimuth), 0.0, std::cos(azimuth));
         const double circularSpeed = std::sqrt(1.0 / starSpawnRadius); // Newtonian v_circ, GM=1 sim units
         const glm::dvec3 velocity = tangential * (circularSpeed * starOrbitalSpeedFraction);
-        stars.emplace_back(position, velocity);
+        SpawnStarAt(position, velocity);
+    };
+
+    // "Spawn here": free-fly to wherever you want, drop a star there
+    // instead of only at a random point on the fixed-radius ring above --
+    // launchSpeed=0 just drops it in place; otherwise it's launched along
+    // the camera's current forward direction, like tossing it into the
+    // scene. Shares spawnDistanceFromCamera with the extra-black-hole and
+    // planet "spawn here" controls.
+    double starLaunchSpeed = 0.0;
+    auto SpawnStarHere = [&]() {
+        const glm::dvec3 position = camera.Position() + camera.Forward() * spawnDistanceFromCamera;
+        const glm::dvec3 velocity = camera.Forward() * starLaunchSpeed;
+        SpawnStarAt(position, velocity);
     };
 
     // --- Planets: user-spawned tidal-disruption bodies with an actual
@@ -682,15 +1014,7 @@ int App::Run() {
 
     constexpr double kEarthMassKg = 5.972e24;
 
-    auto SpawnPlanetWith = [&](double spawnRadius, double orbitalSpeedFraction) {
-        std::uniform_real_distribution<double> azimuthDist(0.0, 2.0 * glm::pi<double>());
-        const double azimuth = azimuthDist(planetSpawnRng);
-        const glm::dvec3 radial(std::cos(azimuth), 0.0, std::sin(azimuth));
-        const glm::dvec3 position = radial * spawnRadius;
-        const glm::dvec3 tangential(-std::sin(azimuth), 0.0, std::cos(azimuth));
-        const double circularSpeed = std::sqrt(1.0 / spawnRadius); // Newtonian v_circ, GM=1 sim units
-        const glm::dvec3 velocity = tangential * (circularSpeed * orbitalSpeedFraction);
-
+    auto SpawnPlanetAt = [&](const glm::dvec3& position, const glm::dvec3& velocity) {
         Astronomy::PlanetBodySettings settings;
         settings.particleCount = planetParticleCount;
         settings.totalMassKg = planetMassEarths * kEarthMassKg;
@@ -700,7 +1024,25 @@ int App::Run() {
         settings.selfGravityStrength = planetSelfGravityStrength;
         planets.emplace_back(position, velocity, settings);
     };
+    auto SpawnPlanetWith = [&](double spawnRadius, double orbitalSpeedFraction) {
+        std::uniform_real_distribution<double> azimuthDist(0.0, 2.0 * glm::pi<double>());
+        const double azimuth = azimuthDist(planetSpawnRng);
+        const glm::dvec3 radial(std::cos(azimuth), 0.0, std::sin(azimuth));
+        const glm::dvec3 position = radial * spawnRadius;
+        const glm::dvec3 tangential(-std::sin(azimuth), 0.0, std::cos(azimuth));
+        const double circularSpeed = std::sqrt(1.0 / spawnRadius); // Newtonian v_circ, GM=1 sim units
+        const glm::dvec3 velocity = tangential * (circularSpeed * orbitalSpeedFraction);
+        SpawnPlanetAt(position, velocity);
+    };
     auto SpawnPlanet = [&]() { SpawnPlanetWith(planetSpawnRadius, planetOrbitalSpeedFraction); };
+
+    // "Spawn here" -- same free-fly-then-drop idea as SpawnStarHere.
+    double planetLaunchSpeed = 0.0;
+    auto SpawnPlanetHere = [&]() {
+        const glm::dvec3 position = camera.Position() + camera.Forward() * spawnDistanceFromCamera;
+        const glm::dvec3 velocity = camera.Forward() * planetLaunchSpeed;
+        SpawnPlanetAt(position, velocity);
+    };
 
     // One-click initial-condition presets (spec 28.19, subset): each sets
     // the spawn distance/speed/composition together and immediately spawns
@@ -758,6 +1100,226 @@ int App::Run() {
     bool jetTabWasDown = false;   // edge-detects the Tab press above (GLFW has no "just pressed" query)
     bool jetCameraCycleKeyWasDown = false; // edge-detects the C press that cycles chase/cockpit view
     double jetMaxSpeedFractionOfC = jetPhysics.maxSpeedFractionOfC; // mirrors the slider below into FlightPhysics (SliderDouble needs a double*)
+
+    // Resets the piloted jet to a sensible starting position/velocity/
+    // camera for whichever view it's about to appear in -- shared by both
+    // the "Pilot Endurance" button (App.cpp, further down) and
+    // TravelToUniverseIndex below, so arriving somewhere while already
+    // piloting the jet doesn't leave it wherever it drifted to in a
+    // completely different view's coordinate scale (see that lambda's
+    // comment for why that was a real, reported bug: a sim-units position
+    // tens of units from a supermassive hole is effectively "far away and
+    // invisible" if the next view is Star System View's 0-25-unit visual
+    // scale, and vice versa).
+    auto ResetJetForArrival = [&](const glm::vec3& position) {
+        jetPhysics.Reset(position);
+        jetFlightCamera = Jet::FlightCamera();
+        jetFlightCamera.Update(jetPhysics.position, jetPhysics.rotation, 0.0f);
+        camera.jetPosition = glm::dvec3(jetFlightCamera.position);
+        camera.jetForward = glm::dvec3(glm::normalize(jetFlightCamera.target - jetFlightCamera.position));
+        camera.jetUp = glm::dvec3(jetFlightCamera.up);
+    };
+
+    // Jumps to catalog entry `index`. BlackHoleObj entries re-point the
+    // existing ray-traced scene at the target's real mass/spin (the same
+    // scene, just a different real hole -- exactly what the Simple-mode
+    // mass slider already does, just driven from catalog data instead of a
+    // slider drag). Star entries switch to the simplified, non-ray-traced
+    // "star system view" render branch (App::Run's main loop) since there
+    // is no black-hole metric to trace around an ordinary star. Galaxy
+    // entries are not travel targets (see StarCatalog.h) and are ignored.
+    //
+    // If the jet is currently being piloted, it's reset to a fresh position
+    // appropriate to the DESTINATION view's own coordinate scale (and the
+    // view itself keeps following it, i.e. the user keeps flying through
+    // the jump) -- without this, the jet silently stayed wherever it was in
+    // the OLD view's scale, which in the new view was either off in the
+    // void (black hole sim-units, e.g. 180, seen from Star System View's
+    // ~25-unit scale) or absurdly close to the star (Star System View's
+    // ~20-unit position, seen from black-hole sim-units where that's deep
+    // inside a normal orbit) -- a real reported bug, not a hypothetical.
+    TravelToUniverseIndex = [&](int index) {
+        if (index < 0 || index >= static_cast<int>(universeCatalog.size())) return;
+        const Universe::CatalogObject& target = universeCatalog[static_cast<size_t>(index)];
+        if (target.type == Universe::ObjectType::Galaxy) return;
+
+        const double distanceLy = glm::length(target.CartesianLy() - UniverseCurrentPositionLy());
+        char buffer[320];
+        std::snprintf(buffer, sizeof(buffer),
+                      "Arrived at %s -- %.4g light-years from the previous location. Light itself would take "
+                      "%.4g years to make that trip: this jump is an instantaneous narrative convenience, "
+                      "not simulated faster-than-light travel.",
+                      target.name, distanceLy, distanceLy);
+        lastTravelSummary = buffer;
+
+        const bool wasPilotingJet = camera.mode == Rendering::Camera::Mode::Jet;
+
+        if (target.type == Universe::ObjectType::BlackHoleObj) {
+            blackHole.SetMassSolarMasses(target.massSolar);
+            blackHoleMassSolar = target.massSolar;
+            if (target.spin != Universe::kUnknownSpin) {
+                blackHole.SetSpin(target.spin);
+                blackHoleSpin = target.spin;
+            }
+            inStarSystemView = false;
+            inMultiStarView = false;
+            visitedStarIndex = -1;
+            if (wasPilotingJet) {
+                ResetJetForArrival(jetSpawnPosition);
+                viewLensedRender = true; // the jet is only ever drawn in the ray-traced/overlay view, see "Pilot Endurance"
+                needsRerender = true;
+            } else {
+                camera.mode = Rendering::Camera::Mode::Orbit;
+                camera.distance = 30.0;
+            }
+        } else { // Star
+            inStarSystemView = true;
+            inMultiStarView = false;
+            visitedStarIndex = index;
+            if (wasPilotingJet) {
+                // Just outside the outermost orbit ring Star System View
+                // draws (kOutermostOrbitVisualRadius = 20 there), so the
+                // jet starts with the whole system already in view.
+                ResetJetForArrival(glm::vec3(0.0f, 3.0f, 23.0f));
+            } else {
+                camera.mode = Rendering::Camera::Mode::FreeFly;
+                // Fixed viewing spot in Star System View's own arbitrary
+                // visual scale (see that render branch's comment) --
+                // independent of whatever sim-unit free-fly position was
+                // last used near a black hole, which would be meaningless
+                // here.
+                camera.freeFlyPosition = glm::dvec3(0.0, 2.0, 25.0);
+                camera.freeFlyYawRadians = 3.14159265358979323846;
+                camera.freeFlyPitchRadians = 0.0;
+            }
+        }
+        universeLocationIndex = index;
+        currentLocationLy = target.CartesianLy();
+        currentLocationName = target.name;
+    };
+
+    // Jumps to a multi-star system (Universe/MultiStarSystem.h) -- see that
+    // file and the Universe panel's own description for the real-vs-
+    // procedural and 2-body-vs-3+-body distinctions. Initializes a REAL
+    // N-body state (positions centered on the barycenter, velocities from
+    // the tuned mutual-gravity law in Physics/GravitySource.h -- the same
+    // law, and the same visual pacing, the existing "Mutual Gravity"
+    // feature already validates) that the main loop integrates every frame
+    // thereafter (see the per-frame update block and the dedicated render
+    // branch, both further down).
+    TravelToMultiStarSystem = [&](const Universe::MultiStarSystemEntry& entry) {
+        activeMultiStarSystem = entry;
+        inMultiStarView = true;
+        inStarSystemView = false;
+        visitedStarIndex = -1;
+
+        const size_t n = entry.members.size();
+        multiStarPositions.assign(n, glm::dvec3(0.0));
+        multiStarVelocities.assign(n, glm::dvec3(0.0));
+        multiStarTextureIds.assign(n, 0u);
+
+        // Initial layout: evenly spaced on a circle (arbitrary visual
+        // scale, same spirit as Star System View's own single-star
+        // scale), radius scaled slightly with member count so more stars
+        // don't start overlapping. Shifted afterward so the MASS-WEIGHTED
+        // centroid sits exactly at the origin, regardless of this
+        // arbitrary starting shape -- a real two-body/N-body barycenter
+        // is defined that way, not assumed true of an arbitrary circle.
+        const double baseRadius = 6.0 + 1.5 * static_cast<double>(n);
+        double totalMass = 0.0;
+        glm::dvec3 massWeightedCentroid(0.0);
+        for (size_t i = 0; i < n; ++i) {
+            const double angle = 2.0 * glm::pi<double>() * static_cast<double>(i) / static_cast<double>(n);
+            multiStarPositions[i] = glm::dvec3(baseRadius * std::cos(angle), 0.0, baseRadius * std::sin(angle));
+            totalMass += entry.members[i].massSolar;
+            massWeightedCentroid += multiStarPositions[i] * entry.members[i].massSolar;
+        }
+        massWeightedCentroid /= totalMass;
+        for (size_t i = 0; i < n; ++i) {
+            multiStarPositions[i] -= massWeightedCentroid;
+        }
+
+        // Initial velocities: a tangential kick sized from this star's OWN
+        // tuned mutual-gravity acceleration at its starting radius (a
+        // local circular-orbit estimate, not an exact N-body solution --
+        // no such thing exists in closed form for N>=3, see the panel's
+        // own description) -- gives the system a coherent initial
+        // rotation to integrate from, rather than starting at rest and
+        // immediately collapsing radially inward. All in the same
+        // rotational sense (counrterclockwise in the XZ plane) so the
+        // system doesn't immediately tear itself apart from colliding
+        // initial velocities. Net momentum is then zeroed (subtract the
+        // mass-weighted mean velocity) so the whole system's barycenter
+        // stays put at the origin instead of drifting off-screen.
+        std::vector<Physics::GravitySource> allSources;
+        allSources.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            allSources.push_back({multiStarPositions[i], entry.members[i].massSolar * Physics::Constants::SOLAR_MASS_KG});
+        }
+        glm::dvec3 massWeightedVelocity(0.0);
+        for (size_t i = 0; i < n; ++i) {
+            std::vector<Physics::GravitySource> others;
+            others.reserve(n - 1);
+            for (size_t j = 0; j < n; ++j) {
+                if (j != i) others.push_back(allSources[j]);
+            }
+            const glm::dvec3 accel = Physics::MutualGravityAccelSim(multiStarPositions[i], others, 1.0);
+            const double r = glm::length(multiStarPositions[i]);
+            const double speed = (r > 1e-6) ? std::sqrt(glm::length(accel) * r) : 0.0;
+            const glm::dvec3 radialDir = (r > 1e-6) ? multiStarPositions[i] / r : glm::dvec3(1.0, 0.0, 0.0);
+            const glm::dvec3 tangentDir(-radialDir.z, 0.0, radialDir.x); // 90-degree rotation in the XZ plane
+            multiStarVelocities[i] = tangentDir * speed;
+            massWeightedVelocity += multiStarVelocities[i] * entry.members[i].massSolar;
+        }
+        massWeightedVelocity /= totalMass;
+        for (size_t i = 0; i < n; ++i) {
+            multiStarVelocities[i] -= massWeightedVelocity;
+        }
+
+        // Textures: one real-temperature-tinted procedural texture per
+        // member (Astronomy::GenerateStarTexture), generated immediately
+        // rather than lazily, since every member needs one up front (the
+        // single-star Star System View's lazy single-texture cache
+        // doesn't generalize cleanly to a variable-length member list).
+        for (size_t i = 0; i < n; ++i) {
+            std::vector<glm::vec3> texturePixels =
+                Astronomy::GenerateStarTexture(entry.members[i].temperatureK, static_cast<unsigned int>(i + 1));
+            for (glm::vec3& pixel : texturePixels) {
+                pixel = glm::clamp(pixel * 1.4f, 0.0f, 1.0f);
+            }
+            multiStarTextureIds[i] = renderer.UploadImage(texturePixels, 256, 128, 0);
+        }
+
+        if (entry.isRealSystem) {
+            const Universe::CatalogObject proxy{entry.name.c_str(), Universe::ObjectType::Star, entry.raHours,
+                                                 entry.decDegrees, entry.distanceLy, 0.0, 0.0, Universe::kUnknownSpin, ""};
+            const double distanceLy = glm::length(proxy.CartesianLy() - currentLocationLy);
+            char buffer[320];
+            std::snprintf(buffer, sizeof(buffer),
+                          "Arrived at %s -- %.4g light-years from the previous location. Light itself would take "
+                          "%.4g years to make that trip: this jump is an instantaneous narrative convenience, "
+                          "not simulated faster-than-light travel.",
+                          entry.name.c_str(), distanceLy, distanceLy);
+            lastTravelSummary = buffer;
+            currentLocationLy = proxy.CartesianLy();
+        } else {
+            lastTravelSummary =
+                "Generated at your current location -- a procedural system has no real sky position, so this "
+                "isn't a real travel jump the way visiting a cataloged object is.";
+        }
+        currentLocationName = entry.name;
+        universeLocationIndex = -1; // no single catalog entry corresponds to a multi-star system
+
+        const bool wasPilotingJet = camera.mode == Rendering::Camera::Mode::Jet;
+        if (wasPilotingJet) {
+            ResetJetForArrival(glm::vec3(0.0f, 3.0f, static_cast<float>(baseRadius * 2.5)));
+        } else {
+            camera.mode = Rendering::Camera::Mode::FreeFly;
+            camera.freeFlyPosition = glm::dvec3(0.0, 3.0, baseRadius * 2.5);
+            camera.freeFlyYawRadians = 3.14159265358979323846;
+            camera.freeFlyPitchRadians = 0.0;
+        }
+    };
 
 #ifdef BH_CUDA_AVAILABLE
     if (cudaDeviceAvailable) {
@@ -836,6 +1398,40 @@ int App::Run() {
             renderSettings.binaryConfig.disk2OuterRadius = diskSettings.outerRadius * rs2OverRs1;
         }
 
+        // Extra black holes (see Physics/MultiBlackHoleSystem.h): once 3+
+        // bodies are active (primary + binary's second body if also on +
+        // these), CPUTracer.cpp routes through Physics::TracePhotonMultiBody
+        // instead of the chain above -- same index order (0=primary,
+        // 1=binary's second body if binaryModeEnabled, then extras) as
+        // CPUTracer.cpp's own BuildLensingBodies, so multiBodyConfig's
+        // per-index disk radii below line up with whatever body each index
+        // actually turns out to be.
+        renderSettings.extraBlackHoles = extraBlackHoles;
+        renderSettings.multiBodyConfig.escapeRadius = kBinaryLiveEscapeRadius;
+        renderSettings.multiBodyConfig.maxSteps = kBinaryLiveMaxSteps;
+        renderSettings.multiBodyConfig.checkDisk = diskEnabled;
+        {
+            int bodyIndex = 0;
+            renderSettings.multiBodyConfig.diskInnerRadius[static_cast<size_t>(bodyIndex)] = diskSettings.innerRadius;
+            renderSettings.multiBodyConfig.diskOuterRadius[static_cast<size_t>(bodyIndex)] = diskSettings.outerRadius;
+            ++bodyIndex;
+            if (binaryModeEnabled) {
+                renderSettings.multiBodyConfig.diskInnerRadius[static_cast<size_t>(bodyIndex)] =
+                    renderSettings.binaryConfig.disk2InnerRadius;
+                renderSettings.multiBodyConfig.diskOuterRadius[static_cast<size_t>(bodyIndex)] =
+                    renderSettings.binaryConfig.disk2OuterRadius;
+                ++bodyIndex;
+            }
+            for (const Physics::ExtraBlackHole& extra : extraBlackHoles) {
+                if (bodyIndex >= Physics::kMaxLensingBodies) break;
+                renderSettings.multiBodyConfig.diskInnerRadius[static_cast<size_t>(bodyIndex)] =
+                    diskSettings.innerRadius * extra.gmRatio;
+                renderSettings.multiBodyConfig.diskOuterRadius[static_cast<size_t>(bodyIndex)] =
+                    diskSettings.outerRadius * extra.gmRatio;
+                ++bodyIndex;
+            }
+        }
+
         const RayTracing::CameraFrame frame = BuildCameraFrame(camera, w, h);
         const glm::dvec3 sourceDirection = frame.forward; // Stage 4: always collinear, see SamplePointSource
 
@@ -865,18 +1461,50 @@ int App::Run() {
             accretionDisk2.SetSettings(disk2Settings);
             accretionDisk2.SetBlackHoleMassKg(blackHole.MassKg() * binarySystem.massRatio);
         }
+
+        // Index order matches CPUTracer.cpp's BuildLensingBodies exactly
+        // (0=primary, 1=binary's second body if active, then extras) --
+        // diskByBodyIndex[i] is the AccretionDisk whichever solver's
+        // result.diskBodyIndex==i refers to. Only relevant when the
+        // multi-body solver is in play (3+ bodies); with 1-2 bodies the
+        // existing ternary below (index 0 or 1) already covers it, kept
+        // as-is since it's exactly indices 0/1 of this same list.
+        extraAccretionDisks.resize(extraBlackHoles.size());
+        std::vector<Astronomy::AccretionDisk*> diskByBodyIndex;
+        diskByBodyIndex.push_back(&accretionDisk);
+        if (binaryModeEnabled) diskByBodyIndex.push_back(&accretionDisk2);
+        for (size_t i = 0; i < extraBlackHoles.size(); ++i) {
+            Astronomy::AccretionDiskSettings extraDiskSettings = diskSettings;
+            extraDiskSettings.innerRadius = diskSettings.innerRadius * extraBlackHoles[i].gmRatio;
+            extraDiskSettings.outerRadius = diskSettings.outerRadius * extraBlackHoles[i].gmRatio;
+            extraAccretionDisks[i].SetSettings(extraDiskSettings);
+            extraAccretionDisks[i].SetBlackHoleMassKg(blackHole.MassKg() * extraBlackHoles[i].gmRatio);
+            diskByBodyIndex.push_back(&extraAccretionDisks[i]);
+        }
+
         const RayTracing::DiskSampler diskSampler = [&](const PhotonTraceResult& hit) {
-            const Astronomy::AccretionDisk& whichDisk = (hit.diskBodyIndex == 1) ? accretionDisk2 : accretionDisk;
+            const Astronomy::AccretionDisk& whichDisk =
+                (hit.diskBodyIndex >= 0 && hit.diskBodyIndex < static_cast<int>(diskByBodyIndex.size()))
+                    ? *diskByBodyIndex[static_cast<size_t>(hit.diskBodyIndex)]
+                    : accretionDisk;
             const double emittedTemperature = whichDisk.Temperature(hit.diskHitRadius);
             const double observedTemperature =
                 diskSettings.relativisticEffects ? emittedTemperature * hit.diskRedshiftFactor : emittedTemperature;
             return whichDisk.EmittedColor(observedTemperature);
         };
 
+        // The GPU kernels don't know about extra black holes at all (see
+        // Physics/MultiBodyGeodesicSolver.h) -- rather than silently
+        // ignoring them, a frame with any extra black holes placed always
+        // renders on CPU, same "fall back instead of running the wrong
+        // physics fast" precedent PlanetBody::UpdateGPU already set for
+        // binary mode.
+        const bool useGpuThisFrame = useGpu && cudaDeviceAvailable && extraBlackHoles.empty();
+
         const auto t0 = std::chrono::steady_clock::now();
         std::vector<glm::vec3> pixels;
 #ifdef BH_CUDA_AVAILABLE
-        if (useGpu && cudaDeviceAvailable) {
+        if (useGpuThisFrame) {
             pixels = RayTracing::RenderImageCUDA(frame, renderSettings, background, diskSampler);
         } else
 #endif
@@ -885,7 +1513,7 @@ int App::Run() {
         }
         const auto t1 = std::chrono::steady_clock::now();
         lastRenderMilliseconds = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        lastRenderWasGpu = useGpu && cudaDeviceAvailable;
+        lastRenderWasGpu = useGpuThisFrame;
 
         lensedTexture = renderer.UploadImage(pixels, w, h, lensedTexture);
         lensedTextureWidth = w;
@@ -907,11 +1535,23 @@ int App::Run() {
         previousCameraMode = camera.mode;
 
         const ImGuiIO& io = ImGui::GetIO();
+
+        // "M" toggles the standalone Universe/Star Map window -- checked
+        // before the per-camera-mode input blocks below so it works
+        // regardless of which one is active (including while the jet's own
+        // Tab/mouse-capture handling is running).
+        const bool mDown = !io.WantCaptureKeyboard && glfwGetKey(m_window, GLFW_KEY_M) == GLFW_PRESS;
+        if (mDown && !universeMapKeyWasDown) {
+            showUniverseMapWindow = !showUniverseMapWindow;
+        }
+        universeMapKeyWasDown = mDown;
+
         if (camera.mode == Rendering::Camera::Mode::Jet) {
             // --- Jet piloting controls: continuous mouse-look by default ---
             // (cursor hidden/captured, mouse acts as a virtual joystick,
             // matching the source project's HOTAS-style control feel), WASD
-            // pitch/roll, Q/E yaw, Shift/Space for thrust. Tab toggles the
+            // pitch/roll, Q/E yaw, Shift/Ctrl for thrust (Ctrl past zero is
+            // reverse thrust). Tab toggles the
             // cursor free so the ImGui panel (camera-view switch, etc.) can
             // be clicked without leaving Jet mode -- flight keyboard
             // controls keep working either way, only mouse-look pauses.
@@ -950,7 +1590,12 @@ int App::Run() {
 
             jetPhysics.Update(static_cast<float>(dt), Physics::Constants::GravitationalRadiusMeters(blackHole.MassKg()));
             if (jetPhysics.capturedByBlackHole) {
-                jetPhysics.Reset(jetSpawnPosition);
+                // Respawn at a position appropriate to whichever view is
+                // CURRENTLY showing -- jetSpawnPosition (180 sim units) is
+                // the black-hole-view default; Star System View's own
+                // much smaller visual scale needs its own respawn point,
+                // same reasoning as TravelToUniverseIndex's ResetJetForArrival.
+                jetPhysics.Reset(inStarSystemView ? glm::vec3(0.0f, 3.0f, 23.0f) : jetSpawnPosition);
             }
 
             jetFlightCamera.Update(jetPhysics.position, jetPhysics.rotation, static_cast<float>(dt));
@@ -993,7 +1638,19 @@ int App::Run() {
 
             if (rightDown) {
                 if (freeFlyLooking) {
-                    camera.freeFlyYawRadians += (mx - lastMouseX) * 0.005;
+                    // Inverted from a naive "+=": Camera::Forward() for
+                    // FreeFly is (sin(yaw), ..., cos(yaw)), and
+                    // OrthonormalBasis() defines `right` as
+                    // cross(forward, up) -- working through those two
+                    // formulas together, INCREASING yaw actually rotates
+                    // Forward() toward the LEFT of that basis.right, not
+                    // the right. A naive "+=" on mouse-right-movement
+                    // therefore turned the view left, and vice versa --
+                    // reported directly by the user, confirmed by tracing
+                    // the math rather than just flipping the sign and
+                    // hoping. Subtracting here makes mouse-right actually
+                    // turn the view right.
+                    camera.freeFlyYawRadians -= (mx - lastMouseX) * 0.005;
                     camera.freeFlyPitchRadians =
                         std::clamp(camera.freeFlyPitchRadians - (my - lastMouseY) * 0.005, -1.5, 1.5);
                 }
@@ -1024,7 +1681,7 @@ int App::Run() {
         glfwGetFramebufferSize(m_window, &fbWidth, &fbHeight);
 
         // --- ImGui control panel ---
-        ImGui::SetNextWindowSize(ImVec2(430, 0), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_FirstUseEver);
         ImGui::Begin("Black Hole Simulator");
 
         // --- Mode switcher: Simple (presets, plain language) vs Advanced ---
@@ -1083,10 +1740,10 @@ int App::Run() {
 
             ImGui::SameLine();
             if (isJet) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
-            if (ImGui::Button("Pilot Jet", ImVec2(thirdWidth, 0))) {
+            if (ImGui::Button("Pilot Endurance", ImVec2(thirdWidth, 0))) {
                 if (!jetRendererLoadAttempted) {
                     jetRendererLoadAttempted = true;
-                    if (!jetRenderer.Load("resources/jet/su57.glb", "resources/jet/su57_basecolor.png", 3.0f)) {
+                    if (!jetRenderer.Load("resources/jet/endurance.glb", "resources/jet/endurance_basecolor.png", 3.0f)) {
                         std::fprintf(stderr, "Jet mode: model/texture failed to load -- piloting still works, but the jet won't be visible.\n");
                     }
                 }
@@ -1124,19 +1781,41 @@ int App::Run() {
             if (isFreeFly) {
                 ImGui::TextDisabled("WASD to move, hold Right Mouse to look, Space/Ctrl for up/down, Shift to go faster.");
             } else if (isJet) {
-                ImGui::TextDisabled("Mouse to look (virtual joystick), WASD pitch/roll, Q/E yaw, Shift/Space thrust, Shift+W afterburner, C to cycle camera view, Tab to free the cursor.");
+                ImGui::TextDisabled("Mouse to look (virtual joystick), WASD pitch/roll, Q/E yaw, Shift/Ctrl thrust (Ctrl past zero reverses), Shift+W afterburner, C to cycle camera view, Tab to free the cursor.");
                 if (ImGui::Button(jetFlightCamera.mode == Jet::FlightCameraMode::Chase ? "Switch to Cockpit View" : "Switch to Chase View")) {
                     jetFlightCamera.CycleMode();
                 }
                 const double jetMetersPerSimUnit = Physics::Constants::GravitationalRadiusMeters(blackHole.MassKg());
                 const double jetSpeedMetersPerSec = jetPhysics.GetSpeed() * jetMetersPerSimUnit;
+                const double jetSpeedC = jetSpeedMetersPerSec / Physics::Constants::C_SI;
                 ImGui::Text("Speed: %.0f sim units/s = %.3gc   G: %.1f (peak %.1f)", jetPhysics.GetSpeed(),
-                            jetSpeedMetersPerSec / Physics::Constants::C_SI, jetPhysics.currentGForce, jetPhysics.peakGForce);
+                            jetSpeedC, jetPhysics.currentGForce, jetPhysics.peakGForce);
+                // Jet::MIN_FLYABLE_SPEED_SIM_UNITS_PER_SEC (FlightPhysics.h)
+                // floors the sim-units/s cap so flight never becomes
+                // literally imperceptible near a supermassive hole -- but
+                // that floor, unlike the fraction-of-c slider below, is NOT
+                // a real-light-speed-respecting cap: at a mass heavy enough
+                // that 0.2c-in-sim-units falls below the floor, the actual
+                // speed shown above can read as many times c. Surfaced
+                // here explicitly rather than silently shown as an honest
+                // "0.2c" -- this app doesn't misrepresent its own physics,
+                // even for a deliberate playability concession.
+                const double relativisticCapSimUnits = (jetMaxSpeedFractionOfC * Physics::Constants::C_SI) / jetMetersPerSimUnit;
+                if (relativisticCapSimUnits < Jet::MIN_FLYABLE_SPEED_SIM_UNITS_PER_SEC) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
+                                        "Speed floor active: this hole's mass makes %.3gc (%.2e sim units/s) imperceptibly slow, "
+                                        "so flight is floored at %.0f sim units/s for playability -- that's %.2gc, well above the "
+                                        "slider's real-light-speed intent. A deliberate, documented concession (see FlightPhysics.h), "
+                                        "not a claim this is really sub-light.",
+                                        jetMaxSpeedFractionOfC, relativisticCapSimUnits,
+                                        Jet::MIN_FLYABLE_SPEED_SIM_UNITS_PER_SEC,
+                                        (Jet::MIN_FLYABLE_SPEED_SIM_UNITS_PER_SEC * jetMetersPerSimUnit) / Physics::Constants::C_SI);
+                }
                 ImGui::TextDisabled("Jet pos: (%.1f, %.1f, %.1f)   Camera pos: (%.1f, %.1f, %.1f)",
                                      jetPhysics.position.x, jetPhysics.position.y, jetPhysics.position.z,
                                      camera.jetPosition.x, camera.jetPosition.y, camera.jetPosition.z);
                 SliderDouble("Max speed (fraction of c)", &jetMaxSpeedFractionOfC, 0.001, 0.9, "%.3f");
-                HelpTooltip("Hard ceiling on the jet's real speed, as a fraction of light speed -- this is what keeps flight from becoming 'cross several light-years in a few seconds' once the black hole is supermassive (one sim unit is much bigger in real terms for a hole like TON 618 than for a stellar-mass one, see Physics/Constants.h). Raise it if a heavier hole feels too slow to get anywhere; it can never reach or exceed 1.0 (actual light speed).");
+                HelpTooltip("Hard ceiling on the jet's real speed, as a fraction of light speed -- this is what keeps flight from becoming 'cross several light-years in a few seconds' once the black hole is supermassive (one sim unit is much bigger in real terms for a hole like TON 618 than for a stellar-mass one, see Physics/Constants.h). Raise it if a heavier hole feels too slow to get anywhere; it can never reach or exceed 1.0 (actual light speed) BY ITSELF -- but see the playability floor warning above, which can override it at extreme masses.");
                 jetPhysics.maxSpeedFractionOfC = static_cast<float>(jetMaxSpeedFractionOfC);
             }
         }
@@ -1144,7 +1823,6 @@ int App::Run() {
 
         if (uiMode == UiMode::Simple) {
             ImGui::TextWrapped("Explore how a black hole bends light. Pick a scene below, then drag to look around.");
-            ImGui::Dummy(ImVec2(0, 4));
 
             // --- Preset scenes: each sets up camera + scene flags and ---
             // triggers a render, so one click is a complete demonstration.
@@ -1159,14 +1837,17 @@ int App::Run() {
                 {"Newtonian vs Einstein", "Old-physics vs. real-physics light paths, side by side."},
             };
 
+            SectionLabel("Scenes");
             const float presetWidth = ImGui::GetContentRegionAvail().x;
             for (const Preset& preset : presets) {
                 const bool isActive = activePreset == preset.name;
                 if (isActive) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
-                const bool clicked = ImGui::Button(preset.name, ImVec2(presetWidth, 32));
+                const bool clicked = ImGui::Button(preset.name, ImVec2(presetWidth, 34));
                 if (isActive) ImGui::PopStyleColor();
+                ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
                 ImGui::TextWrapped("%s", preset.blurb);
-                ImGui::Dummy(ImVec2(0, 6));
+                ImGui::PopStyleColor();
+                ImGui::Dummy(ImVec2(0, 4));
 
                 if (clicked) {
                     activePreset = preset.name;
@@ -1208,7 +1889,7 @@ int App::Run() {
             }
 
             if (viewLensedRender) {
-                ImGui::Separator();
+                SectionLabel("Rendering");
 
                 const double fps = smoothedFrameMs > 0.0 ? 1000.0 / smoothedFrameMs : 0.0;
                 const ImVec4 fpsColor = fps >= 24.0 ? ImVec4(0.4f, 0.9f, 0.4f, 1.0f)
@@ -1231,39 +1912,72 @@ int App::Run() {
 #endif
             }
 
-            if (SliderDouble("Black hole mass (solar masses)", &blackHoleMassSolar, 1.0, 1.0e11, "%.2e")) {
+            SectionLabel("Black Hole");
+            if (SliderDouble("Mass (solar masses)", &blackHoleMassSolar, 1.0, 1.0e11, "%.2e")) {
                 blackHole.SetMassSolarMasses(blackHoleMassSolar);
             }
 
-            ImGui::Separator();
+            SectionLabel("Objects");
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::GetStyle().Colors[ImGuiCol_FrameBg]);
+
+            ImGui::BeginChild("##StarCard", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Border);
+            ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.4f, 1.0f), "Star");
             if (ImGui::Button("Add Star")) {
                 SpawnStar();
             }
             ImGui::SameLine();
-            if (!stars.empty() && ImGui::Button("Clear Stars")) {
+            if (ImGui::Button("Add Here")) {
+                SpawnStarHere();
+            }
+            ImGui::SameLine();
+            ImGui::BeginDisabled(stars.empty());
+            if (ImGui::Button("Clear")) {
                 stars.clear();
             }
+            ImGui::EndDisabled();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
             ImGui::TextWrapped(
                 "Drops a small star into orbit and watches real tidal gravity pull it apart -- no "
                 "scripted stretching, just ~28 particles each falling under the exact same physics "
-                "as everything else here. Switch to Advanced mode to tune its starting orbit.");
+                "as everything else here. 'Add Here' drops it wherever the camera is currently "
+                "looking (switch to Free-fly mode to fly somewhere first) instead of a random orbit.");
+            ImGui::PopStyleColor();
+            ImGui::EndChild();
 
-            ImGui::Separator();
+            ImGui::Dummy(ImVec2(0, 6));
+
+            ImGui::BeginChild("##PlanetCard", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Border);
+            ImGui::TextColored(ImVec4(0.55f, 0.8f, 0.95f, 1.0f), "Planet");
             if (ImGui::Button("Add Planet")) {
                 SpawnPlanet();
             }
             ImGui::SameLine();
-            if (!planets.empty() && ImGui::Button("Clear Planets")) {
+            if (ImGui::Button("Add Here")) {
+                SpawnPlanetHere();
+            }
+            ImGui::SameLine();
+            ImGui::BeginDisabled(planets.empty());
+            if (ImGui::Button("Clear")) {
                 planets.clear();
             }
+            ImGui::EndDisabled();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
             ImGui::TextWrapped(
                 "Drops a planet held together by an actual spring network -- it visibly stretches "
                 "and, if tidal stress overcomes the chosen material's strength, fractures into "
                 "tracked fragments. Switch to Advanced mode for material presets, encounter "
                 "presets, and live diagnostics.");
+            ImGui::PopStyleColor();
+            ImGui::EndChild();
 
+            ImGui::PopStyleColor(); // ChildBg
+
+            ImGui::Dummy(ImVec2(0, 8));
+            ImGui::Separator();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
             ImGui::TextWrapped("Tip: drag with the left mouse button to look around -- the light bends in real time as you move. Scroll to zoom.");
-            if (ImGui::Button("Show every control (Advanced mode)")) {
+            ImGui::PopStyleColor();
+            if (ImGui::Button("Show every control (Advanced mode)", ImVec2(presetWidth, 0))) {
                 uiMode = UiMode::Advanced;
             }
         } // uiMode == Simple
@@ -1348,6 +2062,66 @@ int App::Run() {
                 ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f),
                                     "Binary mode active -- rendering with the approximate superposed-lensing solver.");
             }
+        }
+
+        if (ImGui::CollapsingHeader("Extra Black Holes (place anywhere)")) {
+            ImGui::TextWrapped(
+                "Freely-placed black holes, not constrained to an orbit like Binary mode's second body -- "
+                "fly the camera (Free-fly mode) to wherever you want one, set its mass, and drop it. Uses "
+                "the SAME approximate doubled-Newtonian lensing scheme as Binary mode, generalized to "
+                "however many bodies are active at once (primary + binary's second body if also enabled + "
+                "these). Runs on CPU only while any are placed -- see the GPU status line in the render "
+                "settings above.");
+            SliderDouble("Next black hole's mass (solar masses)", &extraBlackHoleMassSolar, 0.1, blackHole.MassSolarMasses(), "%.3e");
+            SliderDouble("Spawn distance from camera (sim units)", &spawnDistanceFromCamera, 2.0, 100.0, "%.1f");
+            HelpTooltip("Shared with the star/planet 'spawn here' controls below -- how far in front of wherever the camera is currently looking a new object appears.");
+            if (static_cast<int>(extraBlackHoles.size()) >= kMaxExtraBlackHoles) {
+                ImGui::TextDisabled("Add black hole here (limit of %d reached)", kMaxExtraBlackHoles);
+            } else if (ImGui::Button("Add black hole here")) {
+                SpawnExtraBlackHole();
+            }
+            if (!extraBlackHoles.empty()) {
+                ImGui::SameLine();
+                if (ImGui::Button("Clear extra black holes")) {
+                    extraBlackHoles.clear();
+                }
+            }
+            for (size_t i = 0; i < extraBlackHoles.size(); ++i) {
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::Text("#%d: %.3e Msun at (%.1f, %.1f, %.1f)", static_cast<int>(i),
+                            extraBlackHoles[i].gmRatio * blackHole.MassSolarMasses(), extraBlackHoles[i].position.x,
+                            extraBlackHoles[i].position.y, extraBlackHoles[i].position.z);
+                ImGui::SameLine();
+                if (ImGui::Button("Remove")) {
+                    extraBlackHoles.erase(extraBlackHoles.begin() + static_cast<long>(i));
+                    ImGui::PopID();
+                    break; // erased mid-loop -- indices below i are now stale, stop rather than continue over them
+                }
+                ImGui::PopID();
+            }
+        }
+
+        if (ImGui::CollapsingHeader("Mutual Gravity (stars/planets pull on each other)")) {
+            ImGui::TextWrapped(
+                "Off by default -- existing scenarios behave exactly as before unless you turn this on. "
+                "Each spawned star/planet is reduced to a single point mass at its own center of mass for "
+                "the purposes of pulling on OTHER spawned stars/planets (not full particle-to-particle "
+                "physics, and black holes are NOT included -- they stay fixed gravity sources, never pulled "
+                "by anything). This is a DELIBERATELY EXAGGERATED, tuned force, not the real physical mutual "
+                "gravity -- at any black hole mass this app allows, two real stars'/planets' actual mutual "
+                "pull on each other is far too small to ever visibly matter (same reason planet self-gravity "
+                "uses a tuned strength instead of the real formula). With it on, two stars or planets given "
+                "the right initial conditions can settle into a real binary-star-like mutual orbit.");
+            ImGui::Checkbox("Enable mutual gravity", &mutualGravityEnabled);
+            if (mutualGravityEnabled) {
+                SliderDouble("Mutual gravity strength", &mutualGravityStrength, 0.0, 5.0, "%.2f");
+                HelpTooltip("1.0 is the tuned default. Higher = faster/stronger mutual attraction; 0 behaves like mutual gravity off.");
+            }
+        }
+
+        if (ImGui::CollapsingHeader("Universe / Star Map (real catalog)", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextDisabled("Tip: press M anytime (any mode, while flying too) to pop this out as its own window.");
+            DrawUniversePanelContents();
         }
 
         if (ImGui::CollapsingHeader("Scenario", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -1905,6 +2679,8 @@ int App::Run() {
             HelpTooltip("How far from the black hole (in sim units, same scale as everything else) a newly-added star starts. Closer in = stronger, faster tidal disruption.");
             SliderDouble("Orbital speed (fraction of circular)", &starOrbitalSpeedFraction, 0.0, 1.3, "%.2f");
             HelpTooltip("0 = drops straight in (radial plunge). 1.0 = a circular orbit that (ignoring tidal spreading) would never fall in. Something around 0.4-0.7 gives an elliptical orbit that dives close enough to the hole to visibly spaghettify, which is usually the most interesting case.");
+            SliderDouble("Mass (solar masses)", &starSpawnMassSolar, 0.01, 1000.0, "%.3f");
+            HelpTooltip("Only used by Mutual Gravity (see its own panel below) -- a star's own particles are still massless test particles under the black hole's field, unaffected by this slider.");
 
             if (ImGui::Button("Add Star")) {
                 SpawnStar();
@@ -1912,6 +2688,12 @@ int App::Run() {
             ImGui::SameLine();
             if (!stars.empty() && ImGui::Button("Clear Stars")) {
                 stars.clear();
+            }
+
+            ImGui::TextWrapped("Or place one freely: fly the camera (Free-fly mode) wherever you want, set a launch speed (0 = just drop it), and spawn.");
+            SliderDouble("Launch speed (toward camera's forward direction)", &starLaunchSpeed, 0.0, 1.0, "%.2f");
+            if (ImGui::Button("Add Star Here")) {
+                SpawnStarHere();
             }
 
             int remainingParticles = 0;
@@ -1995,6 +2777,12 @@ int App::Run() {
                 planets.clear();
             }
 
+            ImGui::TextWrapped("Or place one freely, same idea as the star's 'Add Star Here' above.");
+            SliderDouble("Launch speed (toward camera's forward direction)##planet", &planetLaunchSpeed, 0.0, 1.0, "%.2f");
+            if (ImGui::Button("Add Planet Here")) {
+                SpawnPlanetHere();
+            }
+
             ImGui::TextWrapped("Initial-condition presets (spec 28.19, representative subset):");
             if (ImGui::Button("Stable orbit")) SpawnPlanetPresetStableOrbit();
             ImGui::SameLine();
@@ -2031,15 +2819,68 @@ int App::Run() {
 
         ImGui::End();
 
+        // Standalone Universe/Star Map window, toggled by "M" (see the key
+        // handling near the top of this loop) -- available regardless of
+        // Simple/Advanced mode or camera mode, specifically so it's usable
+        // mid-flight without first switching to Advanced mode and scrolling
+        // to find it.
+        if (showUniverseMapWindow) {
+            ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Universe / Star Map (M to toggle)", &showUniverseMapWindow)) {
+                DrawUniversePanelContents();
+            }
+            ImGui::End();
+        }
+
         // Single shared trigger for "a render is due": works regardless of
         // uiMode, so Simple-mode presets (which just flip flags) and the
         // Advanced panel's own controls both actually produce an image. In
         // Live mode this fires every single frame, at full precision,
-        // whether the camera is moving or not -- see PerformRender.
-        if (viewLensedRender && (liveMode || needsRerender)) {
+        // whether the camera is moving or not -- see PerformRender. Skipped
+        // entirely in Star System View: that view never displays
+        // lensedTexture (it has its own render branch below), so tracing a
+        // full image every frame here would be pure wasted GPU/CPU work --
+        // a real perf bug, not a hypothetical one, since Live mode fires
+        // this unconditionally every frame.
+        if (!inStarSystemView && !inMultiStarView && viewLensedRender && (liveMode || needsRerender)) {
             PerformRender();
             needsRerender = false;
             smoothedFrameMs = smoothedFrameMs * 0.9 + lastRenderMilliseconds * 0.1;
+        }
+
+        // Multi-star N-body integration (Universe/MultiStarSystem.h,
+        // TravelToMultiStarSystem): real per-frame Newtonian gravity, same
+        // tuned mutual-gravity law (Physics::MutualGravityAccelSim) and
+        // semi-implicit-Euler integration style the existing "Mutual
+        // Gravity" star/planet feature already uses, just applied to the
+        // system's own members pulling on EACH OTHER instead of on
+        // spawned stars/planets. Two explicit passes (compute every
+        // acceleration from the pre-step positions, THEN apply every
+        // velocity/position update) so the result doesn't depend on
+        // member iteration order within a single step.
+        if (inMultiStarView && !paused) {
+            const size_t n = multiStarPositions.size();
+            std::vector<Physics::GravitySource> sources;
+            sources.reserve(n);
+            for (size_t i = 0; i < n; ++i) {
+                sources.push_back({multiStarPositions[i],
+                                    activeMultiStarSystem.members[i].massSolar * Physics::Constants::SOLAR_MASS_KG});
+            }
+            std::vector<glm::dvec3> accelerations(n, glm::dvec3(0.0));
+            for (size_t i = 0; i < n; ++i) {
+                std::vector<Physics::GravitySource> others;
+                others.reserve(n - 1);
+                for (size_t j = 0; j < n; ++j) {
+                    if (j != i) others.push_back(sources[j]);
+                }
+                accelerations[i] = Physics::MutualGravityAccelSim(multiStarPositions[i], others, 1.0);
+            }
+            for (size_t i = 0; i < n; ++i) {
+                multiStarVelocities[i] += accelerations[i] * dt;
+            }
+            for (size_t i = 0; i < n; ++i) {
+                multiStarPositions[i] += multiStarVelocities[i] * dt;
+            }
         }
 
         if (!paused) {
@@ -2054,17 +2895,62 @@ int App::Run() {
             // (now-empty) barycenter instead of responding to the two
             // actual bodies on screen.
             const Physics::BinarySystem* activeBinary = binaryModeEnabled ? &binarySystem : nullptr;
+            // Extra black holes (see Physics/MultiBlackHoleSystem.h) pull
+            // on stars/planets too, same reasoning as activeBinary above --
+            // nullptr when empty so Update()/UpdateGPU() skip the extra
+            // work entirely (same convention activeBinary already uses).
+            const std::vector<Physics::ExtraBlackHole>* activeExtraBlackHoles =
+                extraBlackHoles.empty() ? nullptr : &extraBlackHoles;
 
-            for (Astronomy::StarBody& star : stars) {
-                star.Update(dt, activeBinary);
+            // Mutual gravity (object-level, see Physics/GravitySource.h):
+            // built once per frame from each star/planet's CURRENT
+            // (pre-update) center of mass/mass -- same "frozen for one
+            // step" convention every other external field here already
+            // uses. Left empty (a no-op) when mutualGravityEnabled is off,
+            // so this costs nothing when the feature isn't in use.
+            std::vector<Physics::GravitySource> starGravitySources, planetGravitySources;
+            if (mutualGravityEnabled) {
+                starGravitySources.reserve(stars.size());
+                for (const Astronomy::StarBody& s : stars) {
+                    starGravitySources.push_back({s.CenterOfMass(), s.CurrentMassKg()});
+                }
+                planetGravitySources.reserve(planets.size());
+                for (const Astronomy::PlanetBody& p : planets) {
+                    planetGravitySources.push_back({p.CenterOfMassSim(), p.CurrentMassKg()});
+                }
+            }
+
+            for (size_t i = 0; i < stars.size(); ++i) {
+                std::vector<Physics::GravitySource> others;
+                const std::vector<Physics::GravitySource>* othersPtr = nullptr;
+                if (mutualGravityEnabled) {
+                    others.reserve(starGravitySources.size() + planetGravitySources.size());
+                    for (size_t k = 0; k < starGravitySources.size(); ++k) {
+                        if (k != i) others.push_back(starGravitySources[k]);
+                    }
+                    others.insert(others.end(), planetGravitySources.begin(), planetGravitySources.end());
+                    othersPtr = &others;
+                }
+                stars[i].Update(dt, activeBinary, activeExtraBlackHoles, othersPtr, mutualGravityStrength);
             }
             stars.erase(std::remove_if(stars.begin(), stars.end(),
                                         [](const Astronomy::StarBody& star) { return star.IsFullyConsumed(); }),
                         stars.end());
 
-            for (Astronomy::PlanetBody& planet : planets) {
-                if (!planet.UpdateGPU(dt, blackHole, activeBinary)) {
-                    planet.Update(dt, blackHole, activeBinary);
+            for (size_t j = 0; j < planets.size(); ++j) {
+                std::vector<Physics::GravitySource> others;
+                const std::vector<Physics::GravitySource>* othersPtr = nullptr;
+                if (mutualGravityEnabled) {
+                    others.reserve(starGravitySources.size() + planetGravitySources.size());
+                    others.insert(others.end(), starGravitySources.begin(), starGravitySources.end());
+                    for (size_t k = 0; k < planetGravitySources.size(); ++k) {
+                        if (k != j) others.push_back(planetGravitySources[k]);
+                    }
+                    othersPtr = &others;
+                }
+                Astronomy::PlanetBody& planet = planets[j];
+                if (!planet.UpdateGPU(dt, blackHole, activeBinary, activeExtraBlackHoles, othersPtr, mutualGravityStrength)) {
+                    planet.Update(dt, blackHole, activeBinary, activeExtraBlackHoles, othersPtr, mutualGravityStrength);
                 }
                 tidalFlare.RegisterCapturedMass(planet.MassCapturedLastStep());
             }
@@ -2072,6 +2958,13 @@ int App::Run() {
                                           [](const Astronomy::PlanetBody& planet) { return planet.IsFullyConsumedOrDispersed(); }),
                           planets.end());
             tidalFlare.Update(dt);
+
+            // No-op for the common case (velocity defaults to 0, i.e.
+            // "placed here and stays put") -- only matters if an extra
+            // black hole was ever given a nonzero drift velocity.
+            for (Physics::ExtraBlackHole& extra : extraBlackHoles) {
+                extra.Advance(dt);
+            }
         }
 
         // Deliberately NOT gated on `paused` -- that flag is the Stage 1
@@ -2213,7 +3106,236 @@ int App::Run() {
             }
         };
 
-        if (viewLensedRender && lensedTextureWidth > 0) {
+        // Shared by Star System View and Multi-Star System View below:
+        // neither ray-traces a background (both clear to flat black
+        // otherwise, unlike the main view which always samples
+        // Astronomy::StarField per-pixel) -- a fixed, once-generated set
+        // of DIRECTIONS (not world positions, see below) and colors, same
+        // spirit as StarField itself ("not astronomical data -- a stand-in
+        // background"). Real bug fixed in an earlier session, not a
+        // hypothetical: these points were originally placed at a FIXED
+        // world position (direction * radius, centered on the origin)
+        // rather than re-centered on the camera every frame -- a proper
+        // skybox has to recenter on the viewer, or flying far enough away
+        // (easy at the jet's cruise speeds) leaves the whole "sky" behind.
+        // Recomputing `camera.Position() + direction * radius` every frame
+        // keeps every point at a constant distance from the CURRENT
+        // viewer instead, the standard way any engine draws a skybox.
+        auto DrawBackgroundStarfield = [&]() {
+            static const std::vector<std::pair<glm::dvec3, glm::vec3>> kBackgroundStars = [] {
+                std::vector<std::pair<glm::dvec3, glm::vec3>> points;
+                std::mt19937 rng(1337u);
+                std::uniform_real_distribution<double> unit(-1.0, 1.0);
+                std::uniform_real_distribution<double> kelvinDist(3000.0, 15000.0);
+                std::uniform_real_distribution<double> brightDist(0.35, 1.0);
+                points.reserve(1600);
+                for (int i = 0; i < 1600; ++i) {
+                    glm::dvec3 dir(unit(rng), unit(rng), unit(rng));
+                    while (glm::length(dir) < 1e-6) dir = glm::dvec3(unit(rng), unit(rng), unit(rng));
+                    dir = glm::normalize(dir);
+                    const glm::vec3 hue = Astronomy::ApproximateBlackbodyHue(kelvinDist(rng));
+                    points.emplace_back(dir, hue * static_cast<float>(brightDist(rng)));
+                }
+                return points;
+            }();
+            constexpr double kBackgroundStarRadius = 450.0;
+            const glm::dvec3 camPos = camera.Position();
+            for (const auto& [direction, color] : kBackgroundStars) {
+                renderer.DrawPoint(camPos + direction * kBackgroundStarRadius, color, 2.0f);
+            }
+        };
+
+        // Multi-Star System View: reached by traveling to a multi-star
+        // system (Universe/MultiStarSystem.h) -- see TravelToMultiStarSystem
+        // and the per-frame N-body integration block above for the actual
+        // dynamics. Checked before Star System View below since the two
+        // are mutually exclusive and this one takes priority if somehow
+        // both were ever true.
+        if (inMultiStarView) {
+            glViewport(0, 0, width, height);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            renderer.BeginFrame(camera, aspect, width, height);
+            DrawBackgroundStarfield();
+
+            for (size_t i = 0; i < multiStarPositions.size(); ++i) {
+                const Universe::StarMember& member = activeMultiStarSystem.members[i];
+                // Radius grows with the cube root of mass (same spirit as
+                // a real star's mass-radius relation being sub-linear, not
+                // a precise mass-radius formula) so heavier members read
+                // as visibly bigger without any one star dwarfing the
+                // others at these mass ratios.
+                const double radius = 1.0 + 1.3 * std::cbrt(member.massSolar);
+                renderer.DrawTexturedSphere(multiStarPositions[i], radius, multiStarTextureIds[i], 24, 32);
+            }
+
+            if (camera.mode == Rendering::Camera::Mode::Jet && jetRenderer.IsLoaded()) {
+                const glm::vec3 lightDirection = glm::length(jetPhysics.position) > 1e-4f
+                                                      ? glm::normalize(jetPhysics.position)
+                                                      : glm::vec3(0.0f, 0.0f, -1.0f);
+                jetRenderer.Draw(jetPhysics.position, jetPhysics.rotation, camera.ViewMatrix(),
+                                  camera.ProjectionMatrix(aspect), lightDirection);
+            }
+        } else
+        // Star System View: reached by traveling to a Star catalog entry
+        // (Universe/StarCatalog.h). This app's ray tracer only models
+        // black holes (it traces null geodesics through a Schwarzschild/
+        // Kerr metric) -- there is no equivalent GR renderer for an
+        // ordinary star here, so rather than silently mislabeling a
+        // black-hole render as "visiting a star", this is a deliberately
+        // simple, explicitly-labeled stand-in: the star drawn as a plain
+        // (unlit -- it IS the light source, not a lit object) sphere
+        // colored from its real effective temperature via
+        // Astronomy::ApproximateBlackbodyHue, sized on an arbitrary but
+        // fixed visual scale (NOT the star's real radius relative to its
+        // distance -- that ratio is astronomically tiny and would render
+        // as an invisible point). The free-fly camera here is positioned
+        // in the same arbitrary visual-scale units, independent of
+        // whichever black hole's sim-unit scale (GM/c^2) happens to be
+        // configured.
+        if (inStarSystemView && visitedStarIndex >= 0 &&
+            visitedStarIndex < static_cast<int>(universeCatalog.size())) {
+            glViewport(0, 0, width, height);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            renderer.BeginFrame(camera, aspect, width, height);
+            DrawBackgroundStarfield();
+
+            const Universe::CatalogObject& star = universeCatalog[static_cast<size_t>(visitedStarIndex)];
+            const double kelvin = star.temperatureK > 0.0 ? star.temperatureK : 5778.0;
+
+            // Textured, not flat-colored: a procedural "granulation" pattern
+            // (Astronomy::GenerateStarTexture, see that file's header for
+            // why it's procedural rather than a real photograph -- genuine
+            // resolved surface imagery exists for essentially no star but
+            // the Sun) tinted by the star's real effective temperature.
+            // Generated once per visited star, not every frame -- cached by
+            // catalog index in these function-local statics, same
+            // "generate lazily, reuse across frames" pattern LoadTexture's
+            // callers already use for the jet model's texture.
+            static int cachedStarTextureIndex = -1;
+            static unsigned int cachedStarTextureId = 0;
+            if (visitedStarIndex != cachedStarTextureIndex) {
+                std::vector<glm::vec3> texturePixels =
+                    Astronomy::GenerateStarTexture(kelvin, static_cast<unsigned int>(visitedStarIndex + 1));
+                // Boosted past 1.0 (and left unlit -- DrawTexturedSphere
+                // applies no separate lighting, same as plain DrawSphere)
+                // so it reads as glowing/self-luminous rather than a lit
+                // solid object -- baked into the texture itself here since
+                // DrawTexturedSphere has no separate tint parameter.
+                for (glm::vec3& pixel : texturePixels) {
+                    pixel = glm::clamp(pixel * 1.4f, 0.0f, 1.0f);
+                }
+                cachedStarTextureId = renderer.UploadImage(texturePixels, 256, 128, 0);
+                cachedStarTextureIndex = visitedStarIndex;
+            }
+            renderer.DrawTexturedSphere(glm::dvec3(0.0), 6.0, cachedStarTextureId, 32, 48);
+
+            // Real exoplanets for this star (Universe/ExoplanetCatalog.h),
+            // most stars have none listed (see that file's header comment --
+            // no planet is invented for a star with no real detection).
+            // Each planet's angular speed is real Kepler's-third-law motion
+            // (Universe::OrbitalPeriodDays) relative to the OTHER planets in
+            // the same system -- a closer-in planet genuinely orbits faster
+            // than a farther one here, same as in reality. What is NOT real:
+            // the absolute timescale (compressed so an orbit completes in
+            // seconds, not days/years -- otherwise nothing would visibly
+            // move in a sitting) and the orbital radii (spaced out by
+            // relative semi-major axis only, not to the star's true
+            // physical scale, for the same "would be invisible otherwise"
+            // reason the star's own render size isn't to scale).
+            double maxPeriodDays = 0.0;
+            for (const Universe::ExoplanetEntry& planet : exoplanetCatalog) {
+                if (std::string(planet.hostStarName) != star.name) continue;
+                maxPeriodDays = std::max(maxPeriodDays, Universe::OrbitalPeriodDays(planet.semiMajorAxisAu, star.massSolar));
+            }
+            double maxSemiMajorAxisAu = 0.0;
+            for (const Universe::ExoplanetEntry& planet : exoplanetCatalog) {
+                if (std::string(planet.hostStarName) != star.name) continue;
+                maxSemiMajorAxisAu = std::max(maxSemiMajorAxisAu, planet.semiMajorAxisAu);
+            }
+            constexpr double kOutermostOrbitVisualRadius = 20.0; // visual units from the star's center
+            constexpr double kInnermostOrbitVisualRadius = 8.0;  // just outside the star sphere (radius 6)
+            constexpr double kLongestOrbitVisualPeriodSeconds = 24.0; // the outermost listed planet takes this long to go around, in real wall-clock seconds
+            if (maxPeriodDays > 0.0 && maxSemiMajorAxisAu > 0.0) {
+                for (const Universe::ExoplanetEntry& planet : exoplanetCatalog) {
+                    if (std::string(planet.hostStarName) != star.name) continue;
+                    const double periodDays = Universe::OrbitalPeriodDays(planet.semiMajorAxisAu, star.massSolar);
+                    const double visualPeriodSeconds = kLongestOrbitVisualPeriodSeconds * (periodDays / maxPeriodDays);
+                    const double angleRadians = (visualPeriodSeconds > 1e-6)
+                        ? (now / visualPeriodSeconds) * 2.0 * glm::pi<double>()
+                        : 0.0;
+                    const double orbitRadius = kInnermostOrbitVisualRadius +
+                        (planet.semiMajorAxisAu / maxSemiMajorAxisAu) * (kOutermostOrbitVisualRadius - kInnermostOrbitVisualRadius);
+                    const glm::dvec3 planetPos(orbitRadius * std::cos(angleRadians), 0.0, orbitRadius * std::sin(angleRadians));
+
+                    const glm::vec3 planetColor = (planet.kind == Universe::PlanetKind::GasGiant)
+                        ? glm::vec3(0.85f, 0.65f, 0.35f)
+                        : glm::vec3(0.55f, 0.48f, 0.42f);
+                    const double planetRadius = std::clamp(0.3 + 0.15 * std::log10(planet.massEarth + 1.0), 0.3, 1.2);
+                    renderer.DrawShadedSphere(planetPos, planetRadius, planetColor, glm::normalize(-planetPos), 10, 16);
+
+                    constexpr int kOrbitSamples = 64;
+                    std::vector<glm::dvec3> orbitPath;
+                    orbitPath.reserve(kOrbitSamples + 1);
+                    for (int i = 0; i <= kOrbitSamples; ++i) {
+                        const double t = 2.0 * glm::pi<double>() * i / kOrbitSamples;
+                        orbitPath.push_back(glm::dvec3(orbitRadius * std::cos(t), 0.0, orbitRadius * std::sin(t)));
+                    }
+                    renderer.DrawPath(orbitPath, glm::vec3(0.3f, 0.3f, 0.35f), 1.0f);
+                }
+            }
+
+            // Real debris disks: a handful of StarCatalog.h entries have an
+            // actual, observationally-confirmed circumstellar dust/gas disk
+            // (Vega and Fomalhaut's are among the best-studied of any
+            // star's; Epsilon Eridani's is mentioned directly in its own
+            // catalog note). Drawn as a faint, semi-transparent dust-
+            // colored ring at a fixed visual radius beyond the exoplanet
+            // orbits -- a real feature these specific stars have, not a
+            // generic decoration added to every star.
+            static const std::vector<const char*> kStarsWithKnownDebrisDisks = {"Vega", "Fomalhaut", "Epsilon Eridani"};
+            const bool hasDebrisDisk = std::find_if(kStarsWithKnownDebrisDisks.begin(), kStarsWithKnownDebrisDisks.end(),
+                                                     [&](const char* name) { return std::string(name) == star.name; }) !=
+                                        kStarsWithKnownDebrisDisks.end();
+            if (hasDebrisDisk) {
+                constexpr double kDebrisDiskRadius = 24.0;
+                constexpr int kDebrisDiskPointCount = 500;
+                static const std::vector<glm::dvec3> kDebrisDiskOffsets = [] {
+                    std::vector<glm::dvec3> offsets;
+                    std::mt19937 rng(2024u);
+                    std::uniform_real_distribution<double> angleDist(0.0, 2.0 * glm::pi<double>());
+                    std::uniform_real_distribution<double> radiusJitter(-1.5, 1.5);
+                    std::uniform_real_distribution<double> heightJitter(-0.4, 0.4);
+                    offsets.reserve(kDebrisDiskPointCount);
+                    for (int i = 0; i < kDebrisDiskPointCount; ++i) {
+                        const double angle = angleDist(rng);
+                        const double radius = kDebrisDiskRadius + radiusJitter(rng);
+                        offsets.emplace_back(radius * std::cos(angle), heightJitter(rng), radius * std::sin(angle));
+                    }
+                    return offsets;
+                }();
+                for (const glm::dvec3& offset : kDebrisDiskOffsets) {
+                    renderer.DrawPoint(offset, glm::vec3(0.55f, 0.45f, 0.38f), 2.0f);
+                }
+            }
+
+            // The piloted jet, if currently flying it -- Star System View
+            // originally had no equivalent of the lensed view's jet overlay
+            // at all, so arriving here while piloting left the Endurance
+            // invisible even though flight controls kept working
+            // underneath. renderer.BeginFrame above already set up the
+            // matrices/depth state jetRenderer.Draw needs (it manages its
+            // own shader/VAO state regardless), so no separate overlay pass
+            // is needed here the way the lensed branch below needs one.
+            if (camera.mode == Rendering::Camera::Mode::Jet && jetRenderer.IsLoaded()) {
+                const glm::vec3 lightDirection = glm::length(jetPhysics.position) > 1e-4f
+                                                      ? glm::normalize(jetPhysics.position)
+                                                      : glm::vec3(0.0f, 0.0f, -1.0f);
+                jetRenderer.Draw(jetPhysics.position, jetPhysics.rotation, camera.ViewMatrix(),
+                                  camera.ProjectionMatrix(aspect), lightDirection);
+            }
+        } else if (viewLensedRender && lensedTextureWidth > 0) {
             glViewport(0, 0, width, height);
             glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -2261,6 +3383,14 @@ int App::Run() {
                     renderer.DrawFlammParaboloid(glm::dvec3(0.0), BlackHole::SchwarzschildRadiusSim(), 20.0,
                                                   funnelColor);
                 }
+                // Extra black holes (see Physics/MultiBlackHoleSystem.h)
+                // each get their own funnel too, same approximation/caveat
+                // as the primary's -- additive to whichever of the two
+                // blocks above already ran, not a replacement for them.
+                for (const Physics::ExtraBlackHole& extra : extraBlackHoles) {
+                    renderer.DrawFlammParaboloid(extra.position, extra.SchwarzschildRadiusSim(), 20.0,
+                                                  glm::vec3(0.7f, 0.25f, 0.8f));
+                }
             }
             if (showHorizon) {
                 if (binaryModeEnabled) {
@@ -2289,11 +3419,18 @@ int App::Run() {
                     renderer.DrawSphere(BlackHole::SchwarzschildRadiusSim(), glm::vec3(0.0f, 0.0f, 0.0f));
                     renderer.DrawWireSphere(BlackHole::SchwarzschildRadiusSim(), glm::vec3(0.6f, 0.1f, 0.1f));
                 }
+                // Extra black holes -- additive, same reasoning as the
+                // Flamm's-paraboloid loop just above.
+                for (const Physics::ExtraBlackHole& extra : extraBlackHoles) {
+                    const double rs = extra.SchwarzschildRadiusSim();
+                    renderer.DrawSphere(extra.position, rs, glm::vec3(0.0f, 0.0f, 0.0f));
+                    renderer.DrawWireSphere(extra.position, rs, glm::vec3(0.7f, 0.25f, 0.8f));
+                }
             }
-            if (showPhotonSphere && !binaryModeEnabled) {
-                // No exact photon-sphere formula for binary mode (see
-                // docs/physics.md Sec. 11) -- skipped there rather than
-                // drawn at a misleading single-body value.
+            if (showPhotonSphere && !binaryModeEnabled && extraBlackHoles.empty()) {
+                // No exact photon-sphere formula for binary/multi-body mode
+                // (see docs/physics.md) -- skipped there rather than drawn
+                // at a misleading single-body value.
                 renderer.DrawWireSphere(BlackHole::PhotonSphereRadiusSim(), glm::vec3(0.9f, 0.75f, 0.2f), 12, 24);
             }
 
@@ -2358,6 +3495,40 @@ int App::Run() {
             }
         }
 
+        // --- Star System View info overlay: real catalog facts about the
+        // visited star plus any real exoplanets around it (see the Star
+        // System View render branch above and Universe/ExoplanetCatalog.h)
+        // shown directly in the scene, so arriving somewhere feels like
+        // learning something real about it rather than only being a
+        // changed background.
+        if (inStarSystemView && visitedStarIndex >= 0 && visitedStarIndex < static_cast<int>(universeCatalog.size())) {
+            const Universe::CatalogObject& star = universeCatalog[static_cast<size_t>(visitedStarIndex)];
+            ImGui::SetNextWindowPos(ImVec2(ImGui::GetMainViewport()->Pos.x + 16.0f, ImGui::GetMainViewport()->Pos.y + 70.0f), ImGuiCond_FirstUseEver);
+            ImGui::SetNextWindowBgAlpha(0.55f);
+            if (ImGui::Begin("Star System", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing)) {
+                ImGui::Text("%s", star.name);
+                ImGui::Text("%s", star.notes);
+                ImGui::Text("Mass: %.3g M_sun   Surface temp: %.0f K   Distance from Sol: %.4g ly",
+                            star.massSolar, star.temperatureK, star.distanceLy);
+                bool anyPlanets = false;
+                for (const Universe::ExoplanetEntry& planet : exoplanetCatalog) {
+                    if (std::string(planet.hostStarName) != star.name) continue;
+                    anyPlanets = true;
+                    const double periodDays = Universe::OrbitalPeriodDays(planet.semiMajorAxisAu, star.massSolar);
+                    ImGui::Separator();
+                    ImGui::Text("%s%s", planet.name, planet.detectionDisputed ? " (disputed detection)" : "");
+                    ImGui::Text("  %.3g AU, %.2g Earth masses, real orbital period %.3g days",
+                                planet.semiMajorAxisAu, planet.massEarth, periodDays);
+                    ImGui::TextWrapped("  %s", planet.notes);
+                }
+                if (!anyPlanets) {
+                    ImGui::Separator();
+                    ImGui::TextDisabled("No exoplanets confirmed here (as cataloged in this app).");
+                }
+            }
+            ImGui::End();
+        }
+
         // --- HUD compass: a horizontal strip across the top of the screen
         // showing the relative bearing (left/right of straight ahead) to
         // nearby points of interest -- the black hole always, plus the
@@ -2372,7 +3543,23 @@ int App::Run() {
                 ImU32 color;
             };
             std::vector<PointOfInterest> pointsOfInterest;
-            pointsOfInterest.push_back({"Black Hole", glm::dvec3(0.0), IM_COL32(255, 170, 60, 255)});
+            // In Star System View the origin is a visited star, not the
+            // configured black hole (the ray tracer isn't even running --
+            // see that render branch above) -- label it correctly instead
+            // of calling an ordinary star "Black Hole". Multi-Star System
+            // View has no single origin at all -- every member gets its
+            // own compass entry at its own (moving) position instead.
+            if (inMultiStarView) {
+                for (size_t i = 0; i < multiStarPositions.size() && i < activeMultiStarSystem.members.size(); ++i) {
+                    pointsOfInterest.push_back({activeMultiStarSystem.members[i].name.c_str(),
+                                                 multiStarPositions[i], IM_COL32(255, 220, 140, 255)});
+                }
+            } else if (inStarSystemView && visitedStarIndex >= 0) {
+                pointsOfInterest.push_back({universeCatalog[static_cast<size_t>(visitedStarIndex)].name,
+                                             glm::dvec3(0.0), IM_COL32(255, 220, 140, 255)});
+            } else {
+                pointsOfInterest.push_back({"Black Hole", glm::dvec3(0.0), IM_COL32(255, 170, 60, 255)});
+            }
             if (camera.mode == Rendering::Camera::Mode::Jet) {
                 pointsOfInterest.push_back(
                     {"Jet", glm::dvec3(jetPhysics.position), IM_COL32(120, 220, 255, 255)});
@@ -2426,7 +3613,19 @@ int App::Run() {
                         draw->AddLine(ImVec2(x, winPos.y + 8.0f), ImVec2(x, winPos.y + winSize.y - 16.0f), poi.color, 2.0f);
                     }
 
-                    const std::string label = std::string(poi.name) + "  " + FormatDistance(distanceSim * metersPerSimUnit);
+                    // Star System View's sim units are an arbitrary fixed
+                    // visual scale (see that render branch's comment), not
+                    // tied to blackHole's mass -- a real-meters conversion
+                    // there would be meaningless, so the label stays in
+                    // plain sim units instead of pretending otherwise.
+                    char distanceLabelBuffer[64];
+                    if (inStarSystemView || inMultiStarView) {
+                        std::snprintf(distanceLabelBuffer, sizeof(distanceLabelBuffer), "%.1f (visual scale)", distanceSim);
+                    } else {
+                        const std::string formatted = FormatDistance(distanceSim * metersPerSimUnit);
+                        std::snprintf(distanceLabelBuffer, sizeof(distanceLabelBuffer), "%s", formatted.c_str());
+                    }
+                    const std::string label = std::string(poi.name) + "  " + distanceLabelBuffer;
                     const ImVec2 textSize = ImGui::CalcTextSize(label.c_str());
                     const float labelX = std::clamp(x - textSize.x * 0.5f, winPos.x, winPos.x + winSize.x - textSize.x);
                     draw->AddText(ImVec2(labelX, winPos.y + winSize.y - 15.0f), poi.color, label.c_str());

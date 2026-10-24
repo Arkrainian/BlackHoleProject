@@ -137,6 +137,41 @@ void Renderer::DrawSphere(const glm::dvec3& center, double radius, const glm::ve
     glPopMatrix();
 }
 
+void Renderer::DrawTexturedSphere(const glm::dvec3& center, double radius, unsigned int texture, int rings,
+                                   int sectors) const {
+    glPushMatrix();
+    glTranslated(center.x, center.y, center.z);
+
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glColor3f(1.0f, 1.0f, 1.0f); // no tint -- the texture's own colors are the final color, same as DrawFullscreenTexture
+
+    for (int r = 0; r < rings; ++r) {
+        const double lat0 = kPi * (-0.5 + static_cast<double>(r) / rings);
+        const double lat1 = kPi * (-0.5 + static_cast<double>(r + 1) / rings);
+        const double y0 = std::sin(lat0), yr0 = std::cos(lat0);
+        const double y1 = std::sin(lat1), yr1 = std::cos(lat1);
+        const double v0 = static_cast<double>(r) / rings;
+        const double v1 = static_cast<double>(r + 1) / rings;
+
+        glBegin(GL_QUAD_STRIP);
+        for (int s = 0; s <= sectors; ++s) {
+            const double lng = 2.0 * kPi * static_cast<double>(s) / sectors;
+            const double x = std::cos(lng), z = std::sin(lng);
+            const double u = static_cast<double>(s) / sectors;
+            glTexCoord2d(u, v0);
+            glVertex3d(radius * x * yr0, radius * y0, radius * z * yr0);
+            glTexCoord2d(u, v1);
+            glVertex3d(radius * x * yr1, radius * y1, radius * z * yr1);
+        }
+        glEnd();
+    }
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDisable(GL_TEXTURE_2D);
+    glPopMatrix();
+}
+
 void Renderer::DrawEllipsoid(const glm::dvec3& center, const glm::dvec3& primaryAxisDirection,
                               double primarySemiAxis, double lateralSemiAxis, const glm::vec3& color, int rings,
                               int sectors) const {

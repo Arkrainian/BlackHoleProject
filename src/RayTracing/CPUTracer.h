@@ -8,6 +8,8 @@
 #include "Physics/BinaryGeodesicSolver.h"
 #include "Physics/GeodesicSolver.h"
 #include "Physics/KerrGeodesicSolver.h"
+#include "Physics/MultiBlackHoleSystem.h"
+#include "Physics/MultiBodyGeodesicSolver.h"
 
 namespace RayTracing {
 
@@ -48,6 +50,20 @@ struct RenderSettings {
     bool binaryEnabled = false;
     Physics::BinarySystem binarySystem;
     Physics::BinaryGeodesicConfig binaryConfig;
+
+    // Freely-placed black holes beyond the primary/binary setup above
+    // (see Physics/MultiBlackHoleSystem.h) -- capped at
+    // Physics::kMaxLensingBodies total bodies, including the primary and
+    // binary's second body if also active. Whenever the TOTAL active body
+    // count is 3 or more, RenderImage routes every pixel through
+    // Physics::TracePhotonMultiBody instead of the Schwarzschild/Kerr/
+    // Binary solvers above (which stay exactly as they were for 1 or 2
+    // bodies -- this field being empty reproduces today's behavior
+    // exactly). Not yet implemented on the GPU path -- see
+    // RayTracing::CUDATracer.h and App.cpp's PerformRender, which falls
+    // back to this CPU path whenever extraBlackHoles is non-empty.
+    std::vector<Physics::ExtraBlackHole> extraBlackHoles;
+    Physics::MultiBodyGeodesicConfig multiBodyConfig;
 };
 
 using BackgroundSampler = std::function<glm::vec3(const glm::dvec3& direction)>;

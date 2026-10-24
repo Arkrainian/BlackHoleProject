@@ -49,19 +49,19 @@ StarBody::StarBody(const glm::dvec3& centerPosition, const glm::dvec3& centerVel
     }
 }
 
-void StarBody::Update(double deltaTime, const Physics::BinarySystem* binary) {
-    const double rs = Physics::BlackHole::SchwarzschildRadiusSim();
-
+void StarBody::Update(double deltaTime, const Physics::BinarySystem* binary,
+                       const std::vector<Physics::ExtraBlackHole>* extraBlackHoles,
+                       const std::vector<Physics::GravitySource>* mutualGravitySources,
+                       double mutualGravityStrength) {
     for (StarParticle& particle : m_particles) {
         if (particle.consumed) continue;
 
-        const glm::dvec3 acceleration = binary ? binary->GravityAccelSim(particle.position)
-                                                 : Physics::StaticObserverGravityAccelSim(particle.position);
+        const glm::dvec3 acceleration = Physics::CombinedGravityAccelSim(
+            particle.position, binary, extraBlackHoles, mutualGravitySources, mutualGravityStrength);
         particle.velocity += acceleration * deltaTime;
         particle.position += particle.velocity * deltaTime;
 
-        const bool consumed = binary ? binary->IsCaptured(particle.position) : glm::length(particle.position) < rs;
-        if (consumed) {
+        if (Physics::IsCapturedByAny(particle.position, binary, extraBlackHoles)) {
             particle.consumed = true;
             continue;
         }
@@ -78,6 +78,26 @@ bool StarBody::IsFullyConsumed() const {
         if (!particle.consumed) return false;
     }
     return true;
+}
+
+glm::dvec3 StarBody::CenterOfMass() const {
+    glm::dvec3 sum(0.0);
+    int liveCount = 0;
+    for (const StarParticle& particle : m_particles) {
+        if (particle.consumed) continue;
+        sum += particle.position;
+        ++liveCount;
+    }
+    return liveCount > 0 ? sum / static_cast<double>(liveCount) : glm::dvec3(0.0);
+}
+
+double StarBody::CurrentMassKg() const {
+    if (m_particles.empty()) return 0.0;
+    int liveCount = 0;
+    for (const StarParticle& particle : m_particles) {
+        if (!particle.consumed) ++liveCount;
+    }
+    return m_settings.totalMassKg * (static_cast<double>(liveCount) / static_cast<double>(m_particles.size()));
 }
 
 } // namespace Astronomy

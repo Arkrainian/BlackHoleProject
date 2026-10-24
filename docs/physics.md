@@ -509,7 +509,59 @@ embedding doesn't extend inside the horizon), so the funnel's rim
 starts exactly at the throat rather than implying anything about the
 interior.
 
-## 12. Stars and planets: tidal disruption
+## 12. Freely-placed extra black holes (N-body lensing)
+
+**Extra black holes (`Physics::ExtraBlackHole`, `Physics::TracePhotonMultiBody`).**
+Generalizes Binary mode's exactly-two-body scheme (§11) to however many
+bodies are actually in the scene — the primary black hole, binary mode's
+second body if also enabled, and any number of user-placed
+`ExtraBlackHole`s (capped at `kMaxLensingBodies = 6` total, so every
+fixed-size array involved stays simple stack storage). Unlike binary
+mode's second body, an `ExtraBlackHole` isn't constrained to a circular
+orbit — it's placed by flying the free-fly camera to a spot and spawning
+it there (`App.cpp`'s "Extra Black Holes" panel), and stays exactly where
+it's put (its `velocity` field defaults to zero; nothing pulls on it —
+same "test-particle physics, no mutual gravity" rule every other spawned
+object in this sim already follows).
+
+The lensing itself uses the **exact same** doubled-Newtonian superposition
+approximation §11 describes (each body's light-bending modeled as
+`2GM/r²` toward it, summed across every active body) — `Physics::
+TracePhotonMultiBody` (`src/Physics/MultiBodyGeodesicSolver.cpp`) is a
+structurally independent reimplementation of `TracePhotonBinary`, not a
+refactor of it (same "no shared integration code between solvers, only
+the shared `PhotonTraceResult` return type" pattern Schwarzschild/Kerr/
+Binary already use), generalized from two named body-1/body-2 locals to a
+loop over a small array — confirmed to reduce to `TracePhotonBinary`'s own
+result, for the same ray and equivalent bodies, by `tests/test_multibody.cpp`.
+Every caveat §11 lists (frozen lens, no exact strong-field physics, no
+gravitational radiation) applies here verbatim, now for however many
+bodies are active rather than just two.
+
+Only activates once **3 or more** bodies are in play — with 1 or 2, the
+existing Schwarzschild/Kerr/Binary solvers run completely unchanged (see
+`RayTracing::CPUTracer.cpp`'s dispatch), so turning this feature on never
+alters single-hole, Kerr, or ordinary two-body binary behavior.
+
+**GPU: not implemented.** `cuda/geodesic_kernel.cu` has no multi-body
+kernel. Rather than silently ignoring extra black holes on a GPU-rendered
+frame, `App.cpp`'s `PerformRender` falls back to the CPU tracer for any
+frame where `extraBlackHoles` is non-empty — the same "fall back instead
+of running the wrong physics fast" rule `PlanetBody::UpdateGPU` already
+established for binary mode. A frame with extra black holes placed will
+therefore render more slowly than usual; this is expected, not a bug.
+
+**Stars, planets, and extra black holes.** `Astronomy::StarBody::Update`
+and `PlanetBody::Update`/`UpdateGPU` each gained a parallel
+`extraBlackHoles` parameter (alongside the existing `binary` one from
+Session 15's binary-mode fix) — both route through the new
+`Physics::CombinedGravityAccelSim`/`IsCapturedByAny` helpers
+(`src/Physics/MultiBlackHoleSystem.h`), which sum gravity/capture across
+the primary (binary-aware if applicable) plus every extra black hole. As
+with binary mode, `PlanetBody::UpdateGPU` falls back to the CPU `Update()`
+path whenever any extra black holes are placed.
+
+## 13. Stars and planets: tidal disruption
 
 **Stars (`Astronomy::StarBody`).** A star is modeled as a small cluster of
 independent test particles (default 28), seeded uniformly inside a sphere
@@ -644,7 +696,314 @@ thing to revisit first if those ceilings ever rise); and
 Kerr/binary-hole-aware capture (both stars and planets check only the
 single-hole Schwarzschild radius).
 
-## 13. Limitations
+## 14. Mutual gravity between spawned stars/planets
+
+Section 13 above establishes that stars and planets are test particles
+under the black hole's field with no gravity of their own, beyond a
+planet's own internal self-gravity (§13's own "Self-gravity" entry, which
+is explicitly scoped to one planet's separated fragments pulling back
+together — never one spawned object pulling on another). This section adds
+exactly that missing case: spawned stars and planets now also pull on
+*each other*, at the object level — each one reduced to a single point
+mass at its own center of mass (`Physics::GravitySource`,
+`Astronomy::StarBody::CenterOfMass`/`CurrentMassKg`,
+`Astronomy::PlanetBody::CenterOfMassSim`/`CurrentMassKg`) — so two spawned
+stars can fall into a binary-star-like mutual orbit. **Off by default**:
+existing scenes behave identically unless the "Mutual Gravity" panel is
+explicitly enabled.
+
+Black holes are explicitly excluded and unaffected by this entirely: the
+primary, the binary system's second body, and every extra black hole stay
+exactly as fixed/scripted gravity sources as before — nothing new here
+pulls on them, and they are not among the `GravitySource` entries spawned
+objects pull on.
+
+Same scale problem as self-gravity, same resolution. The real mutual pull
+between any two spawned stars/planets, at any black hole mass this app's
+slider allows, is many orders of magnitude too small to ever visibly
+matter — and like self-gravity, the real ratio's scale depends on the
+configured black hole mass, so no fixed multiplier on the real formula
+could land in a visible range everywhere. `Physics::MutualGravityAccelSim`
+(`src/Physics/GravitySource.h`) therefore uses a standalone, tuned sim-unit
+force law — not the real `(other object's mass / black hole's mass) / r²`
+formula — scaled by the UI's "Mutual gravity strength" slider, with a
+reference mass of **one solar mass**, not Earth mass: stars (1 solar mass
+by default) are the primary use case here, and the first tuning attempt,
+which referenced Earth mass the way `PlanetBody`'s self-gravity does,
+produced a `massRatio` for a solar-mass star of roughly 3.3×10⁵, which blew
+the per-step velocity kick out to many times the objects' own separation
+at ordinary spawn distances/timesteps — every coefficient/min-distance
+combination tried against that reference flung the pair apart to huge
+separations within a few hundred steps (scripted probe, see `HANDOFF.md`).
+Referencing solar mass instead keeps `massRatio` near 1 for the common
+star-star case (and correspondingly tiny — "even off is a physically
+honest choice" territory — for Earth-mass planets pulling on each other).
+
+Tuned via scripted probe (same methodology as self-gravity/the spring-force
+fix): `kMutualGravityCoefficient = 1.5`, `kMutualGravityMinDistance = 3.0`.
+Two 1-solar-mass stars spawned 20 sim units apart with a modest tangential
+kick spiral together over several tens of sim-time units, swing past each
+other at a real closest-approach distance well under the 3.0 softening
+floor without the integrator diverging, and spread back out — a visible,
+bounded "close encounter," not a runaway ejection or a stable closed orbit
+(semi-implicit Euler against a softened, not true, inverse-square law
+doesn't produce one). A pair left ~500 units apart stays essentially
+unaffected, confirming unrelated/distant objects aren't destabilized by
+turning this on. As with self-gravity's minimum-distance cutoff, the
+softening floor only clamps the *force*, not the real distance — two
+objects' centers can still pass closer than it; it exists purely to keep
+the explicit integrator from blowing up as `1/r²` diverges, and models no
+collision or merger.
+
+No capture check is added for mutual sources (`Physics::GravitySource` has
+no Schwarzschild radius) — two stars/planets passing close to each other
+isn't an event horizon, and collision/merger response is out of scope.
+`PlanetBody::UpdateGPU` falls back to the CPU path whenever mutual gravity
+sources are supplied, non-empty — the GPU kernel only knows the
+single-hole law, same precedent binary mode and extra black holes already
+established.
+
+## 15. Jet piloting mode (arcade flight model around the black hole)
+
+A third camera mode (alongside Orbit and FreeFly, `Rendering::Camera::Mode::Jet`)
+puts the user in a flyable ship (a GLB model, `Jet::JetRenderer`) with a
+hybrid "semi-realistic force sim + arcade rate-control" flight model
+(`Jet::FlightPhysics`, ported and adapted from an existing arcade flight
+project) — real thrust/drag forces integrated into velocity, but rotation
+is direct rate-control (input maps straight to angular velocity), not
+torque/moment of inertia.
+
+**Gravity is the one piece that's real, not arcade**: the ship falls
+toward the configured black hole under the *exact* general-relativistic
+"static observer" proper acceleration,
+
+```
+a(r) = (GM/r²) / sqrt(1 - r_s/r)
+```
+
+(the acceleration a hovering observer at fixed Schwarzschild radial
+coordinate `r` must apply to stay there — see e.g. MTW *Gravitation* or
+Hartle's *Gravity* for the standard derivation), not plain Newtonian
+`1/r²` or a constant "down." It reduces to ordinary Newtonian gravity far
+away and *diverges* approaching `r_s` — no amount of thrust can hold
+station arbitrarily close to the horizon, which is the physically correct
+behavior, not a scripted "you die near the hole" check.
+`Physics::StaticObserverGravityAccelSim` (`src/Physics/BlackHole.h`) is
+this exact formula, shared verbatim with `Astronomy::StarBody`'s tidal
+particles (§13) — the same law pulls on anything free-falling in this
+scene, not two independent reimplementations.
+
+**The relativistic speed cap, and the real bug it produced at the app's
+own default mass.** A hard ceiling, expressed as a fraction of light speed
+(`maxSpeedFractionOfC`, default 0.2), is converted every frame into
+however many sim-units/s that implies *for whichever black hole mass is
+currently loaded* (`metersPerSimUnit = GM/c²` in meters,
+`Physics/Constants.h`) and clamps velocity to it — without this, the
+exact same numeric thrust/drag equilibrium that feels right for a
+stellar-mass hole (where one sim unit is kilometers) becomes "cross
+several light-years in a few seconds" once the hole is supermassive
+(TON 618: one sim unit ≈ 0.01 light-years). Worked through with actual
+numbers: at TON 618's mass, `GM/c² ≈ 9.75×10¹³ m`, so `0.2c` converts to
+roughly `0.2 × 2.998×10⁸ / 9.75×10¹³ ≈ 6.1×10⁻⁷` sim-units/s — the jet
+reaches that ceiling from its own thrust in microseconds and then sits
+there, *effectively frozen on any human timescale*, not merely "slow."
+This is the real physical consequence of the real cap at that real mass,
+not a bug in the formula — but it made flight unplayable near the app's
+own default black hole, so a floor was added:
+`Jet::MIN_FLYABLE_SPEED_SIM_UNITS_PER_SEC` (150 sim-units/s,
+`FlightPhysics.h`), applied as `max(relativisticCap, floor)`. At any
+stellar/moderate-mass hole the relativistic cap is already far above 150,
+so this changes nothing there; it only ever binds at supermassive scale,
+where it is an **explicit, surfaced playability concession** — the app
+shows an amber warning with the real implied c-multiple whenever the
+floor is actually overriding the physics, rather than silently letting
+the on-screen "0.2c" label misrepresent what's actually happening.
+
+**Reverse thrust.** `thrust` is allowed to go negative, down to
+`-MAX_THRUST × REVERSE_THRUST_FRACTION` (0.3 — capped well below forward
+thrust, an arcade choice: enough to back out of a bad approach or hold
+station, not to out-accelerate forward flight). `F_thrust = forward ×
+thrust × thrustMultiplier` already pushes the ship backward for free once
+`thrust` can go negative, but the existing "aerodynamic turn correction"
+(an arcade feature that snaps velocity to align with the nose after a
+turn) had to be fixed to target `forward × (airSpeed × sign(thrust))`
+instead of unconditionally `+forward × airSpeed` — otherwise it fought
+every reverse-thrust input by continuously re-aligning velocity to
+*positive* forward regardless of which way the ship was actually being
+pushed.
+
+Scope, deliberately limited: no lift model (an arcade "velocity aligns
+with the nose" correction stands in for it instead); air density is a
+flat sea-level-equivalent constant everywhere (there is no atmosphere in
+orbit around a black hole — this exists only to keep the ported arcade
+thrust/drag feel unchanged, not as a physical claim); G-force is a flavor
+readout (`CalculateGForce`), not a damage/blackout model.
+
+## 16. Universe / Star Map: real catalog travel
+
+A real, bounded (~35-entry) catalog of actual stars, black holes, and
+galaxies (`src/Universe/StarCatalog.h`) — not a procedural galaxy
+generator — lets the scene be re-pointed at a different real astronomical
+object instead of only ever showing one hardcoded default. Figures are
+standard published values (Hipparcos-era distances for nearby stars,
+widely-cited literature masses for the black holes): real enough to be
+meaningful, not research-grade astrometry.
+
+**Coordinate conversion.** Each entry's right ascension (hours),
+declination (degrees), and distance (light-years) convert to a shared
+heliocentric equatorial Cartesian frame via the ordinary spherical-to-
+Cartesian transform,
+
+```
+x = d · cos(δ) · cos(α),   y = d · cos(δ) · sin(α),   z = d · sin(δ)
+```
+
+(`CatalogObject::CartesianLy`, where `α` is right ascension in radians and
+`δ` is declination in radians) — used only so the *real distance between
+any two catalog entries* (not just from the Sun) can be computed by plain
+vector subtraction, never for anything inside the ray tracer itself
+(which has no concept of light-years at all).
+
+**Travel is an explicit, labeled narrative jump — never silently claimed
+to be real flight.** This app's camera/physics have no mechanism for
+continuously crossing light-year distances (sim units are relative to
+whichever black hole is configured and have no meaning at interstellar
+scale, and §15's own relativistic speed cap makes clear why "just fly
+there" isn't physically available even in principle at these distances
+without literal years passing). "Travel" therefore re-points the existing
+scene at the target object directly, and the real light-travel-time the
+jump represents is always printed next to the control that performs it —
+the same honesty standard §15's speed-cap warning holds itself to.
+Traveling to a cataloged **black hole** calls the exact same
+`BlackHole::SetMassSolarMasses`/`SetSpin` the mass/spin sliders already
+call (TON 618, this app's original hardcoded default, is now simply the
+catalog entry those sliders start on). Traveling to a **star** switches to
+a separate, deliberately simple **Star System View**: this app's ray
+tracer only ever models black holes (null geodesics through a
+Schwarzschild/Kerr metric) — there is no equivalent GR renderer for an
+ordinary star, so rather than silently mislabeling a black-hole render as
+"visiting a star," the star is drawn as a plain, unlit, procedurally-
+textured sphere (§18 below) on its own small, fixed, arbitrary visual
+scale, explicitly independent of whichever black hole's `GM/c²` scale
+happens to be loaded. **Galaxy entries are not travel targets** — too far
+and too extended for this app's single-point-source renderer to
+meaningfully visit; they exist for real-scale distance context only.
+
+A small set of real confirmed/candidate exoplanets
+(`src/Universe/ExoplanetCatalog.h`) orbit a handful of catalog stars in
+Star System View — see §17.
+
+## 17. Exoplanets: real Kepler's-third-law orbits
+
+Most catalog stars have **no** exoplanet drawn around them in Star System
+View, deliberately: a star with no real, published detection gets nothing
+invented for it. The handful that do (Proxima Centauri b, Ross 128 b,
+Barnard's Star b — flagged as a genuinely disputed detection, not a
+blanket hedge — Epsilon Eridani b, Pollux b, and two Tau Ceti candidates)
+have real published semi-major axes and masses.
+
+Rather than hardcode each planet's own published orbital period as a
+second, independently-sourced number, `Universe::OrbitalPeriodDays`
+derives it from the catalog's own star mass via the ordinary Kepler's
+third law,
+
+```
+P[years] = sqrt( a[AU]³ / M[M☉] )
+```
+
+(ignoring the planet's own mass relative to its host star, an excellent
+approximation at these mass ratios) — which forces the catalog's star
+masses and planets' semi-major axes to stay *mutually consistent* with
+real physics, and is directly checked in `tests/test_universe.cpp`
+against each planet's own real published period (within 10%, since the
+catalog's star masses are themselves rounded published figures, not each
+discovery paper's own exact value): Proxima Centauri b computes to 11.26
+days against a real ~11.19; Ross 128 b to 9.79 against ~9.9; Epsilon
+Eridani b to 2618 against ~2691; Tau Ceti e to 163.2 against ~162.9; Tau
+Ceti g to 20.06 against ~20.0 — genuinely passing, not tuned to pass.
+
+In Star System View, each planet's *relative* angular speed is real (a
+closer-in planet genuinely orbits faster than a farther one, driven
+directly by the formula above) — what is explicitly not real: the
+absolute timescale (compressed so the outermost listed planet in a system
+completes an orbit in 24 real seconds, not days/years — otherwise nothing
+would visibly move in a sitting) and the orbital radii (spaced by relative
+semi-major axis only, scaled to fit near the star's own already-not-to-
+scale render size).
+
+## 18. Procedural star surface textures
+
+Star System View textures each star's sphere (and, in multi-star systems,
+§19, every member) with a seeded "granulation" pattern — soft, randomly
+placed, overlapping blobs (`Astronomy::GenerateStarTexture`,
+`src/Astronomy/StarTexture.h`), wrapped at the U seam so it tiles
+seamlessly around a sphere's longitude — tinted by the star's real
+effective temperature via `Astronomy::ApproximateBlackbodyHue` (the same
+perceptual blackbody-color approximation §9's accretion-disk coloring
+already uses, factored out into `src/Astronomy/Blackbody.h` so both reuse
+one implementation rather than drifting into two).
+
+This is **deliberately not a photograph**, and deliberately not a
+downloaded one either. Genuine resolved surface imagery exists for the
+Sun (space telescopes image its granulation directly) but for essentially
+no other star — even the best current ground-based interferometry
+resolves only a handful of nearby giants into a few blurry pixels, not a
+texture. Using a real Sun photograph for exactly one of ~35 catalog stars
+and a flat color for the rest would be a *more* misleading inconsistency
+than using neither, so every star gets the same honestly-labeled
+procedural treatment: real color, invented surface detail.
+
+## 19. Multi-star systems: real binary/triple, procedural N-body
+
+The Star Map also offers 2-body, 3-body, and N-body (≥4) multi-star
+systems, driven by a **genuine per-frame Newtonian N-body integration**
+rather than a scripted animation — the same tuned mutual-gravity law §14
+introduced for spawned stars/planets pulling on each other
+(`Physics::MutualGravityAccelSim`), reused as-is (not retuned) and applied
+to a system's own members pulling on *each other* instead.
+
+- **2-body (real): Alpha Centauri AB.** The nearest star system's real
+  inner pair — real masses, average real separation ~23.5 AU, real
+  orbital period ~79.9 years (highly eccentric: 11.2–35.6 AU). Two
+  mutually gravitating bodies *do* have a closed-form solution (the
+  ordinary Kepler two-body problem) — this still integrates step by step
+  like every system here, it just settles into an ordinary bound orbit.
+- **3-body (real): the same system, plus its real third member, Proxima
+  Centauri.** Bound but extraordinarily distant (current estimates:
+  roughly 13,000 AU from the A–B pair, orbital period on the order of
+  500,000+ years, with real substantial uncertainty in the exact orbit —
+  among the least-constrained orbits of any known bound star). **Three or
+  more mutually gravitating bodies have no general closed-form
+  solution** — this is literally *the three-body problem* — so this
+  system's real-time integration is the only way to show its motion at
+  all, not a simplification of an available exact answer. For N≥3, the
+  system's future evolution is genuinely chaotic, the same unsolved
+  N-body problem real astrophysics deals with, not an artifact to "fix."
+- **N-body (procedural), N up to 8.** Precisely-measured real bound
+  systems of 4+ comparably-separated stars are rare and not something to
+  present as verified catalog data from memory, so anything beyond the
+  real triple above is explicitly procedural
+  (`Universe::GenerateProceduralSystem`): masses drawn from a simplified
+  plausible range (0.15–2.5 M☉, not a real initial-mass-function sample),
+  temperatures from a simplified real mass-temperature power law for
+  main-sequence stars, `T ≈ 5778 K × (M/M☉)^0.54` — an empirical fit, not
+  a stellar-structure model.
+
+**Initial conditions**, for any system size: members are laid out on a
+circle at an arbitrary visual radius, then shifted so the *mass-weighted*
+centroid sits exactly at the origin (`Σ mᵢrᵢ = 0`, the real barycenter
+condition, true regardless of the arbitrary starting shape); each member
+gets a tangential kick sized from its own local mutual-gravity
+acceleration at its starting radius (`v = sqrt(|a| · r)`, a circular-orbit
+estimate — exact for N=2, just a reasonable starting condition for N≥3's
+chaos to evolve from), and the mass-weighted mean velocity is then zeroed
+so the system's barycenter doesn't drift off-screen. No collision/escape
+handling exists: `Physics::GravitySource`'s existing minimum-distance
+floor (§14) keeps the force from diverging, so this won't crash, but a
+visually extreme outcome (two members overlapping, one flung far away) is
+a genuine possible consequence of real chaos, not guarded against.
+
+## 20. Limitations
 
 This was, until the Kerr and binary-black-hole additions above,
 explicitly a **Schwarzschild** (non-rotating, uncharged) model; nothing
@@ -658,10 +1017,29 @@ below is covered by either of those additions either:
   `AccretionDisk.cpp`), not a spectral integration.
 - **Flux calibration.** Brightness values are visually tuned (a documented
   `kVisualNormalization` constant), not tied to physical luminosity units.
-- **Stars and planets** (§12): no self-gravity for either; planets add an
-  explicit spring-cohesion model but no differentiated interior, no
-  self-gravity among fragments, and no GPU acceleration; both check only the
-  single-hole Schwarzschild radius for capture.
+- **Stars and planets** (§13, §14): mutual gravity between spawned objects
+  (§14) is an object-level, off-by-default, tuned-not-real effect, not
+  particle-level N-body; planets add an explicit spring-cohesion model but
+  no differentiated interior; both check only the primary/binary/extra
+  black holes' horizons, never a rotating (Kerr) one; no collision/merger
+  response when two objects' centers pass close together.
+- **Extra black holes** (§12): no GPU-accelerated lensing (CPU fallback
+  whenever any are placed); can't carry Kerr spin; nothing acts on them —
+  black holes stay fixed/scripted sources even under §14's mutual gravity,
+  no drift unless manually given a constant velocity.
+- **Jet piloting** (§15): no lift model, flat sea-level-equivalent air
+  density everywhere (no real atmosphere exists in orbit around a black
+  hole), G-force is a flavor readout only; the relativistic speed-cap
+  floor (§15) is an explicit, surfaced playability concession, not a
+  claim that flight near a supermassive hole is still sub-light.
+- **Universe / Star Map** (§16–§19): ~35 catalog stars/black holes/
+  galaxies and 6 exoplanets is a small, hand-picked real set, not a bulk
+  astronomical-catalog import; travel is an instantaneous narrative jump,
+  never simulated continuous faster-than-light flight; Star System View
+  and Multi-Star System View have no orbiting planets beyond the handful
+  of real cataloged exoplanets, no moons, and no surface/on-foot
+  exploration of any kind — this app's scope stops at space travel and
+  orbital viewing.
 
 Where an approximation or a simplification is made anywhere in the code,
 it is labeled as such at the point it's made, rather than presented as

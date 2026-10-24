@@ -35,7 +35,11 @@ public:
         glm::dvec3 up;
     };
 
-    Mode mode = Mode::Orbit;
+    // Starts in FreeFly, far out from the black hole (disk/jet presets top
+    // out around ~100-220 sim units -- see AccretionDisk::outerRadius and
+    // the Orbit distance presets below), so the sim opens with room to fly
+    // in rather than parked on top of the hole in Orbit mode.
+    Mode mode = Mode::FreeFly;
 
     // --- Orbit state ---
     double distance = 30.0;
@@ -43,8 +47,10 @@ public:
     double pitchRadians = 0.3;
 
     // --- Free-fly state ---
-    glm::dvec3 freeFlyPosition{0.0, 8.0, 30.0};
-    double freeFlyYawRadians = 0.0;
+    glm::dvec3 freeFlyPosition{0.0, 50.0, 800.0};
+    // Yaw = pi so Forward() (sin(yaw), ..., cos(yaw)) points back toward the
+    // origin from +Z, not away from it -- see Forward() below.
+    double freeFlyYawRadians = 3.14159265358979323846;
     double freeFlyPitchRadians = 0.0;
 
     // --- Jet state (written externally each frame, see App.cpp) ---

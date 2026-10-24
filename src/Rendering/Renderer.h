@@ -92,6 +92,15 @@ public:
     void DrawPath(const std::vector<glm::dvec3>& path, const glm::vec3& color, float lineWidth = 2.0f) const;
     void DrawPoint(const glm::dvec3& position, const glm::vec3& color, float size = 6.0f) const;
 
+    // Same tessellation/unit-sphere shape as DrawSphere, but equirectangular-
+    // UV-mapped and textured (GL_TEXTURE_2D) instead of flat-colored --
+    // unlit, same as plain DrawSphere, since every caller so far (Star
+    // System View's visited star, Universe/StarCatalog.h) is a
+    // self-luminous body, not a lit solid one. `texture` is a GL texture id
+    // (e.g. from UploadImage) the caller owns and keeps alive.
+    void DrawTexturedSphere(const glm::dvec3& center, double radius, unsigned int texture, int rings = 32,
+                             int sectors = 48) const;
+
     // Loads an image file from disk into a GL texture (via stb_image) and
     // returns its id, or 0 on failure. Intended to be called once per unique
     // file and cached by the caller -- this does hit the filesystem/decode a

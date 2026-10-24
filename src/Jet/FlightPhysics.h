@@ -56,6 +56,38 @@ const float MACH_1 = 343.0f;               // sim units/s, purely for the arcade
 // would otherwise produce around a supermassive hole. See Update().
 const float MAX_SPEED_FRACTION_OF_C = 0.2f;
 
+// Thrust (see FlightPhysics::thrust) is allowed to go negative, down to
+// -MAX_THRUST * REVERSE_THRUST_FRACTION, so Ctrl (throttle down, see
+// InputHandler::ProcessKeyboard) can push past zero into genuine reverse
+// thrust instead of just idling at zero. Capped well below full forward
+// thrust (30%) -- arcade flavor: reverse is there to back out of a bad
+// approach or hold station, not to out-accelerate forward flight.
+const float REVERSE_THRUST_FRACTION = 0.3f;
+
+// Floor on the speed cap, in sim-units/s, applied AFTER the real-c
+// conversion above (see Update): max(relativisticCapSimUnits, this). Real
+// bug this fixes, not a hypothetical -- the relativistic cap is a REAL
+// speed (0.2c) converted into sim-units/s via metersPerSimUnit, and
+// metersPerSimUnit grows with the black hole's mass (see Physics/
+// Constants.h). At a stellar-mass hole metersPerSimUnit is kilometers, so
+// the converted cap is huge and never binds in practice. At TON 618
+// (~6.6e10 solar masses, this app's default) metersPerSimUnit is ~0.01
+// light-years, so the SAME 0.2c converts to roughly 6e-7 sim-units/s --
+// imperceptibly slow, meaning the jet was effectively frozen in place by
+// its own speed cap, not by any gravity or input problem, immediately
+// after spawning near any sufficiently massive hole (reported directly:
+// "near the black hole I cannot fly"). This floor keeps the pure
+// relativistic cap intact (and binding) for small/moderate-mass holes,
+// where it's already far above this floor and max() changes nothing, but
+// guarantees LOCAL maneuvering near a black hole never becomes physically
+// unplayable just because the hole is supermassive. 150 sim-units/s is
+// comfortably above STALL_SPEED (70) and MACH_1 (343 is the arcade
+// transonic reference, not a hard limit) -- fast enough to feel
+// responsive, nowhere near needing to be literal light speed for a sim
+// unit that, at TON 618's scale, is itself a significant fraction of a
+// light-year.
+const float MIN_FLYABLE_SPEED_SIM_UNITS_PER_SEC = 150.0f;
+
 class FlightPhysics {
 public:
     // State

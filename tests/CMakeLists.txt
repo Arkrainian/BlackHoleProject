@@ -10,6 +10,10 @@ add_executable(BlackHoleTests
     test_binary.cpp
     test_planet.cpp
     test_tidal_flare.cpp
+    test_multibody.cpp
+    test_mutual_gravity.cpp
+    test_universe.cpp
+    test_multistar.cpp
 )
 target_link_libraries(BlackHoleTests PRIVATE bh_physics bh_astronomy)
 

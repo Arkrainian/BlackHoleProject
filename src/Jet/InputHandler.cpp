@@ -53,9 +53,15 @@ void InputHandler::ProcessKeyboard(GLFWwindow* window, FlightPhysics& physics, f
     physics.rollInput = smoothedRoll;
     physics.yawInput = smoothedYaw;
 
-    // Thrust: Shift = increase, Space = decrease, W+Shift = afterburner.
+    // Thrust: Shift = increase, Left/Right Ctrl = decrease (and past zero,
+    // genuine reverse thrust -- see REVERSE_THRUST_FRACTION), W+Shift =
+    // afterburner. Previously Space decreased thrust with a floor at zero
+    // (no reverse at all); moved to Ctrl specifically so reverse has its
+    // own dedicated key, not a repurposed "idle" key.
     bool shiftPressed = (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
                           glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
+    bool ctrlPressed = (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+                         glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
     bool wPressed = (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS);
 
     if (shiftPressed) {
@@ -65,11 +71,11 @@ void InputHandler::ProcessKeyboard(GLFWwindow* window, FlightPhysics& physics, f
         physics.afterburner = false;
     }
 
-    if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) {
+    if (ctrlPressed) {
         physics.thrust -= 50000.0f * deltaTime;
     }
 
-    physics.thrust = glm::clamp(physics.thrust, 0.0f, MAX_THRUST);
+    physics.thrust = glm::clamp(physics.thrust, -MAX_THRUST * REVERSE_THRUST_FRACTION, MAX_THRUST);
 }
 
 void InputHandler::ProcessMouse(float xoffset, float yoffset, FlightPhysics& physics, float deltaTime) {

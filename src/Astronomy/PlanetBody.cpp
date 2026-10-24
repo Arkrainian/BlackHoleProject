@@ -319,16 +319,19 @@ void PlanetBody::RebuildFragments() {
     m_fragmentsDirty = false;
 }
 
-void PlanetBody::Update(double deltaTime, const Physics::BlackHole& blackHole, const Physics::BinarySystem* binary) {
+void PlanetBody::Update(double deltaTime, const Physics::BlackHole& blackHole, const Physics::BinarySystem* binary,
+                         const std::vector<Physics::ExtraBlackHole>* extraBlackHoles,
+                         const std::vector<Physics::GravitySource>* mutualGravitySources,
+                         double mutualGravityStrength) {
     m_massCapturedThisStep = 0.0;
-    const double rs = Physics::BlackHole::SchwarzschildRadiusSim();
     const int n = static_cast<int>(m_particles.size());
 
     std::vector<glm::dvec3> accel(static_cast<size_t>(n), glm::dvec3(0.0));
     for (int i = 0; i < n; ++i) {
         if (m_particles[static_cast<size_t>(i)].consumed) continue;
-        const glm::dvec3& pos = m_particles[static_cast<size_t>(i)].position;
-        accel[static_cast<size_t>(i)] = binary ? binary->GravityAccelSim(pos) : Physics::StaticObserverGravityAccelSim(pos);
+        accel[static_cast<size_t>(i)] = Physics::CombinedGravityAccelSim(
+            m_particles[static_cast<size_t>(i)].position, binary, extraBlackHoles, mutualGravitySources,
+            mutualGravityStrength);
     }
     ApplySpringForces(accel);
     ApplySelfGravity(accel);
@@ -340,8 +343,7 @@ void PlanetBody::Update(double deltaTime, const Physics::BlackHole& blackHole, c
         particle.velocity += accel[static_cast<size_t>(i)] * deltaTime;
         particle.position += particle.velocity * deltaTime;
 
-        const bool consumed = binary ? binary->IsCaptured(particle.position) : glm::length(particle.position) < rs;
-        if (consumed) {
+        if (Physics::IsCapturedByAny(particle.position, binary, extraBlackHoles)) {
             particle.consumed = true;
             m_fragmentsDirty = true;
             m_massCapturedThisStep += particle.mass;
@@ -384,13 +386,40 @@ void PlanetBody::FinishStep(const Physics::BlackHole& blackHole) {
     }
 }
 
+glm::dvec3 PlanetBody::CenterOfMassSim() const {
+    glm::dvec3 weightedPosition(0.0);
+    double totalMass = 0.0;
+    for (const PlanetParticle& particle : m_particles) {
+        if (particle.consumed) continue;
+        weightedPosition += particle.position * particle.mass;
+        totalMass += particle.mass;
+    }
+    return totalMass > 0.0 ? weightedPosition / totalMass : glm::dvec3(0.0);
+}
+
+double PlanetBody::CurrentMassKg() const {
+    double totalMass = 0.0;
+    for (const PlanetParticle& particle : m_particles) {
+        if (!particle.consumed) totalMass += particle.mass;
+    }
+    return totalMass;
+}
+
 #ifdef BH_PLANET_CUDA_AVAILABLE
-bool PlanetBody::UpdateGPU(double deltaTime, const Physics::BlackHole& blackHole, const Physics::BinarySystem* binary) {
+bool PlanetBody::UpdateGPU(double deltaTime, const Physics::BlackHole& blackHole, const Physics::BinarySystem* binary,
+                            const std::vector<Physics::ExtraBlackHole>* extraBlackHoles,
+                            const std::vector<Physics::GravitySource>* mutualGravitySources,
+                            double mutualGravityStrength) {
+    (void)mutualGravityStrength; // only meaningful alongside mutualGravitySources, checked below
     // The GPU kernel only knows the single-hole gravity/capture law --
-    // rather than silently running the wrong physics fast, binary mode
-    // always falls back to the (binary-aware) CPU Update() path. See this
-    // method's header comment.
-    if (binary) return false;
+    // rather than silently running the wrong physics fast, binary mode,
+    // any extra black holes, or any mutual-gravity sources always fall
+    // back to the (fully-aware) CPU Update() path. See this method's
+    // header comment.
+    if (binary || (extraBlackHoles && !extraBlackHoles->empty()) ||
+        (mutualGravitySources && !mutualGravitySources->empty())) {
+        return false;
+    }
 
     m_massCapturedThisStep = 0.0;
     const int n = static_cast<int>(m_particles.size());
@@ -481,7 +510,10 @@ bool PlanetBody::UpdateGPU(double deltaTime, const Physics::BlackHole& blackHole
 bool PlanetBody::GpuAvailable() { return CudaPlanetSim::PlanetCudaDeviceAvailable(); }
 #else
 bool PlanetBody::UpdateGPU(double /*deltaTime*/, const Physics::BlackHole& /*blackHole*/,
-                            const Physics::BinarySystem* /*binary*/) { return false; }
+                            const Physics::BinarySystem* /*binary*/,
+                            const std::vector<Physics::ExtraBlackHole>* /*extraBlackHoles*/,
+                            const std::vector<Physics::GravitySource>* /*mutualGravitySources*/,
+                            double /*mutualGravityStrength*/) { return false; }
 bool PlanetBody::GpuAvailable() { return false; }
 #endif
 

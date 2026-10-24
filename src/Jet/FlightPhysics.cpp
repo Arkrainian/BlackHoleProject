@@ -41,7 +41,11 @@ void FlightPhysics::Update(float deltaTime, double metersPerSimUnit) {
     // original arcade thrust/drag equilibrium is what limits speed, same as
     // before this was added; a hole as large as TON 618 gets a small enough
     // cap to actually bind.
-    const double maxSpeedSim = (static_cast<double>(maxSpeedFractionOfC) * Physics::Constants::C_SI) / metersPerSimUnit;
+    // See MIN_FLYABLE_SPEED_SIM_UNITS_PER_SEC in FlightPhysics.h for why the
+    // floor exists: without it, this cap goes to ~6e-7 sim-units/s at a
+    // hole as massive as TON 618, which is not "slow," it's frozen.
+    const double relativisticMaxSpeedSim = (static_cast<double>(maxSpeedFractionOfC) * Physics::Constants::C_SI) / metersPerSimUnit;
+    const double maxSpeedSim = std::max(relativisticMaxSpeedSim, static_cast<double>(MIN_FLYABLE_SPEED_SIM_UNITS_PER_SEC));
     UpdateForces(deltaTime, static_cast<float>(maxSpeedSim));
     UpdateRotation(deltaTime);
 
@@ -129,9 +133,17 @@ void FlightPhysics::UpdateForces(float deltaTime, float maxSpeedSimUnitsPerSec) 
     }
 
     // Aerodynamic "turn" correction -- velocity aligns with the nose.
+    // Direction follows the SIGN of thrust, not just +forward: with
+    // reverse thrust (thrust < 0, see Ctrl/REVERSE_THRUST_FRACTION in
+    // InputHandler/FlightPhysics.h) this pulls velocity to align backward
+    // along the nose instead of snapping it back to forward flight, which
+    // is what an unconditional "+forward*airSpeed" target did before
+    // reverse thrust existed -- that would have fought every reverse
+    // input into a stall rather than letting the ship actually back up.
     if (airSpeed > 10.0f) {
         float turnAgility = 2.0f * deltaTime;
-        glm::vec3 desiredVel = forward * airSpeed;
+        float directionSign = (thrust >= 0.0f) ? 1.0f : -1.0f;
+        glm::vec3 desiredVel = forward * (airSpeed * directionSign);
         velocity = glm::mix(velocity, desiredVel, turnAgility);
     }
 

@@ -6,6 +6,7 @@
 
 #include "Physics/BinarySystem.h"
 #include "Physics/BlackHole.h"
+#include "Physics/MultiBlackHoleSystem.h"
 #include "Physics/PlanetMaterial.h"
 
 namespace Astronomy {
@@ -152,8 +153,16 @@ public:
     // current positions instead of a single mass at the origin -- see
     // StarBody::Update's matching parameter for why this matters (without
     // it, a planet spawned in binary mode behaves as if a single invisible
-    // hole still sits at the barycenter).
-    void Update(double deltaTime, const Physics::BlackHole& blackHole, const Physics::BinarySystem* binary = nullptr);
+    // hole still sits at the barycenter). extraBlackHoles, when non-null,
+    // adds every listed Physics::ExtraBlackHole's own pull/horizon on top
+    // of whatever else is active -- see Physics/MultiBlackHoleSystem.h.
+    // mutualGravitySources/mutualGravityStrength, when non-null, add every
+    // listed Physics::GravitySource's tuned mutual pull -- see
+    // Physics/GravitySource.h.
+    void Update(double deltaTime, const Physics::BlackHole& blackHole, const Physics::BinarySystem* binary = nullptr,
+                const std::vector<Physics::ExtraBlackHole>* extraBlackHoles = nullptr,
+                const std::vector<Physics::GravitySource>* mutualGravitySources = nullptr,
+                double mutualGravityStrength = 1.0);
 
     // Same physics, same result (within float-vs-double rounding -- see
     // cuda/PlanetKernel.h), but the gravity/spring/integration/fracture math
@@ -162,13 +171,18 @@ public:
     // instance's state is left completely untouched -- the caller should
     // fall back to Update() for this frame) when the project wasn't built
     // with BH_ENABLE_CUDA, or no CUDA device is available, or the GPU call
-    // itself failed, OR binary is non-null -- the GPU kernel only knows the
-    // single-hole law; binary mode deliberately always falls back to the
-    // (binary-aware) CPU path rather than silently running the wrong
-    // physics fast. There is no "force GPU" mode and no separate "force
-    // CPU" toggle -- same automatic-fallback-only philosophy the ray tracer
-    // already uses (see RayTracing::CudaAvailable's call sites in App.cpp).
-    bool UpdateGPU(double deltaTime, const Physics::BlackHole& blackHole, const Physics::BinarySystem* binary = nullptr);
+    // itself failed, OR binary is non-null, OR extraBlackHoles is non-null
+    // and non-empty, OR mutualGravitySources is non-null and non-empty --
+    // the GPU kernel only knows the single-hole law; anything beyond that
+    // deliberately always falls back to the (fully-aware) CPU path rather
+    // than silently running the wrong physics fast. There is no "force
+    // GPU" mode and no separate "force CPU" toggle -- same automatic-
+    // fallback-only philosophy the ray tracer already uses (see
+    // RayTracing::CudaAvailable's call sites in App.cpp).
+    bool UpdateGPU(double deltaTime, const Physics::BlackHole& blackHole, const Physics::BinarySystem* binary = nullptr,
+                   const std::vector<Physics::ExtraBlackHole>* extraBlackHoles = nullptr,
+                   const std::vector<Physics::GravitySource>* mutualGravitySources = nullptr,
+                   double mutualGravityStrength = 1.0);
 
     // True if this build was compiled with BH_ENABLE_CUDA AND a CUDA device
     // was found at runtime -- i.e. whether UpdateGPU() can be expected to
@@ -203,6 +217,14 @@ public:
     // visibly affects the accretion disk; not accumulated across steps by
     // this class itself.
     double MassCapturedLastStep() const { return m_massCapturedThisStep; }
+
+    // For Physics::GravitySource construction (mutual gravity, see
+    // App.cpp): this planet's current mass-weighted center of mass and
+    // current total mass, both over live (non-consumed) particles only --
+    // exact, not approximated, since PlanetParticle already tracks its own
+    // mass per-particle.
+    glm::dvec3 CenterOfMassSim() const;
+    double CurrentMassKg() const;
 
 private:
     void BuildSpringLattice();

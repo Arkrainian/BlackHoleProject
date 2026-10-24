@@ -1,21 +1,24 @@
 # Validation
 
 All numbers below are copied directly from an actual run of
-`build/tests/BlackHoleTests.exe` (98 checks with the default CPU-only
-build, 110 with `-DBH_ENABLE_CUDA=ON`; 0 failures either way) and the
-app's "Validate: Compare CPU vs GPU" diagnostic — nothing here is
-asserted without a corresponding automated check in `tests/`. Run the
-suite yourself with:
+`build/tests/BlackHoleTests.exe` (**201 checks, 0 failures**, both local
+build directories as of this writing — see the note at the end of §17's
+summary table for why that CPU-only/CUDA distinction is currently blurred
+in this working copy specifically, and what the CUDA-gated figure would
+be either way) and the app's "Validate: Compare CPU vs GPU" diagnostic —
+nothing here is asserted without a corresponding automated check in
+`tests/`. Run the suite yourself with:
 
 ```
 build.bat
 build\tests\BlackHoleTests.exe
 ```
 
-(§9, on Kerr/rotating black holes, and §10, on approximate binary
-black holes, are both new since this file's original
-Schwarzschild-only version — see `docs/physics.md` §10-11 for the
-physics and `HANDOFF.md` for how each was added.)
+(§9, on Kerr/rotating black holes, §10, on approximate binary black
+holes, §15, on the Universe/Star Map's real catalog, and §16, on
+multi-star N-body systems, are all new since this file's original
+Schwarzschild-only version — see `docs/physics.md` §10-11 and §16-19 for
+the physics and `HANDOFF.md` for how each was added.)
 
 ## 1. Schwarzschild radius
 
@@ -349,7 +352,37 @@ symmetry, independent of any absolute reference formula.
 
 (`tests/test_binary.cpp`)
 
-## 11. CPU vs. GPU (Stage 7)
+## 11. Multi-body lensing (freely-placed extra black holes)
+
+`tests/test_multibody.cpp` (`RunMultiBodyTests`, 6 checks) validates
+`Physics::TracePhotonMultiBody`, the N-body generalization of the binary
+scheme above (see `docs/physics.md` §12):
+
+| Check | Result |
+|---|---|
+| 2-body reduction: same ray, same bodies (primary at `BinarySystem::Position1()`, extra at `Position2()`), `TracePhotonMultiBody` vs. `TracePhotonBinary` — fate | ✅ match |
+| Same — closest approach | exact match (`1e-6` tolerance) |
+| Same — escape direction (when both escape) | angle < `1e-4` rad |
+| Ray aimed directly at a non-primary (index 1) body | ✅ captured, not escaped |
+| Ray aimed at a non-primary body's own disk | ✅ hit registered |
+| Same — attributed to that body's index, not the primary's | ✅ |
+| A star placed near an extra black hole (far from the primary) | ✅ falls in and is captured by the extra black hole |
+
+The first three checks are the important regression guard: generalizing
+`BinaryGeodesicSolver`'s two named bodies into an array (a fresh,
+independent implementation, not a refactor of the original) reproduces
+the original's own result for an equivalent configuration, to float/
+double-rounding precision. One real bug was caught building this test
+suite, not by code review: an early version of both
+`CPUTracer.cpp::BuildLensingBodies` and this test's own first check
+assumed the primary black hole sits at the world origin even in binary
+mode — `BinarySystem::Position1()` shows it does not (body 1 orbits the
+barycenter too, same as body 2) — fixed in both places once the
+reduction check caught the mismatch.
+
+(`tests/test_multibody.cpp`)
+
+## 12. CPU vs. GPU (Stage 7)
 
 **Update (post float-conversion):** the numbers below replace an earlier
 version of this section measured when the GPU kernel still ran in
@@ -456,7 +489,7 @@ there's simply less for float-vs-double rounding to disagree about.
 
 (`tests/test_gpu_render.cpp`)
 
-## 12. Planetary destruction (Milestone 1 + self-gravity + disk coupling)
+## 13. Planetary destruction (Milestone 1 + self-gravity + disk coupling)
 
 Validates `Physics::PlanetMaterial`, `Physics::TidalForceModel`, and
 `Astronomy::PlanetBody` (`tests/test_planet.cpp`, 19 checks):
@@ -518,7 +551,81 @@ own CPU/GPU agreement, which use the same float-precision tradeoff.
 
 (`tests/test_planet_gpu.cpp`, `RunPlanetGpuTests`)
 
-## 13. Summary
+## 14. Mutual gravity (object-level pull between spawned stars/planets)
+
+Validates `Physics::GravitySource`/`MutualGravityAccelSim` and the
+`Astronomy::StarBody::Update`/`PlanetBody::Update`/`UpdateGPU`
+`mutualGravitySources` parameters built on them (`tests/test_mutual_gravity.cpp`,
+4 checks, built in every configuration — not CUDA-gated). All three
+dynamics checks place their stars ~10⁶ sim units from the primary black
+hole specifically to make its own (always-on, see `docs/physics.md` §14)
+pull on the pair negligible relative to the effect under test — an earlier
+draft of this test placed them at a more modest distance and saw spurious
+separation drift (and a swamped directional signal in the second check)
+purely from the primary's own gravity, not a bug in mutual gravity itself.
+
+| Check | What it confirms |
+|---|---|
+| Mutual gravity on vs. off | Two 1-solar-mass stars' separation measurably decreases with mutual gravity on; an identical pair with it left off (the default) shows zero separation change |
+| Attraction toward a more massive companion | A star next to a 10-solar-mass companion picks up measurable displacement toward it within 100 steps |
+| GPU fallback | `PlanetBody::UpdateGPU` returns `false` (falls back to CPU) when mutual gravity sources are supplied, non-empty — same precedent as binary mode/extra black holes |
+
+(`tests/test_mutual_gravity.cpp`, `RunMutualGravityTests`)
+
+The tuned constants themselves (`kMutualGravityCoefficient = 1.5`,
+`kMutualGravityMinDistance = 3.0`, solar-mass reference) were found via a
+scripted probe outside the test suite, not derived from these tests: two
+point masses were integrated directly (bypassing `StarBody`'s particle
+machinery) across a grid of coefficient/min-distance/separation/tangential-
+velocity combinations, discarding any combination that flung the pair
+apart to extreme separations within a few thousand steps. The first probe
+pass, which referenced Earth mass the way `PlanetBody`'s self-gravity does,
+diverged in **every** combination tried (massRatio ~3.3×10⁵ for a
+solar-mass star made the per-step kick dwarf the objects' own separation);
+switching the reference mass to one solar mass fixed this immediately,
+after which the chosen values were picked for producing a visible
+spiral-together/swing-past/spread-back-out encounter rather than a stable
+closed orbit (not expected from a softened, not true, inverse-square law
+under semi-implicit Euler) or an outright ejection. See `docs/physics.md`
+§14 and `HANDOFF.md` for the full account.
+
+## 15. Universe / Star Map: real catalog and Kepler-derived exoplanet orbits
+
+Validates `Universe::StarCatalog.h`'s real data, the RA/Dec/distance ->
+Cartesian coordinate conversion it relies on, and
+`Universe::OrbitalPeriodDays`'s Kepler's-third-law cross-check against
+real exoplanets' published orbital periods (`tests/test_universe.cpp`,
+29 checks, built in every configuration — not CUDA-gated).
+
+| Check | What it confirms |
+|---|---|
+| Equatorial / polar coordinate conversion | A star at RA=0h, Dec=0° lands exactly on +X at its catalog distance; Polaris (Dec ≈ 89.26°) lands almost entirely on the polar axis |
+| Universal magnitude check | Every one of the ~35 catalog entries' `CartesianLy()` magnitude matches its own listed distance, not just the two spot-checked above |
+| Real relative-fact sanity | Alpha Centauri is closer than Sirius; Sagittarius A* is far less massive than TON 618 — catches a transposed/garbled data field without hardcoding every digit |
+| Object-type coverage | The catalog contains at least one Star, one BlackHoleObj, and one Galaxy entry |
+| Kepler-derived exoplanet periods vs. real published values (5 planets, loose 10% tolerance — the catalog's star masses are rounded published figures, not each discovery paper's own exact value) | Proxima Centauri b: **11.26 days** vs. real ~11.19; Ross 128 b: **9.79** vs. ~9.9; Epsilon Eridani b: **2618** vs. ~2691; Tau Ceti e: **163.2** vs. ~162.9; Tau Ceti g: **20.06** vs. ~20.0 — all five genuinely pass, not tuned to pass |
+
+(`tests/test_universe.cpp`, `RunUniverseTests`)
+
+## 16. Multi-star systems: real binary/triple data + N-body mutual-gravity sanity
+
+Validates `Universe::MultiStarSystem.h`'s real builders
+(`BuildAlphaCentauriBinary`/`BuildAlphaCentauriTriple`) and procedural
+generator (`GenerateProceduralSystem`), plus a direct sanity check on the
+tuned mutual-gravity law App.cpp's N-body integration reuses
+(`tests/test_multistar.cpp`, 18 checks, built in every configuration —
+not CUDA-gated).
+
+| Check | What it confirms |
+|---|---|
+| Alpha Centauri AB | Exactly 2 members, classified TwoBody, flagged real, A listed more massive than B (as in reality) |
+| Alpha Centauri System (triple) | Exactly 3 members, classified ThreeBody, flagged real, includes Proxima Centauri |
+| Procedural generator (N=2, 3, 6) | Correct member count and TwoBody/ThreeBody/NBody classification at each size; flagged NOT real; the same seed reproduces bit-identical masses; every generated temperature lands in a plausible real range (1000-50000 K) |
+| Mutual-gravity direction | Two stars pull *toward*, not away from, each other, with zero out-of-plane component for a coplanar pair — independent of App.cpp's own integration loop |
+
+(`tests/test_multistar.cpp`, `RunMultiStarTests`)
+
+## 17. Summary
 
 | Area | Tests | Status |
 |---|---|---|
@@ -530,21 +637,38 @@ own CPU/GPU agreement, which use the same float-precision tradeoff.
 | Accretion disk (Stage 6) | 9 | ✅ |
 | Kerr (rotating) black holes — closed-form + geodesic regression + weak-field spin-orbit deflection | 35 | ✅ |
 | Binary black holes (approximate) — orbital mechanics + single-mass reduction + capture/symmetry + disks | 25 | ✅ |
+| Multi-body lensing — binary reduction check, extra-body capture/disk attribution, star capture | 6 | ✅ |
 | Planetary destruction — materials, tidal/Roche diagnostics, fracture, fragments, self-gravity reaccumulation | 19 | ✅ |
 | Tidal disruption flare (debris → accretion-disk coupling) | 9 | ✅ |
-| **Total (default `build.bat`, no CUDA)** | **126** | **0 failures** |
+| Mutual gravity — on/off comparison, attraction toward a massive companion, GPU fallback | 4 | ✅ |
+| Universe / Star Map — real catalog coordinates, Kepler-derived exoplanet periods | 29 | ✅ |
+| Multi-star systems — real binary/triple data, procedural generator, mutual-gravity direction | 18 | ✅ |
+| **Total (default `build.bat`, no CUDA)** | **183** | **0 failures (deduced: 136 + 29 + 18, see note below — not independently re-verified via a fresh CPU-only configure this session)** |
 | CPU vs. GPU render comparison, Schwarzschild (Stage 7, `-DBH_ENABLE_CUDA=ON` only) | 4 | ✅ |
 | CPU vs. GPU render comparison, Kerr (`-DBH_ENABLE_CUDA=ON` only) | 4 | ✅ |
 | CPU vs. GPU render comparison, binary (`-DBH_ENABLE_CUDA=ON` only) | 4 | ✅ |
 | Planetary destruction, CPU vs. GPU step agreement (`-DBH_ENABLE_CUDA=ON` only) | 6 | ✅ |
-| **Total (`build_cuda.bat`)** | **144** | **0 failures** |
+| **Total (`build_cuda.bat`)** | **201** | **0 failures (directly verified this session)** |
+
+**Note on the 183 vs. 201 figures:** both local build directories
+(`build/` and `build_cuda/`) happen to have `BH_ENABLE_CUDA=ON` baked into
+their CMake cache already (a pre-existing quirk flagged as far back as
+this project's Session 4, not something this work introduced), so the
+only number directly re-run and counted this session is **201** (both
+dirs, 0 failures either way). 183 is the CPU-only figure arithmetically
+implied by adding this session's two new, non-CUDA-gated test files (29 +
+18 = 47) onto validation.md's last independently-verified CPU-only total
+of 136 — correct by construction (neither new file is behind
+`BH_ENABLE_CUDA`), but not re-confirmed via an actual fresh,
+CUDA-disabled configure the way Session 8's original 136 figure was.
 
 CPU vs. GPU correctness (Stage 7, and now Kerr and binary modes too)
 has automated coverage (`tests/test_gpu_render.cpp`, `RunGpuRenderTests`
 + `RunKerrGpuRenderTests` + `RunBinaryGpuRenderTests`) in addition to
 the interactive Advanced-mode "Validate: Compare CPU vs GPU" button —
 it only builds/runs when CUDA is enabled (it requires a CUDA-capable
-GPU, which the default CPU-only build should not assume), so the
-default `build.bat` suite stays at 98 tests. See §11 above for the
-Schwarzschild/Kerr/binary GPU results — all three modes now run on GPU
-when one is available.
+GPU, which the default CPU-only build should not assume). See §12 above
+for the Schwarzschild/Kerr/binary GPU results — all three modes now run
+on GPU when one is available (multi-body lensing does not -- see
+`docs/physics.md` §12 -- so it's covered by `tests/test_multibody.cpp`
+on CPU only, unconditionally).

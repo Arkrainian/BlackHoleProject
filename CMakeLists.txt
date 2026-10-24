@@ -164,6 +164,7 @@ file(GLOB_RECURSE BH_APP_SOURCES CONFIGURE_DEPENDS
     src/Rendering/*.cpp
     src/UI/*.cpp
     src/Jet/*.cpp
+    src/Universe/*.cpp
 )
 
 add_executable(BlackHoleSimulator src/main.cpp ${BH_APP_SOURCES})

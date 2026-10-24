@@ -231,3 +231,31 @@ would be a natural next step if higher precision were needed near
 is IEEE double precision, which is why `captureMultiplier` and the
 disk-crossing linear interpolation (`docs/physics.md` §9) exist as
 deliberate tolerances rather than exact boundary hits.
+
+## 7. Multi-star N-body integration (Universe/MultiStarSystem.h)
+
+Separate from the geodesic ODE integrators above: multi-star systems
+(`docs/physics.md` §19) are integrated with plain semi-implicit
+(symplectic) Euler — the same integration style `Astronomy::StarBody`
+and `Astronomy::PlanetBody` already use for tidal-disruption particles
+and self-gravity respectively, not a new scheme introduced just for this
+feature. Each step computes every member's acceleration from the
+pre-step positions in one pass (`Physics::MutualGravityAccelSim`, summed
+pairwise, O(N²) — entirely fine at the N≤8 star counts this feature
+allows), then applies every velocity update, then every position update,
+in three separate passes so the result never depends on member iteration
+order within a single step.
+
+No adaptive step size is used here (unlike the geodesic solvers' own
+curvature-based adaptive stepping, §3.2) — the step is simply the
+frame's own `dt`, clamped elsewhere in the main loop to guard against a
+stalled-frame spike. This is adequate at the visual-scale separations and
+tuned mutual-gravity strength this feature uses (the same tuning already
+validated for the existing spawned-star/planet mutual-gravity feature,
+`docs/physics.md` §14), but would not be an appropriate integration
+scheme for a close, fast binary at much smaller separations or much
+longer run times, where energy drift from the fixed step size would
+eventually become visible. For N≥3, no closed-form solution exists to
+compare against in the first place (`docs/physics.md` §19) — "stable to
+machine precision over a long run" is not a meaningful bar for a system
+that is supposed to be chaotic.

@@ -10,8 +10,12 @@ void RunShadowTests();
 void RunDiskTests();
 void RunKerrTests();
 void RunBinaryTests();
+void RunMultiBodyTests();
+void RunMutualGravityTests();
 void RunPlanetTests();
 void RunTidalFlareTests();
+void RunUniverseTests();
+void RunMultiStarTests();
 #ifdef BH_CUDA_AVAILABLE
 void RunGpuRenderTests();
 void RunKerrGpuRenderTests();
@@ -46,11 +50,23 @@ int main() {
     std::printf("\n=== Binary black holes (approximate superposed lensing) ===\n");
     RunBinaryTests();
 
+    std::printf("\n=== Multi-body (freely-placed extra black holes) lensing ===\n");
+    RunMultiBodyTests();
+
+    std::printf("\n=== Mutual gravity (object-level pull between spawned stars/planets) ===\n");
+    RunMutualGravityTests();
+
     std::printf("\n=== Planetary destruction: materials, tidal/Roche diagnostics, fracture ===\n");
     RunPlanetTests();
 
     std::printf("\n=== Tidal disruption flare (debris -> accretion disk coupling) ===\n");
     RunTidalFlareTests();
+
+    std::printf("\n=== Universe / Star Map: real catalog data and coordinate conversion ===\n");
+    RunUniverseTests();
+
+    std::printf("\n=== Multi-star systems: 2/3/N-body catalog and mutual-gravity sanity ===\n");
+    RunMultiStarTests();
 
 #ifdef BH_CUDA_AVAILABLE
     std::printf("\n=== CPU vs GPU render comparison (Stage 7) ===\n");
