@@ -8,12 +8,20 @@
 
 namespace Jet {
 
+// Starting cruise speed: exactly 0 -- the ship spawns stationary.
+// Explicitly requested ("make sure the endurance doesnt have speed on
+// spawn, it should have 0 speed"); previously defaulted to a nonzero
+// value (150, originally 300) so the ship was already moving the instant
+// it spawned/respawned, which is no longer the desired behavior. Shift
+// raises it from here with no ceiling of its own.
+constexpr float kDefaultCruiseSpeed = 0.0f;
+
 FlightPhysics::FlightPhysics(const glm::vec3& spawnPosition)
     : position(spawnPosition)
     , velocity(0.0f, 0.0f, 0.0f)
     , rotation(glm::identity<glm::quat>())
     , angularVelocity(0.0f)
-    , thrust(MAX_THRUST * 0.5f)
+    , cruiseSpeedSimUnitsPerSec(kDefaultCruiseSpeed)
     , currentGForce(1.0f)
     , peakGForce(1.0f)
     , pitchInput(0.0f)
@@ -28,7 +36,7 @@ void FlightPhysics::Reset(const glm::vec3& spawnPosition) {
     velocity = glm::vec3(0.0f);
     rotation = glm::identity<glm::quat>();
     angularVelocity = glm::vec3(0.0f);
-    thrust = MAX_THRUST * 0.5f;
+    cruiseSpeedSimUnitsPerSec = kDefaultCruiseSpeed;
     currentGForce = 1.0f;
     peakGForce = 1.0f;
     capturedByBlackHole = false;
@@ -60,91 +68,60 @@ void FlightPhysics::Update(float deltaTime, double metersPerSimUnit) {
 }
 
 void FlightPhysics::UpdateForces(float deltaTime, float maxSpeedSimUnitsPerSec) {
-    float airSpeed = glm::length(velocity);
-
-    // No atmosphere in orbit around a black hole -- nominal sea-level-
-    // equivalent density everywhere, purely to keep the arcade thrust/drag
-    // feel from the source project unchanged (see FlightPhysics.h header).
-    const float airDensity = 1.225f;
-
+    const glm::vec3 velocityBeforeThisStep = velocity;
     glm::vec3 forward = GetForward();
-    glm::vec3 velocityDir = (airSpeed > 0.1f) ? glm::normalize(velocity) : forward;
-    float aoaDot = glm::dot(forward, velocityDir);
-    float aoaFactor = glm::clamp(aoaDot, 0.0f, 1.0f);
 
-    // --- FORCES (Newtons, except gravity which is applied as a direct ---
-    // acceleration -- see below) ---
-
-    // 1. Gravity: NOT plain Newtonian 1/r^2 -- that turned out to be
-    // completely imperceptible everywhere outside the horizon (at r=2*r_s,
-    // GM/r^2 is only ~0.06 sim units/s^2, versus ~130 units/s^2 of thrust
-    // acceleration, a 2000x mismatch that meant the black hole could never
-    // actually threaten the jet no matter how close it got). Instead this
-    // uses the EXACT general-relativistic proper acceleration required for
-    // a "static" observer to hover at fixed Schwarzschild radius r:
+    // Gravity: NOT plain Newtonian 1/r^2 -- that turned out to be
+    // completely imperceptible everywhere outside the horizon. Instead
+    // this uses the EXACT general-relativistic proper acceleration
+    // required for a "static" observer to hover at fixed Schwarzschild
+    // radius r:
     //
     //   a(r) = (GM/r^2) / sqrt(1 - r_s/r)
     //
     // (see e.g. MTW "Gravitation" or Hartle's "Gravity", the standard
-    // static-observer result for the Schwarzschild metric). It reduces to
-    // ordinary Newtonian gravity far away (the 1/sqrt(1-r_s/r) factor -> 1),
-    // matching the GM=1 convention used everywhere else in this sim, but
-    // DIVERGES as r -> r_s -- correctly modeling that no amount of thrust
-    // can hold station arbitrarily close to the horizon. In practice this
-    // stays negligible while cruising (r ~ 100s of units) and only becomes
-    // a real, escalating threat once the jet dives in toward the accretion
-    // disk/photon sphere -- exactly where it should. Shared with
-    // Astronomy::StarBody (see Physics/BlackHole.h) so a falling star feels
-    // the identical law.
+    // static-observer result for the Schwarzschild metric). Still
+    // genuinely integrated into `velocity` every frame, same as always --
+    // see FlightPhysics.h's class comment and `cruiseSpeedSimUnitsPerSec`'s
+    // own comment for exactly what effect this retains (bending the
+    // flight path) versus what the cruise-control redesign below gives up
+    // (gravity no longer forces overall SPEED up along a nose-aligned
+    // dive -- that component gets directly overwritten by the pilot's set
+    // speed a few lines down). Shared with Astronomy::StarBody (see
+    // Physics/BlackHole.h) so a falling star still feels the identical law.
     const glm::vec3 gravityAccel(Physics::StaticObserverGravityAccelSim(glm::dvec3(position)));
+    velocity += gravityAccel * deltaTime;
 
-    // 2. Thrust. Afterburner adds 50% more.
-    float thrustMultiplier = afterburner ? 1.5f : 1.0f;
-    glm::vec3 F_thrust = forward * thrust * thrustMultiplier;
+    // Cruise control: the pilot's directly-set speed
+    // (`cruiseSpeedSimUnitsPerSec`, Shift/Ctrl via
+    // InputHandler::ProcessKeyboard, no ceiling of its own) becomes the
+    // ship's velocity component ALONG its own nose direction, every
+    // frame, immediately -- not a force integrated against drag toward
+    // some equilibrium. Decomposing into along-nose and perpendicular
+    // parts (rather than just setting `velocity = forward * speed`
+    // outright) keeps whatever perpendicular drift gravity just added
+    // above intact instead of silently discarding it -- that's the part
+    // of "the black hole bends your path" that survives this redesign.
+    // Afterburner still multiplies the effective speed by 50%. A negative
+    // cruiseSpeedSimUnitsPerSec means reverse -- flying backward along the
+    // nose, not just "less forward."
+    const float afterburnerMultiplier = afterburner ? 1.5f : 1.0f;
+    const float targetAlongNoseSpeed = cruiseSpeedSimUnitsPerSec * afterburnerMultiplier;
+    const float currentAlongNoseSpeed = glm::dot(velocity, forward);
+    const glm::vec3 perpendicularVelocity = velocity - forward * currentAlongNoseSpeed;
+    velocity = forward * targetAlongNoseSpeed + perpendicularVelocity;
 
-    // 3. Drag (with compressibility effects).
-    float mach = GetMachNumber();
-    float dragCoeff = GetDragCoefficient(mach);
-    float inducedDragCoeff = 0.5f * (1.0f - aoaFactor);
+    CalculateGForce((velocity - velocityBeforeThisStep) / std::max(deltaTime, 1e-6f));
 
-    // ARCADE: heavy drag when turning hard ("air brake" / cobra effect).
-    float turnDrag = glm::length(angularVelocity) * 2.0f;
-
-    float totalDrag = 0.5f * airDensity * (airSpeed * airSpeed) * (dragCoeff + inducedDragCoeff + turnDrag);
-    glm::vec3 F_drag = -velocityDir * totalDrag;
-
-    // 4. Lift: intentionally omitted (arcade mode) -- see the "Turn"
-    // correction below, which aligns velocity with the nose instead.
-
-    // --- INTEGRATION (F = ma, gravity added directly as an acceleration) ---
-    glm::vec3 totalForce = F_thrust + F_drag;
-    glm::vec3 acceleration = totalForce / JET_MASS + gravityAccel;
-
-    CalculateGForce(acceleration);
-
-    velocity += acceleration * deltaTime;
-
-    // Hard relativistic speed limit -- see FlightPhysics.h point 3. Whatever
-    // the thrust/drag equilibrium above would otherwise produce, velocity
-    // never exceeds this (mass-dependent) cap.
+    // Hard relativistic speed limit -- see FlightPhysics.h's
+    // MAX_SPEED_FRACTION_OF_C/MIN_FLYABLE_SPEED_SIM_UNITS_PER_SEC. Whatever
+    // the pilot's set speed above would otherwise produce, velocity never
+    // exceeds this (mass-dependent) cap -- the one bound that ISN'T
+    // "infinite" by design, since it's standing in for an actual physical
+    // limit (the speed of light), not an arbitrary engine rating.
     const float speed = glm::length(velocity);
     if (speed > maxSpeedSimUnitsPerSec && speed > 1e-6f) {
         velocity *= maxSpeedSimUnitsPerSec / speed;
-    }
-
-    // Aerodynamic "turn" correction -- velocity aligns with the nose.
-    // Direction follows the SIGN of thrust, not just +forward: with
-    // reverse thrust (thrust < 0, see Ctrl/REVERSE_THRUST_FRACTION in
-    // InputHandler/FlightPhysics.h) this pulls velocity to align backward
-    // along the nose instead of snapping it back to forward flight, which
-    // is what an unconditional "+forward*airSpeed" target did before
-    // reverse thrust existed -- that would have fought every reverse
-    // input into a stall rather than letting the ship actually back up.
-    if (airSpeed > 10.0f) {
-        float turnAgility = 2.0f * deltaTime;
-        float directionSign = (thrust >= 0.0f) ? 1.0f : -1.0f;
-        glm::vec3 desiredVel = forward * (airSpeed * directionSign);
-        velocity = glm::mix(velocity, desiredVel, turnAgility);
     }
 
     position += velocity * deltaTime;
@@ -206,10 +183,6 @@ float FlightPhysics::GetSpeed() const {
     return glm::length(velocity);
 }
 
-float FlightPhysics::GetMachNumber() const {
-    return GetSpeed() / MACH_1;
-}
-
 glm::vec3 FlightPhysics::GetForward() const {
     return rotation * glm::vec3(0, 0, -1);
 }
@@ -220,17 +193,6 @@ glm::vec3 FlightPhysics::GetUp() const {
 
 glm::vec3 FlightPhysics::GetRight() const {
     return rotation * glm::vec3(1, 0, 0);
-}
-
-float FlightPhysics::GetDragCoefficient(float mach) const {
-    float baseDrag = 0.02f;
-    if (mach > 0.8f && mach < 1.2f) {
-        float transonicFactor = 1.0f + 5.0f * std::pow(mach - 0.8f, 2.0f);
-        return baseDrag * transonicFactor;
-    } else if (mach >= 1.2f) {
-        return baseDrag * 3.0f;
-    }
-    return baseDrag;
 }
 
 } // namespace Jet

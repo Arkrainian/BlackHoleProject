@@ -96,6 +96,12 @@ public:
     bool IsFullyConsumed() const;
     const std::vector<StarParticle>& Particles() const { return m_particles; }
     const glm::vec3& Color() const { return m_settings.color; }
+    void SetColor(const glm::vec3& color) { m_settings.color = color; }
+
+    // Scene Editor support: shifts every particle (and its trail history) by
+    // `delta`, moving the whole cluster without disturbing its velocities or
+    // internal spread -- used to reposition an already-spawned star.
+    void Translate(const glm::dvec3& delta);
 
     // For Physics::GravitySource construction (mutual gravity, see
     // App.cpp): this star's current center of mass (plain average of live

@@ -4,9 +4,12 @@
 #include <cmath>
 #include <cstdio>
 
-// Legacy fixed-function GL entry points (glBegin/glVertex/glMatrixMode/...)
-// are exported directly by opengl32.lib on Windows, so no extension loader
-// is needed for this debug-view renderer.
+// GLEW must come before any GL header (including the one GLFW pulls in) --
+// it's what exposes the modern shader/FBO entry points DrawFullscreenTextureWithGlare
+// uses below, on top of the legacy fixed-function ones
+// (glBegin/glVertex/glMatrixMode/...) that opengl32.lib already exports
+// directly on Windows and the rest of this debug-view renderer still uses.
+#include <GL/glew.h>
 #include <GLFW/glfw3.h>
 
 #define GLM_ENABLE_EXPERIMENTAL
@@ -29,6 +32,260 @@ constexpr double kPi = glm::pi<double>();
 #endif
 
 namespace Rendering {
+
+namespace {
+
+// GPU bloom pipeline backing DrawFullscreenTextureWithGlare -- replaces the
+// old CPU ApplyGlare (bright-pass + box blur over every pixel on the host)
+// with the same idea done as GPU shader passes instead, since even a
+// multithreaded CPU blur over a full HDR framebuffer every time the camera
+// moves is real, visible lag that a GPU eats for free. Lazily created (a GL
+// context must already exist) and resized whenever the source texture's
+// resolution changes; everything here lives for the process's lifetime, same
+// as Renderer's own m_uploadedTexture.
+struct GlareGpuState {
+    bool initialized = false;
+    GLuint vao = 0, vbo = 0;
+    GLuint brightProgram = 0, blurProgram = 0, compositeProgram = 0;
+    GLuint fbo[2] = {0, 0};
+    GLuint tex[2] = {0, 0};
+    int width = 0, height = 0;
+};
+GlareGpuState g_glare;
+
+GLuint CompileGlareProgram(const char* vertexSource, const char* fragmentSource) {
+    GLuint vertex = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vertex, 1, &vertexSource, nullptr);
+    glCompileShader(vertex);
+
+    GLuint fragment = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fragment, 1, &fragmentSource, nullptr);
+    glCompileShader(fragment);
+
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vertex);
+    glAttachShader(program, fragment);
+    glLinkProgram(program);
+
+    GLint linked = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &linked);
+    if (!linked) {
+        GLchar log[1024];
+        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
+        std::fprintf(stderr, "Rendering::ApplyGlare (GPU): shader link failed: %s\n", log);
+    }
+
+    glDeleteShader(vertex);
+    glDeleteShader(fragment);
+    return program;
+}
+
+constexpr const char* kGlareQuadVertexShader = R"glsl(
+#version 330 core
+layout(location = 0) in vec2 aPos;
+out vec2 vUv;
+void main() {
+    vUv = aPos * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+)glsl";
+
+constexpr const char* kGlareBrightFragmentShader = R"glsl(
+#version 330 core
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler2D uTex;
+uniform float uThreshold;
+void main() {
+    // Flip V: `uTex` is the raw lensed-render texture (row 0 = top of
+    // image, same data UploadImage/DrawFullscreenTexture use), so this has
+    // to apply the same flip DrawFullscreenTexture's texcoords do -- every
+    // later pass in this pipeline (blur, composite's uGlow) samples
+    // textures THIS pipeline produced, so they stay consistent without
+    // needing the flip again; only this first read of the external source
+    // texture, and the composite pass's uBase read of that same texture,
+    // need it.
+    vec3 c = texture(uTex, vec2(vUv.x, 1.0 - vUv.y)).rgb;
+    float luminance = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    outColor = vec4(luminance > uThreshold ? c : vec3(0.0), 1.0);
+}
+)glsl";
+
+// Small fixed 5-tap Gaussian, applied separably (H then V) and repeated a
+// few times -- same "repeated small blur approximates a big one" idea the
+// old CPU sliding-window box blur relied on, just spent as a handful of
+// full-screen draw calls instead of a huge per-pixel sample window.
+constexpr const char* kGlareBlurFragmentShader = R"glsl(
+#version 330 core
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler2D uTex;
+uniform vec2 uTexelStep;
+void main() {
+    vec3 sum = texture(uTex, vUv).rgb * 0.227027;
+    sum += texture(uTex, vUv + uTexelStep * 1.3846153846).rgb * 0.3162162162;
+    sum += texture(uTex, vUv - uTexelStep * 1.3846153846).rgb * 0.3162162162;
+    sum += texture(uTex, vUv + uTexelStep * 3.2307692308).rgb * 0.0702702703;
+    sum += texture(uTex, vUv - uTexelStep * 3.2307692308).rgb * 0.0702702703;
+    outColor = vec4(sum, 1.0);
+}
+)glsl";
+
+constexpr const char* kGlareCompositeFragmentShader = R"glsl(
+#version 330 core
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler2D uBase;
+uniform sampler2D uGlow;
+uniform float uIntensity;
+void main() {
+    // uBase is the same raw external texture the bright-pass shader reads
+    // (see its own comment) -- same flip needed here. uGlow is this
+    // pipeline's own blurred result, already in the flipped/correct
+    // orientation, so it's sampled as-is.
+    vec3 base = texture(uBase, vec2(vUv.x, 1.0 - vUv.y)).rgb;
+    vec3 glow = texture(uGlow, vUv).rgb;
+    outColor = vec4(base + glow * uIntensity, 1.0);
+}
+)glsl";
+
+GLuint CreateGlareTarget(GLuint& fbo, int width, int height) {
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    // 16-bit float storage, not the usual 8-bit: the bright-pass threshold
+    // is luminance > 1.0, i.e. values an ordinary LDR target would already
+    // have clipped.
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, width, height, 0, GL_RGB, GL_FLOAT, nullptr);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    if (fbo == 0) glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    return tex;
+}
+
+void EnsureGlareResources(int width, int height) {
+    if (!g_glare.initialized) {
+        g_glare.initialized = true;
+
+        // A single NDC-space quad (two triangles) covering the whole
+        // viewport -- every pass below just reuses this with a different
+        // shader/target bound, the standard full-screen-post-process setup.
+        constexpr float kQuadVertices[] = {
+            -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f,
+            -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
+        };
+        glGenVertexArrays(1, &g_glare.vao);
+        glGenBuffers(1, &g_glare.vbo);
+        glBindVertexArray(g_glare.vao);
+        glBindBuffer(GL_ARRAY_BUFFER, g_glare.vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(kQuadVertices), kQuadVertices, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
+        glBindVertexArray(0);
+
+        g_glare.brightProgram = CompileGlareProgram(kGlareQuadVertexShader, kGlareBrightFragmentShader);
+        g_glare.blurProgram = CompileGlareProgram(kGlareQuadVertexShader, kGlareBlurFragmentShader);
+        g_glare.compositeProgram = CompileGlareProgram(kGlareQuadVertexShader, kGlareCompositeFragmentShader);
+    }
+
+    if (g_glare.width != width || g_glare.height != height) {
+        g_glare.width = width;
+        g_glare.height = height;
+        if (g_glare.tex[0]) glDeleteTextures(1, &g_glare.tex[0]);
+        if (g_glare.tex[1]) glDeleteTextures(1, &g_glare.tex[1]);
+        g_glare.tex[0] = CreateGlareTarget(g_glare.fbo[0], width, height);
+        g_glare.tex[1] = CreateGlareTarget(g_glare.fbo[1], width, height);
+    }
+}
+
+// Backs DrawWormholeEffect (App.cpp's "capturedByBlackHole" wormhole
+// sequence, No Man's Sky-style jump between catalog locations) -- a single
+// shader pass, not a multi-FBO pipeline like glare above, since this just
+// warps/tints the already-displayed texture rather than needing its own
+// blurred render target.
+struct WormholeGpuState {
+    bool initialized = false;
+    GLuint vao = 0, vbo = 0;
+    GLuint program = 0;
+};
+WormholeGpuState g_wormhole;
+
+constexpr const char* kWormholeFragmentShader = R"glsl(
+#version 330 core
+in vec2 vUv;
+out vec4 outColor;
+uniform sampler2D uTex;
+uniform float uProgress; // 0..1 across the whole sequence (App.cpp's wormholeElapsed / duration)
+uniform float uTime;     // free-running seconds, animates the tunnel rings
+uniform bool uFlipped;   // see DrawWormholeEffect's own comment
+
+void main() {
+    vec2 uv = uFlipped ? vec2(vUv.x, 1.0 - vUv.y) : vUv;
+    vec2 toCenter = uv - vec2(0.5, 0.5);
+    float dist = length(toCenter);
+    vec2 dir = dist > 0.0001 ? toCenter / dist : vec2(0.0);
+
+    // Falls to 0 at both ends of the sequence, peaks at the midpoint --
+    // that peak is exactly when App.cpp performs the actual catalog jump,
+    // so the strongest warp/flash hides the instant camera-position cut.
+    float pull = sin(clamp(uProgress, 0.0, 1.0) * 3.14159265);
+
+    // Radial motion-streak: average samples pulled outward from center,
+    // the classic "falling through a tunnel at speed" look.
+    vec3 streak = vec3(0.0);
+    const int kSamples = 10;
+    for (int i = 0; i < kSamples; ++i) {
+        float t = float(i) / float(kSamples - 1);
+        vec2 sampleUv = clamp(uv - dir * t * pull * 0.6, 0.0, 1.0);
+        streak += texture(uTex, sampleUv).rgb;
+    }
+    streak /= float(kSamples);
+
+    // Pulsing concentric rings racing toward the viewer, tinted blue/violet
+    // -- reads as a wormhole tunnel's walls rather than a plain radial blur.
+    float rings = sin(dist * 50.0 - uTime * 18.0) * 0.5 + 0.5;
+    vec3 tunnelGlow = vec3(0.45, 0.65, 1.0) * rings * pull * (1.0 - smoothstep(0.0, 0.6, dist));
+
+    vec3 color = streak + tunnelGlow;
+
+    // White/blue flash right at the midpoint, strong enough to fully
+    // obscure the frame for a few frames around the actual jump.
+    vec3 flashColor = vec3(0.85, 0.92, 1.0);
+    float flash = smoothstep(0.7, 1.0, pull);
+    color = mix(color, flashColor, flash);
+
+    outColor = vec4(color, 1.0);
+}
+)glsl";
+
+void EnsureWormholeResources() {
+    if (g_wormhole.initialized) return;
+    g_wormhole.initialized = true;
+
+    constexpr float kQuadVertices[] = {
+        -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f,
+        -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
+    };
+    glGenVertexArrays(1, &g_wormhole.vao);
+    glGenBuffers(1, &g_wormhole.vbo);
+    glBindVertexArray(g_wormhole.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, g_wormhole.vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(kQuadVertices), kQuadVertices, GL_STATIC_DRAW);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
+    glBindVertexArray(0);
+
+    g_wormhole.program = CompileGlareProgram(kGlareQuadVertexShader, kWormholeFragmentShader);
+}
+
+} // namespace
 
 void Renderer::BeginFrame(const Camera& camera, float aspectRatio, int viewportWidth, int viewportHeight) {
     glViewport(0, 0, viewportWidth, viewportHeight);
@@ -379,7 +636,14 @@ unsigned int Renderer::UploadImage(const std::vector<glm::vec3>& pixels, int wid
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_FLOAT, pixels.data());
+        // Sized float internal format, not plain GL_RGB: an unsized
+        // internal format lets the driver pick an 8-bit normalized store,
+        // which silently clamps every pixel to [0,1] on upload. That
+        // destroyed the HDR headroom DrawFullscreenTextureWithGlare's
+        // bright-pass shader depends on (its threshold is luminance > 1.0),
+        // so glare computed to effectively nothing no matter the pixel
+        // data actually being traced above 1.0 before this fix.
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, width, height, 0, GL_RGB, GL_FLOAT, pixels.data());
         m_uploadedTexture = texture;
         m_uploadedWidth = width;
         m_uploadedHeight = height;
@@ -409,6 +673,134 @@ void Renderer::DrawFullscreenTexture(unsigned int texture) const {
 
     glBindTexture(GL_TEXTURE_2D, 0);
     glDisable(GL_TEXTURE_2D);
+}
+
+void Renderer::DrawFullscreenTextureWithGlare(unsigned int texture, int width, int height, float intensity,
+                                               float radius) const {
+    if (intensity <= 0.0f || width <= 0 || height <= 0) {
+        DrawFullscreenTexture(texture);
+        return;
+    }
+
+    EnsureGlareResources(width, height);
+
+    // The bright-pass/blur passes below render into their own FBOs at
+    // `width`x`height` (the render's internal resolution, which can be
+    // lower than the window) -- save the caller's viewport/framebuffer so
+    // the final composite (and everything the rest of the frame draws
+    // afterward) lands back at the real window size.
+    GLint previousViewport[4];
+    glGetIntegerv(GL_VIEWPORT, previousViewport);
+    GLint previousFbo = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previousFbo);
+
+    glDisable(GL_DEPTH_TEST);
+    glViewport(0, 0, width, height);
+    glBindVertexArray(g_glare.vao);
+
+    // 1) Bright-pass: threshold `texture` into tex[0].
+    glBindFramebuffer(GL_FRAMEBUFFER, g_glare.fbo[0]);
+    glUseProgram(g_glare.brightProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glUniform1i(glGetUniformLocation(g_glare.brightProgram, "uTex"), 0);
+    glUniform1f(glGetUniformLocation(g_glare.brightProgram, "uThreshold"), 1.0f);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    // 2) A handful of small separable blur passes, ping-ponging tex[0] and
+    // tex[1] -- see kGlareBlurFragmentShader's comment. `radius` (same
+    // 0..0.3 fractional-image-size slider ApplyGlare used) maps to an
+    // iteration count rather than a sample-window size, since each
+    // iteration here is one full-screen draw call, not a per-pixel loop.
+    const int iterations = std::clamp(static_cast<int>(radius * 40.0f), 1, 12);
+    glUseProgram(g_glare.blurProgram);
+    const GLint texelStepLoc = glGetUniformLocation(g_glare.blurProgram, "uTexelStep");
+    glUniform1i(glGetUniformLocation(g_glare.blurProgram, "uTex"), 0);
+    int src = 0, dst = 1;
+    for (int i = 0; i < iterations; ++i) {
+        glBindFramebuffer(GL_FRAMEBUFFER, g_glare.fbo[dst]);
+        glBindTexture(GL_TEXTURE_2D, g_glare.tex[src]);
+        glUniform2f(texelStepLoc, 1.0f / static_cast<float>(width), 0.0f);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        std::swap(src, dst);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, g_glare.fbo[dst]);
+        glBindTexture(GL_TEXTURE_2D, g_glare.tex[src]);
+        glUniform2f(texelStepLoc, 0.0f, 1.0f / static_cast<float>(height));
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        std::swap(src, dst);
+    }
+
+    // 3) Composite base + blurred glow back at the caller's real
+    // viewport/framebuffer.
+    glBindFramebuffer(GL_FRAMEBUFFER, previousFbo);
+    glViewport(previousViewport[0], previousViewport[1], previousViewport[2], previousViewport[3]);
+    glUseProgram(g_glare.compositeProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glUniform1i(glGetUniformLocation(g_glare.compositeProgram, "uBase"), 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, g_glare.tex[src]);
+    glUniform1i(glGetUniformLocation(g_glare.compositeProgram, "uGlow"), 1);
+    glUniform1f(glGetUniformLocation(g_glare.compositeProgram, "uIntensity"), intensity);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
+    glBindVertexArray(0);
+}
+
+void Renderer::DrawWormholeEffect(unsigned int texture, float progress, float timeSeconds,
+                                   bool textureIsFlippedVertically) const {
+    EnsureWormholeResources();
+
+    glDisable(GL_DEPTH_TEST);
+    glBindVertexArray(g_wormhole.vao);
+    glUseProgram(g_wormhole.program);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glUniform1i(glGetUniformLocation(g_wormhole.program, "uTex"), 0);
+    glUniform1f(glGetUniformLocation(g_wormhole.program, "uProgress"), progress);
+    glUniform1f(glGetUniformLocation(g_wormhole.program, "uTime"), timeSeconds);
+    glUniform1i(glGetUniformLocation(g_wormhole.program, "uFlipped"), textureIsFlippedVertically ? 1 : 0);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
+    glBindVertexArray(0);
+}
+
+unsigned int Renderer::CaptureFramebufferTexture(int width, int height) const {
+    if (width <= 0 || height <= 0) return m_captureTexture;
+
+    if (m_captureTexture == 0) {
+        glGenTextures(1, &m_captureTexture);
+        glBindTexture(GL_TEXTURE_2D, m_captureTexture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, m_captureTexture);
+    }
+
+    if (m_captureWidth != width || m_captureHeight != height) {
+        // glCopyTexImage2D (re)allocates storage at the new size and fills
+        // it from the currently-bound read framebuffer in one call --
+        // exactly what's needed on a resolution change; glCopyTexSubImage2D
+        // below is the cheaper same-size path, same split as UploadImage.
+        glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, width, height, 0);
+        m_captureWidth = width;
+        m_captureHeight = height;
+    } else {
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, width, height);
+    }
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return m_captureTexture;
 }
 
 } // namespace Rendering

@@ -91,6 +91,15 @@ glm::dvec3 StarBody::CenterOfMass() const {
     return liveCount > 0 ? sum / static_cast<double>(liveCount) : glm::dvec3(0.0);
 }
 
+void StarBody::Translate(const glm::dvec3& delta) {
+    for (StarParticle& particle : m_particles) {
+        particle.position += delta;
+        for (glm::dvec3& trailPoint : particle.trail) {
+            trailPoint += delta;
+        }
+    }
+}
+
 double StarBody::CurrentMassKg() const {
     if (m_particles.empty()) return 0.0;
     int liveCount = 0;

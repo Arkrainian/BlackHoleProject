@@ -46,13 +46,15 @@ out vec4 FragColor;
 
 uniform sampler2D diffuseMap;
 uniform vec3 lightDirection; // points FROM the light TOWARD the surface
+uniform vec3 lightColor;
+uniform float lightIntensity;
 
 void main() {
     vec3 normal = normalize(vNormal);
     float diffuse = max(dot(normal, -lightDirection), 0.0);
-    float lighting = 0.25 + 0.75 * diffuse; // ambient floor + Lambertian term
+    float lighting = 0.25 + 0.75 * diffuse * lightIntensity; // ambient floor + Lambertian term
     vec3 albedo = texture(diffuseMap, vTexCoord).rgb;
-    FragColor = vec4(albedo * lighting, 1.0);
+    FragColor = vec4(albedo * lighting * lightColor, 1.0);
 }
 )glsl";
 
@@ -111,7 +113,8 @@ bool JetRenderer::Load(const std::string& modelPath, const std::string& textureP
 }
 
 void JetRenderer::Draw(const glm::vec3& position, const glm::quat& rotation, const glm::mat4& view,
-                       const glm::mat4& projection, const glm::vec3& lightDirection) const {
+                       const glm::mat4& projection, const glm::vec3& lightDirection,
+                       const glm::vec3& lightColor, float lightIntensity) const {
     if (!m_loaded) return;
 
     // Same fixup rotation the source project applies at draw time to align
@@ -129,6 +132,8 @@ void JetRenderer::Draw(const glm::vec3& position, const glm::quat& rotation, con
     m_shader->SetMat4("view", view);
     m_shader->SetMat4("projection", projection);
     m_shader->SetVec3("lightDirection", glm::normalize(lightDirection));
+    m_shader->SetVec3("lightColor", lightColor);
+    m_shader->SetFloat("lightIntensity", lightIntensity);
 
     // The jet's thin single-sided panels (flaps, canopy frame, pylons) look
     // wrong with back-face culling on, same reasoning as the source

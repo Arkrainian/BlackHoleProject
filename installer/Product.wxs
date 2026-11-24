@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <Package Name="Black Hole Simulator"
+            Manufacturer="Black Hole Simulator Project"
+            Version="1.1.0.0"
+            UpgradeCode="8be82f05-58d7-49f1-a7fd-69ca5b8ebb7d"
+            Compressed="yes"
+            Scope="perMachine">
+
+    <SummaryInformation Keywords="Installer" Description="Black Hole Simulator Setup" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Black Hole Simulator is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Black Hole Simulator">
+        <Directory Id="ResourcesDir" Name="resources">
+          <Directory Id="FontsDir" Name="fonts" />
+          <Directory Id="JetDir" Name="jet" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Black Hole Simulator" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder" />
+
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="MainExecutable" Guid="7c2a6e7c-2d44-4f6d-8f90-2a9d2a0f9c11">
+        <File Id="BlackHoleSimulatorExe" Source="..\build\BlackHoleSimulator.exe" KeyPath="yes" />
+      </Component>
+
+      <Component Id="FontFile" Directory="FontsDir" Guid="4b2f6f5e-3b2a-4b1b-9a4a-1c6a1e9a4f21">
+        <File Id="DroidSansTtf" Source="..\resources\fonts\DroidSans.ttf" KeyPath="yes" />
+      </Component>
+
+      <Component Id="JetModel" Directory="JetDir" Guid="9d1a5c3e-6f2b-4a8d-9b7e-3e8c7a2b5d44">
+        <File Id="EnduranceGlb" Source="..\resources\jet\endurance.glb" KeyPath="yes" />
+      </Component>
+
+      <Component Id="JetTexture" Directory="JetDir" Guid="1e6a9f2d-4c3b-4e7a-8f1d-5b9a3c2e7d88">
+        <File Id="EnduranceBasecolorPng" Source="..\resources\jet\endurance_basecolor.png" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="ApplicationShortcutStartMenu" Directory="ApplicationProgramsFolder" Guid="2f8c4a1e-7b3d-4f6a-9c2e-8a5d1b3e6f99">
+      <Shortcut Id="StartMenuShortcut"
+                Name="Black Hole Simulator"
+                Description="Launch the Black Hole Simulator"
+                Target="[INSTALLFOLDER]BlackHoleSimulator.exe"
+                WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\BlackHoleSimulator" Name="StartMenuShortcutInstalled" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Component Id="ApplicationShortcutDesktop" Directory="DesktopFolder" Guid="6a3e9d2c-1f4b-4a8e-9d6c-2b7e4f1a8c33">
+      <Shortcut Id="DesktopShortcut"
+                Name="Black Hole Simulator"
+                Description="Launch the Black Hole Simulator"
+                Target="[INSTALLFOLDER]BlackHoleSimulator.exe"
+                WorkingDirectory="INSTALLFOLDER" />
+      <RegistryValue Root="HKCU" Key="Software\BlackHoleSimulator" Name="DesktopShortcutInstalled" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="MainFeature" Title="Black Hole Simulator" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentRef Id="ApplicationShortcutStartMenu" />
+      <ComponentRef Id="ApplicationShortcutDesktop" />
+    </Feature>
+
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+    <ui:WixUI Id="WixUI_InstallDir" />
+
+  </Package>
+</Wix>

@@ -52,6 +52,15 @@ public:
     // origin from +Z, not away from it -- see Forward() below.
     double freeFlyYawRadians = 3.14159265358979323846;
     double freeFlyPitchRadians = 0.0;
+    // Roll around Forward(), applied in OrthonormalBasis() on top of the
+    // normal world-up-relative right/up -- almost always 0 (FreeFly is
+    // ordinarily a "no bank" fly-around camera). Exists so Photo Mode
+    // (App.cpp) can carry over a Jet-mode view's bank/roll (e.g. the
+    // Endurance's own up-vector, which App.cpp intentionally tilts off
+    // world-up so the accretion disk renders level -- see jetSpawnPosition's
+    // comment) instead of snapping back to world-up and un-leveling the
+    // disk the instant Photo Mode converts Jet -> FreeFly.
+    double freeFlyRollRadians = 0.0;
 
     // --- Jet state (written externally each frame, see App.cpp) ---
     glm::dvec3 jetPosition{0.0};
@@ -105,6 +114,19 @@ public:
         basis.forward = forward;
         basis.right = glm::normalize(glm::cross(forward, up));
         basis.up = glm::cross(basis.right, forward);
+
+        // See freeFlyRollRadians's comment -- a plain rotation of the
+        // (right, up) pair around forward, by whatever angle Photo Mode's
+        // Jet->FreeFly conversion (App.cpp) worked out reproduces the
+        // Jet view's own up-vector exactly.
+        if (mode == Mode::FreeFly && freeFlyRollRadians != 0.0) {
+            const double c = std::cos(freeFlyRollRadians);
+            const double s = std::sin(freeFlyRollRadians);
+            const glm::dvec3 right = basis.right;
+            const glm::dvec3 up2 = basis.up;
+            basis.right = right * c + up2 * s;
+            basis.up = up2 * c - right * s;
+        }
         return basis;
     }
 

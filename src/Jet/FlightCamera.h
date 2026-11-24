@@ -25,19 +25,15 @@ public:
 
     float chaseDistance = 3.0f;
     float chaseHeight = 1.0f;
-    float smoothness = 0.9f;
 
     FlightCamera();
 
-    void Update(const glm::vec3& jetPos, const glm::quat& jetRot, float deltaTime);
+    void Update(const glm::vec3& jetPos, const glm::quat& jetRot);
     void CycleMode();
 
 private:
-    void UpdateChaseCamera(const glm::vec3& jetPos, const glm::quat& jetRot, float deltaTime);
+    void UpdateChaseCamera(const glm::vec3& jetPos, const glm::quat& jetRot);
     void UpdateCockpitCamera(const glm::vec3& jetPos, const glm::quat& jetRot);
-
-    glm::vec3 smoothPosition;
-    glm::vec3 smoothTarget;
 };
 
 } // namespace Jet

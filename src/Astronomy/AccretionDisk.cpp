@@ -67,7 +67,17 @@ glm::vec3 AccretionDisk::EmittedColor(double temperature) const {
     // product IS the disk's actual local effective temperature in Kelvin
     // (see RecomputePeakKelvin()), not an arbitrary color-ramp fudge.
     const double effectiveKelvin = m_peakKelvin * temperature;
-    const glm::vec3 hue = ApproximateBlackbodyHue(effectiveKelvin);
+    // Movie-accurate mode (AccretionDiskSettings::movieAccurateColors):
+    // swap the real blackbody hue for a fixed warm gold/white tint instead
+    // of deriving it from effectiveKelvin -- the actual Interstellar disk
+    // was never that blue/white because Double Negative deliberately
+    // suppressed its color-temperature variation (see that field's
+    // comment); this reproduces that choice rather than the physics.
+    // Brightness below still comes from the real T^4 law, so lensing/
+    // redshift/Doppler beaming still dim and brighten the disk exactly as
+    // before -- only the hue is faked.
+    const glm::vec3 hue = m_settings.movieAccurateColors ? glm::vec3(1.0f, 0.82f, 0.55f)
+                                                          : ApproximateBlackbodyHue(effectiveKelvin);
 
     // Stefan-Boltzmann: radiated intensity ~ T^4. This is also exactly what
     // makes redshift correctly dim/brighten the disk (relativistic beaming)

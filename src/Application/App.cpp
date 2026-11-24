@@ -19,6 +19,7 @@
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/constants.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 #include <imgui.h>
 #include <backends/imgui_impl_glfw.h>
@@ -26,6 +27,7 @@
 
 #include <chrono>
 
+#include "Application/SceneFile.h"
 #include "Astronomy/AccretionDisk.h"
 #include "Astronomy/Blackbody.h"
 #include "Astronomy/StarTexture.h"
@@ -369,6 +371,12 @@ RayTracing::CameraFrame BuildCameraFrame(const Rendering::Camera& camera, int re
 // hardcoded constant so it can be raised or lowered for different hardware.
 constexpr int kDefaultMaxRenderPixels = 1'500'000;
 
+// Auto-adjust-resolution tuning (see autoQualityScale in App::Run): target
+// ~30 fps, with a dead zone around it (1.15x/0.6x of the target) so the
+// scale doesn't hunt back and forth frame to frame off ordinary jitter.
+constexpr double kAutoAdjustTargetFrameMs = 33.0;
+constexpr double kAutoAdjustMinScale = 0.05;
+
 // Kerr's per-step cost is much higher than Schwarzschild's -- every RK4
 // stage needs its own sin/cos pair (KerrGeodesicMath::RK4Step), where
 // Schwarzschild's u(phi) RK4Step is pure polynomial arithmetic -- so
@@ -412,6 +420,81 @@ std::pair<int, int> ComputeRenderResolution(int fbWidth, int fbHeight, double sc
         h = std::max(1, static_cast<int>(h * shrink));
     }
     return {w, h};
+}
+
+// Live mode (see PerformRender) re-traces every pixel every frame on the
+// assumption that the camera or scene might have moved -- but most of the
+// time spent just LOOKING at the render, nothing has actually changed
+// since last frame, and re-tracing is pure wasted work. This snapshot
+// captures every input PerformRender actually reads (camera frame,
+// resolution, disk/binary/multi-body/starfield/Einstein-ring settings,
+// the black hole's mass/spin, and the tidal-flare brightness boost, which
+// decays over time on its own); SameRenderInputs below does the actual
+// comparison. If a future setting is added to PerformRender without also
+// being added here, the symptom is a stale image when that setting
+// changes but nothing else does -- not a silent physics error, since
+// liveMode's own re-render-every-frame behavior (and the "Render" button
+// in non-live/Advanced mode) still exists untouched as a fallback whenever
+// this skip doesn't fire.
+struct RenderInputsSnapshot {
+    RayTracing::CameraFrame frame;
+    int width = 0;
+    int height = 0;
+    bool checkDisk = false;
+    double spin = 0.0;
+    Astronomy::AccretionDiskSettings diskSettings;
+    double tidalBoost = 0.0;
+    bool binaryEnabled = false;
+    Physics::BinarySystem binarySystem;
+    std::vector<Physics::ExtraBlackHole> extraBlackHoles;
+    double blackHoleMassKg = 0.0;
+    Astronomy::StarField::Settings starSettings;
+    bool useEinsteinRingSource = false;
+    double sourceAngularRadius = 0.0;
+    double sourceBrightness = 0.0;
+};
+
+bool SameRenderInputs(const RenderInputsSnapshot& a, const RenderInputsSnapshot& b) {
+    if (a.width != b.width || a.height != b.height || a.checkDisk != b.checkDisk || a.spin != b.spin ||
+        a.binaryEnabled != b.binaryEnabled || a.blackHoleMassKg != b.blackHoleMassKg ||
+        a.useEinsteinRingSource != b.useEinsteinRingSource || a.sourceAngularRadius != b.sourceAngularRadius ||
+        a.sourceBrightness != b.sourceBrightness || a.tidalBoost != b.tidalBoost) {
+        return false;
+    }
+    if (a.frame.position != b.frame.position || a.frame.forward != b.frame.forward ||
+        a.frame.right != b.frame.right || a.frame.up != b.frame.up ||
+        a.frame.tanHalfFovY != b.frame.tanHalfFovY || a.frame.aspect != b.frame.aspect) {
+        return false;
+    }
+    if (a.diskSettings.innerRadius != b.diskSettings.innerRadius || a.diskSettings.outerRadius != b.diskSettings.outerRadius ||
+        a.diskSettings.temperatureScale != b.diskSettings.temperatureScale ||
+        a.diskSettings.brightnessScale != b.diskSettings.brightnessScale ||
+        a.diskSettings.clockwise != b.diskSettings.clockwise ||
+        a.diskSettings.relativisticEffects != b.diskSettings.relativisticEffects ||
+        a.diskSettings.eddingtonFraction != b.diskSettings.eddingtonFraction ||
+        a.diskSettings.radiativeEfficiency != b.diskSettings.radiativeEfficiency) {
+        return false;
+    }
+    if (a.binarySystem.massRatio != b.binarySystem.massRatio || a.binarySystem.separation != b.binarySystem.separation ||
+        a.binarySystem.phase != b.binarySystem.phase) {
+        return false;
+    }
+    if (a.starSettings.density != b.starSettings.density || a.starSettings.brightness != b.starSettings.brightness ||
+        a.starSettings.angularStarRadius != b.starSettings.angularStarRadius ||
+        a.starSettings.cellSizeRadians != b.starSettings.cellSizeRadians || a.starSettings.seed != b.starSettings.seed) {
+        return false;
+    }
+    if (a.extraBlackHoles.size() != b.extraBlackHoles.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.extraBlackHoles.size(); ++i) {
+        const Physics::ExtraBlackHole& ea = a.extraBlackHoles[i];
+        const Physics::ExtraBlackHole& eb = b.extraBlackHoles[i];
+        if (ea.gmRatio != eb.gmRatio || ea.position != eb.position || ea.velocity != eb.velocity) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Stage 4: a single distant point source, used for the Einstein ring test.
@@ -637,6 +720,19 @@ int App::Run() {
     bool showUniverseMapWindow = false;
     bool universeMapKeyWasDown = false; // edge-detects the M press, same pattern as the jet's Tab/C handling
 
+    // "P" toggles Photo Mode: freezes the simulation and the ImGui panels
+    // get out of the way, dropping the camera into an ordinary FreeFly
+    // noclip so the view can be composed from anywhere, independent of
+    // whatever camera mode (Orbit/FreeFly/Jet) was active. Entering/
+    // exiting restores the camera mode, the Stage 1 pause state, and
+    // binary-orbit animation exactly as they were, so toggling Photo Mode
+    // is non-destructive to whatever the user was doing.
+    bool photoMode = false;
+    bool photoModeKeyWasDown = false;
+    Rendering::Camera::Mode photoModePreviousCameraMode = Rendering::Camera::Mode::FreeFly;
+    bool photoModePreviousPaused = false;
+    bool photoModePreviousBinaryOrbitAnimated = true;
+
     // --- Universe / Star Map (see Universe/StarCatalog.h) ---
     // Real stars/black holes/galaxies at their real distances/masses.
     // "Traveling" re-points this app's one black-hole-centered scene at a
@@ -649,6 +745,19 @@ int App::Run() {
     glm::dvec3 currentLocationLy = glm::dvec3(0.0); // real heliocentric position, in light-years, of wherever the most recent REAL travel (single object or real multi-star system) landed
     std::string currentLocationName = "Sol (home)";
     int universeSelectedIndex = 0;   // row currently highlighted in the Star Map table, not yet traveled to
+    std::mt19937 wormholeRng(std::random_device{}()); // picks the random destination when the jet crosses an event horizon
+
+    // --- Wormhole transition (No Man's Sky-style) --- Crossing the event
+    // horizon used to call TravelToUniverseIndex the SAME frame, an instant
+    // cut with no visual transition at all. Now it plays a short full-screen
+    // warp effect (Renderer::DrawWormholeEffect) first, and performs the
+    // actual catalog jump at the effect's brightest midpoint instead, so the
+    // jump itself is hidden behind the flash rather than visible as a cut.
+    bool wormholeActive = false;
+    double wormholeElapsedSeconds = 0.0;
+    constexpr double kWormholeDurationSeconds = 1.8;
+    int wormholeDestinationIndex = -1; // -1 = no other catalog entry to jump to (falls back to the old in-place reset)
+    bool wormholeJumped = false;       // true once the mid-sequence TravelToUniverseIndex/reset has fired
     bool inStarSystemView = false;   // true after traveling to a Star entry -- no GR metric to render there, see the dedicated render branch below
     int visitedStarIndex = -1;
     std::string lastTravelSummary;   // human-readable real distance/light-time for the most recent jump
@@ -830,6 +939,21 @@ int App::Run() {
     int stepsPerFrame = 2;
     bool showGrid = true;
     bool showWarpedGrid = false; // Flamm's-paraboloid funnel surface, see Renderer::DrawFlammParaboloid
+
+    // Location markers: a bright, unmissable wireframe sphere drawn
+    // directly AT each gravitating/orbital-destination object's real
+    // position (the black hole and its binary/extra companions in the
+    // main view; each star in Star System/Multi-Star View) -- requested
+    // directly ("add an option for physical markers on the star objects
+    // to see where it is") after the user reported still losing track of
+    // where things actually are while piloting. Distinct from the
+    // lensed/rendered IMAGE of the black hole (its shadow) on purpose: the
+    // shadow's apparent size/position is a lensing effect, not a literal
+    // outline of where the hole actually is in flat overlay space, which
+    // is exactly the disorientation this is meant to fix. Off by default
+    // (explicitly requested) -- a Simple-mode button and the Advanced-mode
+    // checkbox (Black Hole panel) both toggle this same flag, see below.
+    bool showLocationMarkers = false;
     bool showAnalyticCurve = true;
     bool showHorizon = true;
     bool showNewtonianTrajectories = true;
@@ -851,6 +975,24 @@ int App::Run() {
     // full-precision values, whether the camera is moving or not).
     double renderScalePercent = 80.0; // 10-100 -- full precision is mandatory (see above), so this is the main speed knob
     int maxRenderPixels = kDefaultMaxRenderPixels; // advanced-mode override of the ray budget cap, see ComputeRenderResolution
+
+    // Auto-adjusts the ACTUAL traced resolution below the Resolution
+    // slider's own floor (and back up toward it) based on the measured
+    // frame time, not guessed hardware specs -- this is what lets one
+    // build self-tune for everything from an old laptop's single-threaded
+    // CPU fallback to a fast discrete GPU, including machines far weaker
+    // than the slider's 10% floor alone can rescue. autoQualityScale
+    // multiplies renderScalePercent; 1.0 = no reduction. See the
+    // glfwGetFramebufferSize call in the main loop for the feedback step,
+    // and PerformRender for where it's actually applied.
+    bool autoAdjustResolution = true;
+    double autoQualityScale = 1.0;
+    double effectiveScalePercent = renderScalePercent; // = renderScalePercent * autoQualityScale, recomputed every frame below; declared here (not inside the loop) because PerformRender captures it by reference and is defined before the loop starts
+
+    // Cache for the "skip re-tracing a static scene" check inside
+    // PerformRender -- see RenderInputsSnapshot/SameRenderInputs above.
+    RenderInputsSnapshot lastRenderInputs;
+    bool hasLastRenderInputs = false;
     Astronomy::StarField::Settings starSettings;
     Astronomy::StarField starField(starSettings);
     unsigned int lensedTexture = 0;
@@ -1084,20 +1226,50 @@ int App::Run() {
     double lastFrameTime = glfwGetTime();
     double freeFlyMoveSpeed = 12.0; // sim units/sec at 1x -- Shift multiplies this
     bool freeFlyLooking = false;    // right mouse button held
-    Rendering::Camera::Mode previousCameraMode = camera.mode; // detects a mode switch this frame, to avoid a mouse-delta jump
 
     // --- Jet piloting mode (see src/Jet/) ---
     // Spawned well outside the disk/photon sphere, matching the scale the
     // Orbit/FreeFly presets already use, so the black hole is immediately
     // visible without the jet starting dangerously close to the horizon.
-    const glm::vec3 jetSpawnPosition(0.0f, 15.0f, 180.0f);
+    // The disk's equatorial plane is world z=0 (see GeodesicSolver.cpp's
+    // disk-crossing check, which triggers on a z-plane crossing) -- so the
+    // big coordinate here needs to be x (in-plane, giving a side view where
+    // the disk curves around the hole) rather than z (the polar axis,
+    // which looks straight down at the disk face-on from "above"). The
+    // small z component is just a slight tilt off the plane for a nicer
+    // three-quarter framing, same role the old spawn's small y played.
+    const glm::vec3 jetSpawnPosition(180.0f, 0.0f, 15.0f);
+
+    // FlightPhysics::Reset/the constructor always set identity rotation
+    // (facing world -Z, see FlightPhysics::GetForward), which only happens
+    // to point at the black hole when the spawn's big coordinate IS z --
+    // no longer true now that jetSpawnPosition's big coordinate is x (see
+    // above). Every jetSpawnPosition spawn/respawn below sets rotation to
+    // this right after, so the ship opens already facing the hole instead
+    // of pointed off to the side.
+    //
+    // The "up" hint passed to quatLookAt is NOT world-up (0,1,0) here --
+    // the disk lies in the world's X-Y plane (its normal is Z; see
+    // GeodesicSolver.cpp's disk-crossing check, which triggers on a
+    // z-plane crossing), so approaching it edge-on along X while treating
+    // world-Y as "up" points the camera's up-vector straight along one of
+    // the disk's OWN in-plane diameters -- the disk then renders as a
+    // thin vertical sliver (reported: "the accretion disk is vertically
+    // up") instead of a horizontal band, because the screen's horizontal
+    // axis ends up aligned with the disk's normal (where it has ~zero
+    // extent) rather than its other in-plane diameter. Using world-Z as
+    // the up hint instead banks the ship so ITS up-vector points along
+    // the disk's actual normal, which is what makes the disk render
+    // level/horizontal, curving around the hole the way a side view should.
+    const auto FaceOrigin = [](const glm::vec3& pos) {
+        return glm::quatLookAt(glm::normalize(-pos), glm::vec3(0.0f, 0.0f, 1.0f));
+    };
     Jet::FlightPhysics jetPhysics(jetSpawnPosition);
+    jetPhysics.rotation = FaceOrigin(jetSpawnPosition);
     Jet::InputHandler jetInput;
     Jet::FlightCamera jetFlightCamera;
     Jet::JetRenderer jetRenderer;
     bool jetRendererLoadAttempted = false; // load lazily on first use, see PerformRender's sibling below
-    bool jetMouseCaptured = true; // Tab toggles this while piloting, see the Jet input block
-    bool jetTabWasDown = false;   // edge-detects the Tab press above (GLFW has no "just pressed" query)
     bool jetCameraCycleKeyWasDown = false; // edge-detects the C press that cycles chase/cockpit view
     double jetMaxSpeedFractionOfC = jetPhysics.maxSpeedFractionOfC; // mirrors the slider below into FlightPhysics (SliderDouble needs a double*)
 
@@ -1111,13 +1283,308 @@ int App::Run() {
     // tens of units from a supermassive hole is effectively "far away and
     // invisible" if the next view is Star System View's 0-25-unit visual
     // scale, and vice versa).
-    auto ResetJetForArrival = [&](const glm::vec3& position) {
+    auto ResetJetForArrival = [&](const glm::vec3& position, const glm::quat& rotation = glm::identity<glm::quat>()) {
         jetPhysics.Reset(position);
+        jetPhysics.rotation = rotation;
         jetFlightCamera = Jet::FlightCamera();
-        jetFlightCamera.Update(jetPhysics.position, jetPhysics.rotation, 0.0f);
+        jetFlightCamera.Update(jetPhysics.position, jetPhysics.rotation);
         camera.jetPosition = glm::dvec3(jetFlightCamera.position);
         camera.jetForward = glm::dvec3(glm::normalize(jetFlightCamera.target - jetFlightCamera.position));
         camera.jetUp = glm::dvec3(jetFlightCamera.up);
+    };
+
+    // --- Scene Editor state (Blender-style object placement/behavior) ---
+    // See DrawSceneEditorPanelContents below for the panel built on top of
+    // this state, and GetShipTransform/GetLightDirection for how it feeds
+    // into the actual draw calls further down in this function.
+    enum class ShipSceneMode { Piloted, Parked, Orbiting };
+    ShipSceneMode shipSceneMode = ShipSceneMode::Piloted;
+    glm::vec3 shipParkedPosition = jetSpawnPosition;
+    glm::vec3 shipParkedEulerDegrees(0.0f, 0.0f, 0.0f); // pitch, yaw, roll
+    double shipOrbitRadius = 40.0;
+    double shipOrbitSpeedRadPerSec = 0.15;
+    double shipOrbitInclinationDegrees = 15.0;
+    double shipOrbitElapsedSeconds = 0.0;
+    // Off by default, same reasoning as Binary Black Holes' "Animate orbit"
+    // checkbox -- without this, switching to Orbiting immediately starts
+    // the ship moving every frame, which fights with trying to place/frame
+    // it precisely. With it off, shipOrbitPhase below is a direct,
+    // manually-set angle instead of one driven by elapsed time.
+    bool shipOrbitAnimated = false;
+    double shipOrbitPhase = 0.0;
+
+    enum class SceneLightMode { AutoFromBlackHole, Custom };
+    SceneLightMode sceneLightMode = SceneLightMode::AutoFromBlackHole;
+    float sceneLightAzimuthDegrees = 0.0f;
+    float sceneLightElevationDegrees = 30.0f;
+    glm::vec3 sceneLightColor(1.0f, 1.0f, 1.0f);
+    float sceneLightIntensity = 1.0f;
+
+    float diskGlareIntensity = 0.0f;
+    float diskGlareRadius = 0.05f;
+
+    bool showSceneEditorWindow = false;
+    bool sceneEditorKeyWasDown = false; // edge-detects the E press, same pattern as universeMapKeyWasDown
+    std::string sceneSaveLoadStatus;
+
+    // Loads the Endurance model/texture on first need -- shared by the
+    // "Pilot Endurance" button (main panel, further down) and the Scene
+    // Editor's Parked/Orbiting modes, so switching to either from the Scene
+    // Editor without ever pressing "Pilot Endurance" still shows the ship.
+    auto EnsureJetRendererLoaded = [&]() {
+        if (jetRendererLoadAttempted) return;
+        jetRendererLoadAttempted = true;
+        if (!jetRenderer.Load("resources/jet/endurance.glb", "resources/jet/endurance_basecolor.png", 3.0f)) {
+            std::fprintf(stderr, "Jet mode: model/texture failed to load -- piloting still works, but the jet won't be visible.\n");
+        }
+    };
+
+    // Returns the Endurance's current position/rotation for drawing,
+    // independent of whether it's actively being piloted (jetPhysics) or
+    // just placed/animated from the Scene Editor. Rotation follows
+    // Jet::FlightPhysics's convention (forward = rotation * (0,0,-1)).
+    auto GetShipTransform = [&]() -> std::pair<glm::vec3, glm::quat> {
+        if (shipSceneMode == ShipSceneMode::Parked) {
+            const glm::vec3 eulerRadians = glm::radians(shipParkedEulerDegrees);
+            return {shipParkedPosition, glm::quat(eulerRadians)};
+        }
+        if (shipSceneMode == ShipSceneMode::Orbiting) {
+            const double angle = shipOrbitAnimated ? shipOrbitElapsedSeconds * shipOrbitSpeedRadPerSec : shipOrbitPhase;
+            const double inclination = glm::radians(shipOrbitInclinationDegrees);
+            const glm::vec3 position(
+                static_cast<float>(shipOrbitRadius * std::cos(angle)),
+                static_cast<float>(shipOrbitRadius * std::sin(angle) * std::sin(inclination)),
+                static_cast<float>(shipOrbitRadius * std::sin(angle) * std::cos(inclination)));
+            const glm::vec3 forward = glm::normalize(glm::vec3(
+                static_cast<float>(-std::sin(angle)), 0.0f, static_cast<float>(std::cos(angle))));
+            // Build a rotation whose local -Z axis points along `forward`
+            // (Jet::FlightPhysics's forward convention) -- the same basis
+            // construction glm::lookAt uses internally, just not inverted
+            // into a view matrix, so this doesn't need the experimental
+            // gtx quatLookAt header.
+            const glm::vec3 zAxis = -forward;
+            const glm::vec3 xAxis = glm::normalize(glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), zAxis));
+            const glm::vec3 yAxis = glm::cross(zAxis, xAxis);
+            const glm::mat3 basis(xAxis, yAxis, zAxis);
+            return {position, glm::quat_cast(basis)};
+        }
+        return {jetPhysics.position, jetPhysics.rotation};
+    };
+
+    // `lightDirection` convention is "points FROM the light TOWARD the
+    // surface" (see Jet::JetRenderer::Draw). Auto mode reproduces the
+    // original fixed behavior -- a light effectively at the black hole,
+    // shining out toward wherever the ship is; Custom lets the Scene
+    // Editor aim it anywhere, independent of the ship's position.
+    auto GetLightDirection = [&](const glm::vec3& shipPosition) -> glm::vec3 {
+        if (sceneLightMode == SceneLightMode::Custom) {
+            const float az = glm::radians(sceneLightAzimuthDegrees);
+            const float el = glm::radians(sceneLightElevationDegrees);
+            return glm::vec3(std::cos(el) * std::sin(az), std::sin(el), std::cos(el) * std::cos(az));
+        }
+        return glm::length(shipPosition) > 1e-4f ? glm::normalize(shipPosition) : glm::vec3(0.0f, 0.0f, -1.0f);
+    };
+
+    // Shared body of the Scene Editor UI -- used both inside the standalone
+    // "E"-toggled window and (nowhere else yet, but written the same way as
+    // DrawUniversePanelContents so a future Advanced-mode copy is trivial).
+    auto DrawSceneEditorPanelContents = [&]() {
+        ImGui::TextWrapped(
+            "Blender-style scene placement: the Endurance's position/behavior, the light's direction/"
+            "color, the accretion disk's color/glare, and any spawned stars'/planets' position/color. "
+            "Everything here mutates the SAME state the main panel's own controls use, nothing is a "
+            "separate copy.");
+
+        ImGui::SeparatorText("Endurance (ship)");
+        int shipModeInt = static_cast<int>(shipSceneMode);
+        ImGui::RadioButton("Piloted", &shipModeInt, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("Parked", &shipModeInt, 1);
+        ImGui::SameLine();
+        ImGui::RadioButton("Orbiting", &shipModeInt, 2);
+        if (shipModeInt != static_cast<int>(shipSceneMode)) {
+            shipSceneMode = static_cast<ShipSceneMode>(shipModeInt);
+            if (shipSceneMode != ShipSceneMode::Piloted) {
+                EnsureJetRendererLoaded();
+                if (shipSceneMode == ShipSceneMode::Orbiting) shipOrbitElapsedSeconds = 0.0;
+            }
+        }
+        HelpTooltip(
+            "'Piloted' is the normal 'Pilot Endurance' flight mode (main panel, below). 'Parked' and "
+            "'Orbiting' place/animate the ship without flying it -- useful for screenshots or a "
+            "background presence while you fly the camera freely.");
+
+        if (shipSceneMode == ShipSceneMode::Parked) {
+            ImGui::DragFloat3("Position (sim units)", &shipParkedPosition.x, 0.5f);
+            ImGui::DragFloat3("Rotation pitch/yaw/roll (deg)", &shipParkedEulerDegrees.x, 1.0f);
+        } else if (shipSceneMode == ShipSceneMode::Orbiting) {
+            ImGui::Checkbox("Animate orbit", &shipOrbitAnimated);
+            HelpTooltip("Off by default so placing the ship doesn't immediately send it moving -- turn this on once you actually want it circling.");
+            if (!shipOrbitAnimated) {
+                SliderDouble("Orbital phase (rad)", &shipOrbitPhase, -glm::pi<double>(), glm::pi<double>(), "%.3f");
+            } else {
+                SliderDouble("Orbit speed (rad/sec)", &shipOrbitSpeedRadPerSec, -1.0, 1.0, "%.3f");
+            }
+            SliderDouble("Orbit radius (sim units)", &shipOrbitRadius, 5.0, 200.0, "%.1f");
+            SliderDouble("Orbit inclination (deg)", &shipOrbitInclinationDegrees, -90.0, 90.0, "%.1f");
+        }
+        if (shipSceneMode != ShipSceneMode::Piloted && jetRendererLoadAttempted && !jetRenderer.IsLoaded()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "Endurance model/texture failed to load -- see stderr.");
+        }
+
+        ImGui::SeparatorText("Light");
+        int lightModeInt = static_cast<int>(sceneLightMode);
+        ImGui::RadioButton("Auto (from black hole)", &lightModeInt, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton("Custom direction", &lightModeInt, 1);
+        sceneLightMode = static_cast<SceneLightMode>(lightModeInt);
+        if (sceneLightMode == SceneLightMode::Custom) {
+            ImGui::SliderFloat("Azimuth (deg)", &sceneLightAzimuthDegrees, -180.0f, 180.0f);
+            ImGui::SliderFloat("Elevation (deg)", &sceneLightElevationDegrees, -90.0f, 90.0f);
+        }
+        ImGui::ColorEdit3("Light color", &sceneLightColor.x);
+        ImGui::SliderFloat("Light intensity", &sceneLightIntensity, 0.0f, 3.0f);
+        HelpTooltip("Only affects the Endurance's shading -- the accretion disk and background are self-luminous and unaffected by this light.");
+
+        ImGui::SeparatorText("Accretion disk");
+        ImGui::TextWrapped("Same settings as 'Black Hole' / 'Accretion Disk' below -- surfaced here too for convenience.");
+        needsRerender |= SliderDouble("Temperature scale", &diskSettings.temperatureScale, 0.1, 3.0, "%.2f");
+        needsRerender |= SliderDouble("Brightness scale", &diskSettings.brightnessScale, 0.01, 2.0, "%.3f");
+        needsRerender |= ImGui::Checkbox("Movie-accurate colors (Interstellar style)", &diskSettings.movieAccurateColors);
+        ImGui::Separator();
+        needsRerender |= ImGui::SliderFloat("Glare intensity", &diskGlareIntensity, 0.0f, 2.0f);
+        needsRerender |= ImGui::SliderFloat("Glare radius", &diskGlareRadius, 0.0f, 0.3f);
+        HelpTooltip(
+            "A stylistic screen-space glow around the brightest parts of the rendered image -- not a "
+            "physically-derived bloom, just a look you can dial in.");
+
+        ImGui::SeparatorText("Spawned stars");
+        if (stars.empty()) {
+            ImGui::TextDisabled("None spawned yet -- see 'Stars & Planets' below.");
+        }
+        for (size_t i = 0; i < stars.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            Astronomy::StarBody& star = stars[i];
+            glm::vec3 color = star.Color();
+            const glm::dvec3 centerD = star.CenterOfMass();
+            glm::vec3 center(static_cast<float>(centerD.x), static_cast<float>(centerD.y), static_cast<float>(centerD.z));
+            ImGui::Text("Star #%d", static_cast<int>(i));
+            if (ImGui::ColorEdit3("Color", &color.x)) star.SetColor(color);
+            if (ImGui::DragFloat3("Position", &center.x, 0.25f)) {
+                star.Translate(glm::dvec3(center) - centerD);
+            }
+            ImGui::PopID();
+        }
+
+        if (!planets.empty()) {
+            ImGui::SeparatorText("Spawned planets");
+            for (size_t i = 0; i < planets.size(); ++i) {
+                ImGui::PushID(static_cast<int>(i) + 10000);
+                Astronomy::PlanetBody& planet = planets[i];
+                glm::vec3 color = planet.BaseColor();
+                const glm::dvec3 centerD = planet.CenterOfMassSim();
+                glm::vec3 center(static_cast<float>(centerD.x), static_cast<float>(centerD.y), static_cast<float>(centerD.z));
+                ImGui::Text("Planet #%d", static_cast<int>(i));
+                if (ImGui::ColorEdit3("Color", &color.x)) planet.SetBaseColor(color);
+                if (ImGui::DragFloat3("Position", &center.x, 0.25f)) {
+                    planet.Translate(glm::dvec3(center) - centerD);
+                }
+                ImGui::PopID();
+            }
+        }
+
+        ImGui::SeparatorText("Save / Load Scene");
+        static char sceneNameBuffer[128] = "my_scene";
+        ImGui::InputText("Scene name", sceneNameBuffer, sizeof(sceneNameBuffer));
+        const std::string sceneSavePath = std::string("scenes/") + sceneNameBuffer + ".json";
+        HelpTooltip(
+            "Saves/loads everything on this panel (ship placement/behavior, light, disk color/glare, "
+            "black hole mass/spin, and spawned stars'/planets' position/color) to scenes/<name>.json. "
+            "Loading only repositions/recolors stars/planets ALREADY spawned here -- it won't spawn new "
+            "ones to match a scene saved with more of them.");
+        if (ImGui::Button("Save Scene")) {
+            Application::SceneState state;
+            state.shipMode = static_cast<int>(shipSceneMode);
+            state.shipParkedPosition = shipParkedPosition;
+            state.shipParkedEulerDegrees = shipParkedEulerDegrees;
+            state.shipOrbitRadius = shipOrbitRadius;
+            state.shipOrbitSpeedRadPerSec = shipOrbitSpeedRadPerSec;
+            state.shipOrbitInclinationDegrees = shipOrbitInclinationDegrees;
+            state.shipOrbitAnimated = shipOrbitAnimated;
+            state.shipOrbitPhase = shipOrbitPhase;
+            state.lightMode = static_cast<int>(sceneLightMode);
+            state.lightAzimuthDegrees = sceneLightAzimuthDegrees;
+            state.lightElevationDegrees = sceneLightElevationDegrees;
+            state.lightColor = sceneLightColor;
+            state.lightIntensity = sceneLightIntensity;
+            state.diskTemperatureScale = diskSettings.temperatureScale;
+            state.diskBrightnessScale = diskSettings.brightnessScale;
+            state.diskMovieAccurateColors = diskSettings.movieAccurateColors;
+            state.diskGlareIntensity = diskGlareIntensity;
+            state.diskGlareRadius = diskGlareRadius;
+            state.blackHoleMassSolar = blackHoleMassSolar;
+            state.blackHoleSpin = blackHoleSpin;
+            for (const Astronomy::StarBody& star : stars) {
+                const glm::dvec3 c = star.CenterOfMass();
+                state.stars.push_back({glm::vec3(c), star.Color()});
+            }
+            for (const Astronomy::PlanetBody& planet : planets) {
+                const glm::dvec3 c = planet.CenterOfMassSim();
+                state.planets.push_back({glm::vec3(c), planet.BaseColor()});
+            }
+            sceneSaveLoadStatus = Application::SaveScene(sceneSavePath, state)
+                                       ? ("Saved to " + sceneSavePath)
+                                       : ("Failed to save " + sceneSavePath);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Load Scene")) {
+            if (const std::optional<Application::SceneState> loaded = Application::LoadScene(sceneSavePath)) {
+                const Application::SceneState& state = *loaded;
+                shipSceneMode = static_cast<ShipSceneMode>(state.shipMode);
+                shipParkedPosition = state.shipParkedPosition;
+                shipParkedEulerDegrees = state.shipParkedEulerDegrees;
+                shipOrbitRadius = state.shipOrbitRadius;
+                shipOrbitSpeedRadPerSec = state.shipOrbitSpeedRadPerSec;
+                shipOrbitInclinationDegrees = state.shipOrbitInclinationDegrees;
+                shipOrbitAnimated = state.shipOrbitAnimated;
+                shipOrbitPhase = state.shipOrbitPhase;
+                if (shipSceneMode != ShipSceneMode::Piloted) EnsureJetRendererLoaded();
+
+                sceneLightMode = static_cast<SceneLightMode>(state.lightMode);
+                sceneLightAzimuthDegrees = state.lightAzimuthDegrees;
+                sceneLightElevationDegrees = state.lightElevationDegrees;
+                sceneLightColor = state.lightColor;
+                sceneLightIntensity = state.lightIntensity;
+
+                diskSettings.temperatureScale = state.diskTemperatureScale;
+                diskSettings.brightnessScale = state.diskBrightnessScale;
+                diskSettings.movieAccurateColors = state.diskMovieAccurateColors;
+                diskGlareIntensity = state.diskGlareIntensity;
+                diskGlareRadius = state.diskGlareRadius;
+
+                blackHoleMassSolar = state.blackHoleMassSolar;
+                blackHole.SetMassSolarMasses(blackHoleMassSolar);
+                blackHoleSpin = state.blackHoleSpin;
+                blackHole.SetSpin(blackHoleSpin);
+
+                for (size_t i = 0; i < stars.size() && i < state.stars.size(); ++i) {
+                    stars[i].Translate(glm::dvec3(state.stars[i].position) - stars[i].CenterOfMass());
+                    stars[i].SetColor(state.stars[i].color);
+                }
+                for (size_t i = 0; i < planets.size() && i < state.planets.size(); ++i) {
+                    planets[i].Translate(glm::dvec3(state.planets[i].position) - planets[i].CenterOfMassSim());
+                    planets[i].SetBaseColor(state.planets[i].color);
+                }
+
+                needsRerender = true;
+                sceneSaveLoadStatus = "Loaded " + sceneSavePath;
+            } else {
+                sceneSaveLoadStatus = "Failed to load " + sceneSavePath;
+            }
+        }
+        if (!sceneSaveLoadStatus.empty()) {
+            ImGui::TextWrapped("%s", sceneSaveLoadStatus.c_str());
+        }
     };
 
     // Jumps to catalog entry `index`. BlackHoleObj entries re-point the
@@ -1165,7 +1632,7 @@ int App::Run() {
             inMultiStarView = false;
             visitedStarIndex = -1;
             if (wasPilotingJet) {
-                ResetJetForArrival(jetSpawnPosition);
+                ResetJetForArrival(jetSpawnPosition, FaceOrigin(jetSpawnPosition));
                 viewLensedRender = true; // the jet is only ever drawn in the ray-traced/overlay view, see "Pilot Endurance"
                 needsRerender = true;
             } else {
@@ -1351,8 +1818,8 @@ int App::Run() {
     // whether the camera is moving or still) -- resolution/frame rate is
     // the only thing renderScale and the GPU toggle trade off, never the
     // accuracy of the light paths themselves.
-    const auto PerformRender = [&]() {
-        const auto [w, h] = ComputeRenderResolution(fbWidth, fbHeight, renderScalePercent, maxRenderPixels);
+    const auto PerformRender = [&](bool force) -> bool {
+        const auto [w, h] = ComputeRenderResolution(fbWidth, fbHeight, effectiveScalePercent, maxRenderPixels);
 
         RayTracing::RenderSettings renderSettings;
         renderSettings.width = w;
@@ -1443,6 +1910,13 @@ int App::Run() {
                   })
                 : RayTracing::BackgroundSampler([&](const glm::dvec3& dir) { return starField.Sample(dir); });
 
+        // Captured in its own variable (rather than just inlined into
+        // effectiveDiskSettings below) so the render-input snapshot further
+        // down can see it too -- it decays over time on its own, so while a
+        // tidal flare is active this alone is enough to correctly keep
+        // re-rendering every frame even if the camera and every slider are
+        // untouched.
+        const double tidalBoost = tidalFlare.EddingtonFractionBoost();
         {
             // Tidal disruption flare boost applied on top of the user's
             // own slider-backed diskSettings, never mutating it directly --
@@ -1450,7 +1924,7 @@ int App::Run() {
             // their chosen baseline. Single/Kerr-hole scope only (not
             // added to disk2Settings below) -- see tidalFlare's own comment.
             Astronomy::AccretionDiskSettings effectiveDiskSettings = diskSettings;
-            effectiveDiskSettings.eddingtonFraction += tidalFlare.EddingtonFractionBoost();
+            effectiveDiskSettings.eddingtonFraction += tidalBoost;
             accretionDisk.SetSettings(effectiveDiskSettings);
         }
         accretionDisk.SetBlackHoleMassKg(blackHole.MassKg());
@@ -1501,6 +1975,35 @@ int App::Run() {
         // binary mode.
         const bool useGpuThisFrame = useGpu && cudaDeviceAvailable && extraBlackHoles.empty();
 
+        // Skip re-tracing entirely when every input this render actually
+        // depends on is bit-identical to last time (see RenderInputsSnapshot
+        // above) -- the common case is just looking at a static scene, where
+        // this saves 100% of the ray-tracing cost for free, no precision or
+        // quality tradeoff at all. `force` (the "Render Now (force refresh)"
+        // button) always re-traces regardless.
+        RenderInputsSnapshot inputs;
+        inputs.frame = frame;
+        inputs.width = w;
+        inputs.height = h;
+        inputs.checkDisk = diskEnabled;
+        inputs.spin = renderSettings.spin;
+        inputs.diskSettings = diskSettings;
+        inputs.tidalBoost = tidalBoost;
+        inputs.binaryEnabled = binaryModeEnabled;
+        inputs.binarySystem = binarySystem;
+        inputs.extraBlackHoles = extraBlackHoles;
+        inputs.blackHoleMassKg = blackHole.MassKg();
+        inputs.starSettings = starSettings;
+        inputs.useEinsteinRingSource = useEinsteinRingSource;
+        inputs.sourceAngularRadius = sourceAngularRadius;
+        inputs.sourceBrightness = sourceBrightness;
+
+        if (!force && hasLastRenderInputs && SameRenderInputs(inputs, lastRenderInputs)) {
+            return false;
+        }
+        lastRenderInputs = inputs;
+        hasLastRenderInputs = true;
+
         const auto t0 = std::chrono::steady_clock::now();
         std::vector<glm::vec3> pixels;
 #ifdef BH_CUDA_AVAILABLE
@@ -1515,9 +2018,13 @@ int App::Run() {
         lastRenderMilliseconds = std::chrono::duration<double, std::milli>(t1 - t0).count();
         lastRenderWasGpu = useGpuThisFrame;
 
+        // Scene Editor's "glare" is now applied as a GPU post-process at
+        // display time instead (see DrawFullscreenTextureWithGlare below) --
+        // the uploaded texture itself stays the plain, un-glowed render.
         lensedTexture = renderer.UploadImage(pixels, w, h, lensedTexture);
         lensedTextureWidth = w;
         lensedTextureHeight = h;
+        return true;
     };
 
     while (!glfwWindowShouldClose(m_window)) {
@@ -1531,9 +2038,6 @@ int App::Run() {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        const bool cameraModeJustChanged = (camera.mode != previousCameraMode);
-        previousCameraMode = camera.mode;
-
         const ImGuiIO& io = ImGui::GetIO();
 
         // "M" toggles the standalone Universe/Star Map window -- checked
@@ -1546,24 +2050,103 @@ int App::Run() {
         }
         universeMapKeyWasDown = mDown;
 
+        // "E" toggles the standalone Scene Editor window -- same
+        // edge-detection pattern as "M" above.
+        const bool eDown = !io.WantCaptureKeyboard && glfwGetKey(m_window, GLFW_KEY_E) == GLFW_PRESS;
+        if (eDown && !sceneEditorKeyWasDown) {
+            showSceneEditorWindow = !showSceneEditorWindow;
+        }
+        sceneEditorKeyWasDown = eDown;
+
+        // "P" toggles Photo Mode -- see its state block's comment above for
+        // what it does. Checked here, before the per-camera-mode input
+        // blocks, same reasoning as "M" above.
+        const bool pDown = !io.WantCaptureKeyboard && glfwGetKey(m_window, GLFW_KEY_P) == GLFW_PRESS;
+        if (pDown && !photoModeKeyWasDown) {
+            photoMode = !photoMode;
+            if (photoMode) {
+                photoModePreviousCameraMode = camera.mode;
+                photoModePreviousPaused = paused;
+                photoModePreviousBinaryOrbitAnimated = binaryOrbitAnimated;
+
+                // Drop into FreeFly from wherever the view currently is,
+                // same position/orientation conversions the "Free-Fly
+                // Camera" and "Pilot Endurance" UI buttons already use for
+                // Orbit->FreeFly and Jet->FreeFly respectively, so entering
+                // Photo Mode never jump-cuts the view.
+                if (photoModePreviousCameraMode == Rendering::Camera::Mode::Orbit) {
+                    camera.freeFlyPosition = camera.Position();
+                    camera.freeFlyYawRadians = camera.yawRadians + glm::pi<double>();
+                    camera.freeFlyPitchRadians = -camera.pitchRadians;
+                    camera.freeFlyRollRadians = 0.0;
+                } else if (photoModePreviousCameraMode == Rendering::Camera::Mode::Jet) {
+                    camera.freeFlyPosition = camera.jetPosition;
+                    const glm::dvec3 forward = glm::normalize(camera.jetForward);
+                    camera.freeFlyYawRadians = std::atan2(forward.x, forward.z);
+                    camera.freeFlyPitchRadians = std::asin(std::clamp(forward.y, -1.0, 1.0));
+
+                    // FreeFly's OrthonormalBasis always starts the (right,
+                    // up) pair for this yaw/pitch from the SAME unrolled,
+                    // world-up-relative basis -- solve for whatever roll on
+                    // top of that reproduces the Jet view's actual
+                    // up-vector (camera.jetUp, deliberately tilted off
+                    // world-up near the black hole so the disk renders
+                    // level -- see jetSpawnPosition's comment), so Photo
+                    // Mode doesn't un-level the disk the instant it
+                    // converts Jet -> FreeFly (reported: "why is it
+                    // vertically up").
+                    glm::dvec3 up0 = glm::dvec3(0.0, 1.0, 0.0);
+                    if (std::abs(glm::dot(forward, up0)) > 0.999) {
+                        up0 = glm::dvec3(0.0, 0.0, 1.0);
+                    }
+                    const glm::dvec3 right0 = glm::normalize(glm::cross(forward, up0));
+                    up0 = glm::cross(right0, forward);
+                    const glm::dvec3 jetUpOrtho =
+                        glm::normalize(camera.jetUp - forward * glm::dot(camera.jetUp, forward));
+                    camera.freeFlyRollRadians =
+                        std::atan2(-glm::dot(jetUpOrtho, right0), glm::dot(jetUpOrtho, up0));
+                }
+                camera.mode = Rendering::Camera::Mode::FreeFly;
+                paused = true;
+                binaryOrbitAnimated = false;
+            } else {
+                camera.mode = photoModePreviousCameraMode;
+                paused = photoModePreviousPaused;
+                binaryOrbitAnimated = photoModePreviousBinaryOrbitAnimated;
+            }
+        }
+        photoModeKeyWasDown = pDown;
+
+        // The jet overlay draws (further down) gate on camera.mode == Jet,
+        // which Photo Mode deliberately switches away from (to FreeFly) --
+        // without this, parking the camera in Photo Mode while piloting the
+        // Endurance would make the ship vanish instead of just freezing in
+        // place for photos. True while actually piloting OR while Photo
+        // Mode is parked having come from Jet mode -- OR whenever the
+        // Scene Editor has placed the ship as Parked/Orbiting, which draws
+        // regardless of camera mode or piloting state (see GetShipTransform).
+        const bool jetDrawEnabled = shipSceneMode != ShipSceneMode::Piloted ||
+                                     camera.mode == Rendering::Camera::Mode::Jet ||
+                                     (photoMode && photoModePreviousCameraMode == Rendering::Camera::Mode::Jet);
+
+        if (shipSceneMode == ShipSceneMode::Orbiting && shipOrbitAnimated && !paused) {
+            shipOrbitElapsedSeconds += dt;
+        }
+
         if (camera.mode == Rendering::Camera::Mode::Jet) {
-            // --- Jet piloting controls: continuous mouse-look by default ---
-            // (cursor hidden/captured, mouse acts as a virtual joystick,
-            // matching the source project's HOTAS-style control feel), WASD
-            // pitch/roll, Q/E yaw, Shift/Ctrl for thrust (Ctrl past zero is
-            // reverse thrust). Tab toggles the
-            // cursor free so the ImGui panel (camera-view switch, etc.) can
-            // be clicked without leaving Jet mode -- flight keyboard
-            // controls keep working either way, only mouse-look pauses.
-            // See Jet::InputHandler/Jet::FlightPhysics.
-            if (cameraModeJustChanged) {
-                jetMouseCaptured = true;
-            }
-            const bool tabDown = glfwGetKey(m_window, GLFW_KEY_TAB) == GLFW_PRESS;
-            if (tabDown && !jetTabWasDown) {
-                jetMouseCaptured = !jetMouseCaptured;
-            }
-            jetTabWasDown = tabDown;
+            // --- Jet piloting controls: keyboard only, by explicit user ---
+            // request -- WASD pitch/roll, Q/E yaw, Shift/Ctrl directly set
+            // the cruise speed (see Jet::FlightPhysics::
+            // cruiseSpeedSimUnitsPerSec -- Shift keeps raising it with no
+            // ceiling of its own; Ctrl lowers it down to a floor of exactly
+            // 0, no reverse -- see InputHandler::ProcessKeyboard). Mouse movement does NOT
+            // steer the ship (Jet::InputHandler::ProcessMouse is
+            // deliberately never called here) and the cursor is left
+            // normal/visible at all times -- there is nothing left for a
+            // captured cursor to be FOR once mouse-look is gone, so it's
+            // not hidden the way it used to be while piloting.
+            glfwSetInputMode(m_window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+            freeFlyLooking = false;
 
             // C cycles Chase/Cockpit view, same key as the source project.
             const bool cDown = !io.WantCaptureKeyboard && glfwGetKey(m_window, GLFW_KEY_C) == GLFW_PRESS;
@@ -1572,33 +2155,97 @@ int App::Run() {
             }
             jetCameraCycleKeyWasDown = cDown;
 
-            glfwSetInputMode(m_window, GLFW_CURSOR, jetMouseCaptured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
-            freeFlyLooking = false;
-
             double mx, my;
             glfwGetCursorPos(m_window, &mx, &my);
-            if (jetMouseCaptured && !cameraModeJustChanged && !io.WantCaptureMouse) {
-                jetInput.ProcessMouse(static_cast<float>(mx - lastMouseX), static_cast<float>(my - lastMouseY),
-                                       jetPhysics, static_cast<float>(dt));
-            }
             lastMouseX = mx;
             lastMouseY = my;
 
-            if (!io.WantCaptureKeyboard) {
-                jetInput.ProcessKeyboard(m_window, jetPhysics, static_cast<float>(dt));
+            if (wormholeActive) {
+                // Transition playing: freeze flight entirely (no input, no
+                // physics integration) -- the ship's position is already
+                // inside/at the event horizon, and FlightPhysics::Update's
+                // GR proper-acceleration formula involves sqrt(1 - rs/r),
+                // which goes to NaN for r < rs, so letting it keep
+                // integrating here would corrupt position/velocity before
+                // the jump even happens. See DrawWormholeEffect's call site
+                // for the actual visual.
+                wormholeElapsedSeconds += dt;
+                if (!wormholeJumped && wormholeElapsedSeconds >= kWormholeDurationSeconds * 0.5) {
+                    // Perform the real jump right at the effect's brightest
+                    // point, so the instant camera-position cut is hidden
+                    // behind the flash rather than visible as a cut.
+                    if (wormholeDestinationIndex >= 0) {
+                        TravelToUniverseIndex(wormholeDestinationIndex);
+                        lastTravelSummary = "The event horizon folded spacetime and spat the Endurance out at " +
+                                             std::string(universeCatalog[static_cast<size_t>(wormholeDestinationIndex)].name) +
+                                             " -- a wormhole, not a crash.";
+                    } else {
+                        // No other catalog entries to fall back on (shouldn't
+                        // happen with a non-empty catalog) -- behave as before.
+                        if (inStarSystemView) {
+                            jetPhysics.Reset(glm::vec3(0.0f, 3.0f, 23.0f));
+                        } else {
+                            jetPhysics.Reset(jetSpawnPosition);
+                            jetPhysics.rotation = FaceOrigin(jetSpawnPosition);
+                        }
+                    }
+                    wormholeJumped = true;
+                }
+                if (wormholeElapsedSeconds >= kWormholeDurationSeconds) {
+                    wormholeActive = false;
+                }
+            } else {
+                if (!io.WantCaptureKeyboard) {
+                    jetInput.ProcessKeyboard(m_window, jetPhysics, static_cast<float>(dt));
+                }
+
+                jetPhysics.Update(static_cast<float>(dt), Physics::Constants::GravitationalRadiusMeters(blackHole.MassKg()));
+                if (jetPhysics.capturedByBlackHole && (inStarSystemView || inMultiStarView)) {
+                    // Star/Multi-Star View's positions are an arbitrary
+                    // small visual scale with no GR metric at all (see
+                    // those render branches' own comments) -- FlightPhysics'
+                    // horizon check still compares against the currently
+                    // loaded black hole's real Schwarzschild radius, which
+                    // can trip just from flying close to a STAR's center at
+                    // that scale. That's not an event horizon, so it must
+                    // not trigger the wormhole -- clear the flag and ignore
+                    // it; only an actual black hole (the branch below)
+                    // should ever send the player elsewhere.
+                    jetPhysics.capturedByBlackHole = false;
+                } else if (jetPhysics.capturedByBlackHole) {
+                    // "Wormhole" behavior (explicit user request, No Man's
+                    // Sky-style): crossing the horizon doesn't just respawn
+                    // the ship where it was -- it picks a random OTHER
+                    // catalog object (Star or BlackHoleObj alike) up front,
+                    // freezes flight, and plays DrawWormholeEffect for
+                    // kWormholeDurationSeconds; the branch above performs
+                    // the actual TravelToUniverseIndex jump partway through
+                    // once wormholeActive is true (see its own comment for
+                    // why). wasPilotingJet inside that lambda sees
+                    // camera.mode is still Jet, so it keeps flying us
+                    // through the jump and resets position/velocity via
+                    // ResetJetForArrival -- no separate reset needed here.
+                    std::vector<int> candidates;
+                    candidates.reserve(universeCatalog.size());
+                    for (int i = 0; i < static_cast<int>(universeCatalog.size()); ++i) {
+                        if (universeCatalog[static_cast<size_t>(i)].type != Universe::ObjectType::Galaxy &&
+                            i != universeLocationIndex) {
+                            candidates.push_back(i);
+                        }
+                    }
+                    wormholeDestinationIndex = -1;
+                    if (!candidates.empty()) {
+                        std::uniform_int_distribution<size_t> pick(0, candidates.size() - 1);
+                        wormholeDestinationIndex = candidates[pick(wormholeRng)];
+                    }
+                    wormholeActive = true;
+                    wormholeElapsedSeconds = 0.0;
+                    wormholeJumped = false;
+                    jetPhysics.velocity = glm::vec3(0.0f); // stop drifting deeper while the effect plays
+                }
             }
 
-            jetPhysics.Update(static_cast<float>(dt), Physics::Constants::GravitationalRadiusMeters(blackHole.MassKg()));
-            if (jetPhysics.capturedByBlackHole) {
-                // Respawn at a position appropriate to whichever view is
-                // CURRENTLY showing -- jetSpawnPosition (180 sim units) is
-                // the black-hole-view default; Star System View's own
-                // much smaller visual scale needs its own respawn point,
-                // same reasoning as TravelToUniverseIndex's ResetJetForArrival.
-                jetPhysics.Reset(inStarSystemView ? glm::vec3(0.0f, 3.0f, 23.0f) : jetSpawnPosition);
-            }
-
-            jetFlightCamera.Update(jetPhysics.position, jetPhysics.rotation, static_cast<float>(dt));
+            jetFlightCamera.Update(jetPhysics.position, jetPhysics.rotation);
             camera.jetPosition = glm::dvec3(jetFlightCamera.position);
             camera.jetForward = glm::dvec3(glm::normalize(jetFlightCamera.target - jetFlightCamera.position));
             camera.jetUp = glm::dvec3(jetFlightCamera.up);
@@ -1680,7 +2327,30 @@ int App::Run() {
 
         glfwGetFramebufferSize(m_window, &fbWidth, &fbHeight);
 
-        // --- ImGui control panel ---
+        // Feedback step for autoQualityScale: react to last frame's
+        // smoothedFrameMs (a one-frame-delayed EMA, same reading the FPS
+        // counter shows) rather than probing hardware specs directly --
+        // specs are a poor proxy for actual throughput here (CPU core
+        // count doesn't capture that CPUTracer is single-threaded, a CUDA
+        // device's compute capability isn't checked at all, etc.), while
+        // the measured frame time captures whatever the real bottleneck
+        // is on THIS machine automatically. Multiplicative small steps
+        // plus the dead zone above keep this stable instead of oscillating.
+        if (autoAdjustResolution) {
+            if (smoothedFrameMs > kAutoAdjustTargetFrameMs * 1.15) {
+                autoQualityScale = std::max(kAutoAdjustMinScale, autoQualityScale * 0.85);
+            } else if (smoothedFrameMs < kAutoAdjustTargetFrameMs * 0.6) {
+                autoQualityScale = std::min(1.0, autoQualityScale * 1.05);
+            }
+        } else {
+            autoQualityScale = 1.0;
+        }
+        effectiveScalePercent = renderScalePercent * autoQualityScale;
+
+        // --- ImGui control panel --- Hidden entirely in Photo Mode so
+        // screenshots/composition aren't cluttered by it; see the small
+        // "Photo Mode" overlay drawn further down instead.
+        if (!photoMode) {
         ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_FirstUseEver);
         ImGui::Begin("Black Hole Simulator");
 
@@ -1734,6 +2404,10 @@ int App::Run() {
                     camera.freeFlyYawRadians = camera.yawRadians + glm::pi<double>();
                     camera.freeFlyPitchRadians = -camera.pitchRadians;
                 }
+                // Clears out any roll Photo Mode's Jet->FreeFly conversion
+                // left behind (see freeFlyRollRadians's comment) -- this
+                // button is an ordinary "no bank" fly-around camera.
+                camera.freeFlyRollRadians = 0.0;
                 camera.mode = Rendering::Camera::Mode::FreeFly;
             }
             if (isFreeFly) ImGui::PopStyleColor();
@@ -1741,12 +2415,12 @@ int App::Run() {
             ImGui::SameLine();
             if (isJet) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ButtonActive]);
             if (ImGui::Button("Pilot Endurance", ImVec2(thirdWidth, 0))) {
-                if (!jetRendererLoadAttempted) {
-                    jetRendererLoadAttempted = true;
-                    if (!jetRenderer.Load("resources/jet/endurance.glb", "resources/jet/endurance_basecolor.png", 3.0f)) {
-                        std::fprintf(stderr, "Jet mode: model/texture failed to load -- piloting still works, but the jet won't be visible.\n");
-                    }
-                }
+                EnsureJetRendererLoaded();
+                // Hand control back to the pilot -- if the Scene Editor had
+                // left the ship Parked/Orbiting, GetShipTransform() would
+                // otherwise keep drawing it there instead of following
+                // jetPhysics below.
+                shipSceneMode = ShipSceneMode::Piloted;
                 // The jet is only ever drawn/tracked in the ray-traced view
                 // (see the composite draw below) -- force it on so clicking
                 // this button always shows the jet, even if the debug 3D
@@ -1754,7 +2428,6 @@ int App::Run() {
                 // showing instead.
                 viewLensedRender = true;
                 needsRerender = true;
-                jetMouseCaptured = true;
 
                 // Always start from a clean, known-good flight state --
                 // without this, re-entering Jet mode after the jet drifted
@@ -1763,6 +2436,7 @@ int App::Run() {
                 // last had, which could look like "the camera isn't
                 // following the jet" if that state was bad.
                 jetPhysics.Reset(jetSpawnPosition);
+                jetPhysics.rotation = FaceOrigin(jetSpawnPosition);
                 jetFlightCamera = Jet::FlightCamera();
 
                 // Compute the camera's first frame synchronously (rather
@@ -1770,7 +2444,7 @@ int App::Run() {
                 // there's no one-frame glitch where camera.jetPosition still
                 // holds its stale default (the origin -- i.e. inside the
                 // black hole) before this mode's own update code has run.
-                jetFlightCamera.Update(jetPhysics.position, jetPhysics.rotation, 0.0f);
+                jetFlightCamera.Update(jetPhysics.position, jetPhysics.rotation);
                 camera.jetPosition = glm::dvec3(jetFlightCamera.position);
                 camera.jetForward = glm::dvec3(glm::normalize(jetFlightCamera.target - jetFlightCamera.position));
                 camera.jetUp = glm::dvec3(jetFlightCamera.up);
@@ -1781,7 +2455,7 @@ int App::Run() {
             if (isFreeFly) {
                 ImGui::TextDisabled("WASD to move, hold Right Mouse to look, Space/Ctrl for up/down, Shift to go faster.");
             } else if (isJet) {
-                ImGui::TextDisabled("Mouse to look (virtual joystick), WASD pitch/roll, Q/E yaw, Shift/Ctrl thrust (Ctrl past zero reverses), Shift+W afterburner, C to cycle camera view, Tab to free the cursor.");
+                ImGui::TextDisabled("Keyboard only: WASD pitch/roll, Q/E yaw, Shift/Ctrl set speed (hold to keep raising/lowering it; Ctrl floors at a stop, no reverse), Shift+W afterburner, C to cycle camera view. Mouse movement does not steer the ship.");
                 if (ImGui::Button(jetFlightCamera.mode == Jet::FlightCameraMode::Chase ? "Switch to Cockpit View" : "Switch to Chase View")) {
                     jetFlightCamera.CycleMode();
                 }
@@ -1901,6 +2575,11 @@ int App::Run() {
 
                 SliderDouble("Resolution", &renderScalePercent, 10.0, 100.0, "%.0f%%");
                 ImGui::TextWrapped("Lower resolution = faster. This never reduces the physics precision -- only how many rays are traced.");
+                ImGui::Checkbox("Auto-adjust for performance", &autoAdjustResolution);
+                if (autoAdjustResolution && autoQualityScale < 0.999) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(currently tracing at %.0f%% of the slider above to keep fps up)", autoQualityScale * 100.0);
+                }
 #ifdef BH_CUDA_AVAILABLE
                 if (cudaDeviceAvailable) {
                     ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.4f, 1.0f), "GPU (CUDA) active");
@@ -1972,6 +2651,16 @@ int App::Run() {
 
             ImGui::PopStyleColor(); // ChildBg
 
+            SectionLabel("Waypoints");
+            ImGui::TextWrapped("Travel to a real star, black hole, or multi-star system (press M anytime for this as a popup too).");
+            if (ImGui::CollapsingHeader("Universe / Star Map")) {
+                DrawUniversePanelContents();
+            }
+            ImGui::Checkbox("Show location markers (black hole / stars)", &showLocationMarkers);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
+            ImGui::TextWrapped("A bright marker at each object's real position -- separate from the lensed shadow you actually see, which isn't a literal outline of where it is.");
+            ImGui::PopStyleColor();
+
             ImGui::Dummy(ImVec2(0, 8));
             ImGui::Separator();
             ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyle().Colors[ImGuiCol_TextDisabled]);
@@ -2001,6 +2690,15 @@ int App::Run() {
             HelpTooltip("How much mass the black hole has, in units of our Sun's mass. Heavier = larger Schwarzschild radius, but the SHAPE of everything you see stays the same (it's all scale-invariant) -- only the physical size in kilometers changes.");
             ImGui::Text("Schwarzschild radius r_s = 2GM/c^2 = %.3e km", blackHole.SchwarzschildRadiusMeters() / 1000.0);
             ImGui::Text("(In simulation units, r_s is always exactly 2.0 -- see Physics/Constants.h)");
+
+            ImGui::Checkbox("Show location markers (black hole / stars)", &showLocationMarkers);
+            HelpTooltip(
+                "A bright wireframe sphere drawn directly at each object's real position -- the black "
+                "hole here, plus any binary/extra black holes, or each star in Star System/Multi-Star "
+                "View. Deliberately separate from the lensed shadow you see: the shadow's apparent size "
+                "and position are a LENSING EFFECT, not a literal outline of where the hole actually is "
+                "in flat space, which is exactly what makes orienting yourself while flying hard without "
+                "this. Also shown while piloting the Endurance.");
 
             ImGui::Separator();
             if (SliderDouble("Spin a* = Jc/(GM^2)", &blackHoleSpin, -0.998, 0.998, "%.3f")) {
@@ -2147,6 +2845,12 @@ int App::Run() {
             }
         }
 
+        ImGui::Checkbox("Scene Editor (E)", &showSceneEditorWindow);
+        HelpTooltip(
+            "Blender-style scene placement in a standalone window: the Endurance's position/behavior, "
+            "the light's direction/color, the accretion disk's color/glare, and any spawned stars'/"
+            "planets' position/color. Press E anytime to toggle it.");
+
         ImGui::Checkbox("Show grid", &showGrid);
         ImGui::Checkbox("Show Flamm's paraboloid (spacetime curvature funnel)", &showWarpedGrid);
         HelpTooltip(
@@ -2257,11 +2961,18 @@ int App::Run() {
             SliderDouble("Resolution", &renderScalePercent, 10.0, 100.0, "%.0f%%");
             ImGui::SameLine();
             {
-                const auto [previewW, previewH] = ComputeRenderResolution(fbWidth, fbHeight, renderScalePercent, maxRenderPixels);
-                ImGui::TextDisabled("(%d x %d px, aspect-matched, capped at %.1fM rays/frame)", previewW, previewH,
-                                     maxRenderPixels / 1.0e6);
+                const auto [previewW, previewH] = ComputeRenderResolution(fbWidth, fbHeight, effectiveScalePercent, maxRenderPixels);
+                if (autoAdjustResolution && autoQualityScale < 0.999) {
+                    ImGui::TextDisabled("(%d x %d px, auto-reduced to %.0f%% of this for your fps)", previewW, previewH,
+                                         autoQualityScale * 100.0);
+                } else {
+                    ImGui::TextDisabled("(%d x %d px, aspect-matched, capped at %.1fM rays/frame)", previewW, previewH,
+                                         maxRenderPixels / 1.0e6);
+                }
             }
             HelpTooltip("Percentage of the window's actual pixel count to trace, capped at a fixed ray budget so frame rate stays predictable no matter how large your window or monitor is. Lower = faster, never less accurate -- geodesic precision (step budget) is always full regardless of this setting.");
+            ImGui::Checkbox("Auto-adjust resolution for performance", &autoAdjustResolution);
+            HelpTooltip("Watches your actual frame time and automatically traces at a lower resolution than the slider above when this machine can't keep up (even below the slider's 10% floor), then climbs back toward the slider's setting once there's headroom. Targets about 30 fps. Turn off to always trace exactly what the slider says, no matter the frame rate.");
             {
                 double maxRenderPixelsM = maxRenderPixels / 1.0e6;
                 if (SliderDouble("Max rays/frame (millions)", &maxRenderPixelsM, 0.1, 8.0, "%.1fM")) {
@@ -2308,7 +3019,9 @@ int App::Run() {
                 ImGui::TextDisabled("GPU (CUDA): not compiled in this build (configure with -DBH_ENABLE_CUDA=ON)");
             }
             if (ImGui::Button(liveMode ? "Render Now (force refresh)" : "Render Now")) {
-                PerformRender();
+                if (PerformRender(/*force=*/true)) {
+                    smoothedFrameMs = smoothedFrameMs * 0.9 + lastRenderMilliseconds * 0.1;
+                }
                 needsRerender = false;
             }
 
@@ -2477,7 +3190,7 @@ int App::Run() {
                 SliderDouble("Pixel Y (NDC)", &inspectorNdcY, -1.0, 1.0, "%.3f");
                 ImGui::Checkbox("Show this ray's path in the 3D debug view", &inspectorShowPath);
 
-                const auto [iw, ih] = ComputeRenderResolution(fbWidth, fbHeight, renderScalePercent, maxRenderPixels);
+                const auto [iw, ih] = ComputeRenderResolution(fbWidth, fbHeight, effectiveScalePercent, maxRenderPixels);
                 const RayTracing::CameraFrame inspectorFrame = BuildCameraFrame(camera, iw, ih);
                 inspectorResult = TraceInspectorRay(inspectorFrame, inspectorNdcX, inspectorNdcY, blackHole.Spin());
 
@@ -2546,6 +3259,8 @@ int App::Run() {
             needsRerender |= SliderDouble("Brightness scale", &diskSettings.brightnessScale, 0.01, 2.0, "%.3f");
             needsRerender |= ImGui::Checkbox("Clockwise rotation", &diskSettings.clockwise);
             needsRerender |= ImGui::Checkbox("Relativistic effects (redshift + beaming)", &diskSettings.relativisticEffects);
+            needsRerender |= ImGui::Checkbox("Movie-accurate colors (Interstellar style)", &diskSettings.movieAccurateColors);
+            HelpTooltip("Off = this disk's real blackbody color, computed from mass/Eddington fraction (blue-white for a hole this massive). On = swaps that hue for a fixed warm gold/white tint matching the film's own look -- Double Negative's real rendering paper says they deliberately suppressed the disk's true color-temperature variation for the final movie, even though their lensing/redshift physics was otherwise accurate. Brightness, lensing, and Doppler beaming are unaffected either way -- only the hue changes.");
 
             needsRerender |= SliderDouble("Eddington fraction (L / L_Edd)", &diskSettings.eddingtonFraction, 0.01, 1.0, "%.2f");
             HelpTooltip("How hard the black hole is accreting, as a fraction of the Eddington limit (the luminosity at which radiation pressure balances gravity). Together with the mass, this sets the disk's REAL temperature in Kelvin (bigger mass + same Eddington fraction = a cooler disk, since the emitting area grows faster than the luminosity) -- it does not just recolor the image, it's the physical quantity the color comes from.");
@@ -2818,16 +3533,48 @@ int App::Run() {
         } // uiMode == Advanced
 
         ImGui::End();
+        } // !photoMode
 
         // Standalone Universe/Star Map window, toggled by "M" (see the key
         // handling near the top of this loop) -- available regardless of
         // Simple/Advanced mode or camera mode, specifically so it's usable
         // mid-flight without first switching to Advanced mode and scrolling
-        // to find it.
-        if (showUniverseMapWindow) {
+        // to find it. Also suppressed in Photo Mode, same reasoning as the
+        // main control panel above.
+        if (showUniverseMapWindow && !photoMode) {
             ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_FirstUseEver);
             if (ImGui::Begin("Universe / Star Map (M to toggle)", &showUniverseMapWindow)) {
                 DrawUniversePanelContents();
+            }
+            ImGui::End();
+        }
+
+        // Standalone Scene Editor window, toggled by "E". Unlike the
+        // Universe/Star Map window above, this one stays available in Photo
+        // Mode -- composing a shot (moving/orienting objects) is exactly
+        // what Photo Mode is for, so hiding the editor there would defeat
+        // its purpose. It's a small floating window, not the cluttered main
+        // panel, so it doesn't fight the "clean screenshot" goal much.
+        if (showSceneEditorWindow) {
+            ImGui::SetNextWindowSize(ImVec2(420.0f, 0.0f), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Scene Editor (E to toggle)", &showSceneEditorWindow)) {
+                DrawSceneEditorPanelContents();
+            }
+            ImGui::End();
+        }
+
+        // Minimal Photo Mode overlay: a small borderless label so the
+        // screen stays clean for screenshots but it's still obvious the
+        // mode is active and how to get back.
+        if (photoMode) {
+            ImGui::SetNextWindowPos(ImVec2(16.0f, 16.0f));
+            ImGui::SetNextWindowBgAlpha(0.35f);
+            const ImGuiWindowFlags photoOverlayFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                                         ImGuiWindowFlags_NoInputs;
+            if (ImGui::Begin("##PhotoModeOverlay", nullptr, photoOverlayFlags)) {
+                ImGui::Text("PHOTO MODE -- simulation paused");
+                ImGui::Text("WASD + hold right mouse to fly, P to exit");
             }
             ImGui::End();
         }
@@ -2843,9 +3590,16 @@ int App::Run() {
         // a real perf bug, not a hypothetical one, since Live mode fires
         // this unconditionally every frame.
         if (!inStarSystemView && !inMultiStarView && viewLensedRender && (liveMode || needsRerender)) {
-            PerformRender();
+            // needsRerender alone (non-live/Advanced mode) forces a real
+            // retrace -- it's only ever set true by an explicit user action
+            // (a slider/button), so skipping it against a stale cache would
+            // be wrong exactly when the user is waiting for that action's
+            // result. In liveMode, the cache does its job and `force` stays
+            // false, so a truly static frame costs nothing.
+            if (PerformRender(/*force=*/needsRerender)) {
+                smoothedFrameMs = smoothedFrameMs * 0.9 + lastRenderMilliseconds * 0.1;
+            }
             needsRerender = false;
-            smoothedFrameMs = smoothedFrameMs * 0.9 + lastRenderMilliseconds * 0.1;
         }
 
         // Multi-star N-body integration (Universe/MultiStarSystem.h,
@@ -2979,6 +3733,33 @@ int App::Run() {
 
         const int width = fbWidth, height = fbHeight; // set earlier this frame, before PerformRender used them
         const float aspect = height > 0 ? static_cast<float>(width) / static_cast<float>(height) : 1.0f;
+
+        // Location markers (see showLocationMarkers's own comment/tooltip):
+        // a bright wireframe sphere at each gravitating body's REAL
+        // position in flat overlay space -- deliberately not subject to
+        // lensing, unlike the shadow/accretion-disk image the ray tracer
+        // produces, so it reads as "here is where the thing actually is"
+        // rather than "here is what it looks like." Sized at 3x each
+        // body's own Schwarzschild radius (scale-invariant in sim units --
+        // always 2.0 times whatever GM ratio applies, see Physics/
+        // BlackHole.h) so it's comfortably bigger than the body itself
+        // without being so large it swallows nearby detail. One shared
+        // color (bright magenta) for every marker so they're trivially
+        // distinguishable from any other wireframe this app already draws
+        // (the red/blue binary horizons, the warped-grid funnel, etc.).
+        const auto DrawLocationMarkers = [&]() {
+            if (!showLocationMarkers) return;
+            constexpr glm::vec3 kMarkerColor(1.0f, 0.1f, 0.9f);
+            const double rs = Physics::BlackHole::SchwarzschildRadiusSim();
+            renderer.DrawWireSphere(glm::dvec3(0.0), rs * 3.0, kMarkerColor);
+            if (binaryModeEnabled) {
+                renderer.DrawWireSphere(binarySystem.Position1(), binarySystem.SchwarzschildRadius1() * 3.0, kMarkerColor);
+                renderer.DrawWireSphere(binarySystem.Position2(), binarySystem.SchwarzschildRadius2() * 3.0, kMarkerColor);
+            }
+            for (const Physics::ExtraBlackHole& extra : extraBlackHoles) {
+                renderer.DrawWireSphere(extra.position, extra.SchwarzschildRadiusSim() * 3.0, kMarkerColor);
+            }
+        };
 
         // Draws every star's non-consumed particles (a short fading trail
         // plus the particle itself) -- shared between the ray-traced view's
@@ -3167,14 +3948,15 @@ int App::Run() {
                 // others at these mass ratios.
                 const double radius = 1.0 + 1.3 * std::cbrt(member.massSolar);
                 renderer.DrawTexturedSphere(multiStarPositions[i], radius, multiStarTextureIds[i], 24, 32);
+                if (showLocationMarkers) {
+                    renderer.DrawWireSphere(multiStarPositions[i], radius * 1.5, glm::vec3(1.0f, 0.1f, 0.9f));
+                }
             }
 
-            if (camera.mode == Rendering::Camera::Mode::Jet && jetRenderer.IsLoaded()) {
-                const glm::vec3 lightDirection = glm::length(jetPhysics.position) > 1e-4f
-                                                      ? glm::normalize(jetPhysics.position)
-                                                      : glm::vec3(0.0f, 0.0f, -1.0f);
-                jetRenderer.Draw(jetPhysics.position, jetPhysics.rotation, camera.ViewMatrix(),
-                                  camera.ProjectionMatrix(aspect), lightDirection);
+            if (jetDrawEnabled && jetRenderer.IsLoaded()) {
+                const auto [shipPosition, shipRotation] = GetShipTransform();
+                jetRenderer.Draw(shipPosition, shipRotation, camera.ViewMatrix(), camera.ProjectionMatrix(aspect),
+                                  GetLightDirection(shipPosition), sceneLightColor, sceneLightIntensity);
             }
         } else
         // Star System View: reached by traveling to a Star catalog entry
@@ -3230,6 +4012,9 @@ int App::Run() {
                 cachedStarTextureIndex = visitedStarIndex;
             }
             renderer.DrawTexturedSphere(glm::dvec3(0.0), 6.0, cachedStarTextureId, 32, 48);
+            if (showLocationMarkers) {
+                renderer.DrawWireSphere(glm::dvec3(0.0), 9.0, glm::vec3(1.0f, 0.1f, 0.9f));
+            }
 
             // Real exoplanets for this star (Universe/ExoplanetCatalog.h),
             // most stars have none listed (see that file's header comment --
@@ -3328,36 +4113,34 @@ int App::Run() {
             // matrices/depth state jetRenderer.Draw needs (it manages its
             // own shader/VAO state regardless), so no separate overlay pass
             // is needed here the way the lensed branch below needs one.
-            if (camera.mode == Rendering::Camera::Mode::Jet && jetRenderer.IsLoaded()) {
-                const glm::vec3 lightDirection = glm::length(jetPhysics.position) > 1e-4f
-                                                      ? glm::normalize(jetPhysics.position)
-                                                      : glm::vec3(0.0f, 0.0f, -1.0f);
-                jetRenderer.Draw(jetPhysics.position, jetPhysics.rotation, camera.ViewMatrix(),
-                                  camera.ProjectionMatrix(aspect), lightDirection);
+            if (jetDrawEnabled && jetRenderer.IsLoaded()) {
+                const auto [shipPosition, shipRotation] = GetShipTransform();
+                jetRenderer.Draw(shipPosition, shipRotation, camera.ViewMatrix(), camera.ProjectionMatrix(aspect),
+                                  GetLightDirection(shipPosition), sceneLightColor, sceneLightIntensity);
             }
         } else if (viewLensedRender && lensedTextureWidth > 0) {
             glViewport(0, 0, width, height);
             glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-            renderer.DrawFullscreenTexture(lensedTexture);
+            renderer.DrawFullscreenTextureWithGlare(lensedTexture, lensedTextureWidth, lensedTextureHeight,
+                                                      diskGlareIntensity, diskGlareRadius);
 
             // Composite the piloted jet and any stars on top of the
             // ray-traced image, using the SAME camera the tracer used this
             // frame (see BuildCameraFrame) so both line up with the lensed
             // background. The jet is lit from the black hole's direction --
             // it's the only light source in this scene.
-            const bool jetVisible = camera.mode == Rendering::Camera::Mode::Jet && jetRenderer.IsLoaded();
-            if (jetVisible || !stars.empty() || !planets.empty()) {
+            const bool jetVisible = jetDrawEnabled && jetRenderer.IsLoaded();
+            if (jetVisible || !stars.empty() || !planets.empty() || showLocationMarkers) {
                 renderer.BeginOverlayPass(camera, aspect);
                 if (jetVisible) {
-                    const glm::vec3 lightDirection = glm::length(jetPhysics.position) > 1e-4f
-                                                          ? glm::normalize(jetPhysics.position)
-                                                          : glm::vec3(0.0f, 0.0f, -1.0f);
-                    jetRenderer.Draw(jetPhysics.position, jetPhysics.rotation, camera.ViewMatrix(),
-                                      camera.ProjectionMatrix(aspect), lightDirection);
+                    const auto [shipPosition, shipRotation] = GetShipTransform();
+                    jetRenderer.Draw(shipPosition, shipRotation, camera.ViewMatrix(), camera.ProjectionMatrix(aspect),
+                                      GetLightDirection(shipPosition), sceneLightColor, sceneLightIntensity);
                 }
                 DrawStars();
                 DrawPlanets(false);
+                DrawLocationMarkers();
             }
         } else {
             renderer.BeginFrame(camera, aspect, width, height);
@@ -3495,6 +4278,21 @@ int App::Run() {
             }
         }
 
+        // Wormhole transition overlay: drawn on top of whichever branch
+        // above just rendered (lensed/Star System/Multi-Star/debug view --
+        // the jet's destination could be any of them), by capturing
+        // whatever just landed in the window's framebuffer into a texture
+        // and re-drawing it warped/flashed in place. This is what actually
+        // hides the mid-sequence TravelToUniverseIndex camera-position jump
+        // (see the Jet-mode input block above) behind the effect, uniformly
+        // regardless of which view the destination happens to use.
+        if (wormholeActive) {
+            const float wormholeProgress = static_cast<float>(wormholeElapsedSeconds / kWormholeDurationSeconds);
+            const unsigned int captured = renderer.CaptureFramebufferTexture(fbWidth, fbHeight);
+            renderer.DrawWormholeEffect(captured, wormholeProgress, static_cast<float>(glfwGetTime()),
+                                         /*textureIsFlippedVertically=*/false);
+        }
+
         // --- Star System View info overlay: real catalog facts about the
         // visited star plus any real exoplanets around it (see the Star
         // System View render branch above and Universe/ExoplanetCatalog.h)
@@ -3560,7 +4358,7 @@ int App::Run() {
             } else {
                 pointsOfInterest.push_back({"Black Hole", glm::dvec3(0.0), IM_COL32(255, 170, 60, 255)});
             }
-            if (camera.mode == Rendering::Camera::Mode::Jet) {
+            if (jetDrawEnabled) {
                 pointsOfInterest.push_back(
                     {"Jet", glm::dvec3(jetPhysics.position), IM_COL32(120, 220, 255, 255)});
             }

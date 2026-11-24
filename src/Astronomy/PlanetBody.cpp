@@ -397,6 +397,18 @@ glm::dvec3 PlanetBody::CenterOfMassSim() const {
     return totalMass > 0.0 ? weightedPosition / totalMass : glm::dvec3(0.0);
 }
 
+void PlanetBody::Translate(const glm::dvec3& delta) {
+    for (PlanetParticle& particle : m_particles) {
+        particle.position += delta;
+        for (glm::dvec3& trailPoint : particle.trail) {
+            trailPoint += delta;
+        }
+    }
+    for (PlanetFragment& fragment : m_fragments) {
+        fragment.comPosition += delta;
+    }
+}
+
 double PlanetBody::CurrentMassKg() const {
     double totalMass = 0.0;
     for (const PlanetParticle& particle : m_particles) {

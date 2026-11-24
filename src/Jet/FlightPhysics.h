@@ -5,64 +5,64 @@
 
 // Ported (and adapted for orbiting a black hole instead of flying over an
 // Earth-like atmosphere) from the "jet system new" project's Physics class.
-// It's a hybrid "semi-realistic force sim + arcade rate-control" flight
-// model: real thrust/drag forces integrated into velocity, but rotation is
-// direct rate-control (input -> target angular velocity), not torque/moment
-// of inertia -- see UpdateRotation. Two changes from the original, both
+// Rotation is direct rate-control (input -> target angular velocity), not
+// torque/moment of inertia -- see UpdateRotation.
+//
+// Forward speed is DIRECT "cruise control," not a thrust/drag force
+// simulation -- a deliberate redesign, not the original design. The first
+// version of this class modeled real thrust/drag forces (a Newton value
+// integrated against velocity-squared drag until the two balanced at some
+// equilibrium speed); that was replaced after two real, reported problems
+// with it: (1) because equilibrium speed scales as sqrt(thrust) rather than
+// linearly, a few seconds of Ctrl barely moved the actual cruise speed
+// while the same few seconds of Shift felt dramatically more effective,
+// reading as "I can't slow down and it speeds up" even though both keys
+// changed the underlying value by the same amount; and (2) the user
+// explicitly asked for direct, literal "set speed" control -- Shift/Ctrl
+// should raise/lower a speed value with no ceiling of their own, not tune
+// an indirect equilibrium. See `cruiseSpeedSimUnitsPerSec` below.
+//
+// Two other changes from the original "jet system new" project, both
 // deliberate:
-//   1. Gravity now pulls toward the black hole at the origin, using the
-//      EXACT general-relativistic Schwarzschild static-observer acceleration
-//      (GM/r^2)/sqrt(1-r_s/r) -- see UpdateForces -- instead of a constant
-//      -9.81 in a fixed "down", or even plain Newtonian 1/r^2 (which turned
-//      out too weak, relative to this jet's thrust, to ever be felt). It
-//      reduces to negligible far away, same as Newtonian gravity, but
-//      diverges near the horizon: no amount of thrust can hold station
-//      arbitrarily close to r_s, so the black hole becomes a real,
-//      escalating threat exactly where a black hole's gravity should be one.
+//   1. Gravity still pulls toward the black hole at the origin using the
+//      EXACT general-relativistic Schwarzschild static-observer
+//      acceleration, (GM/r^2)/sqrt(1-r_s/r) -- see UpdateForces -- instead
+//      of a constant -9.81 or plain Newtonian 1/r^2. It is genuinely
+//      integrated into `velocity` every frame, same as before the cruise-
+//      control redesign -- but its effect on OVERALL SPEED is now
+//      overwritten by the pilot's set speed every frame (see
+//      `cruiseSpeedSimUnitsPerSec`'s own comment for exactly what survives
+//      and what doesn't: the real, honest tradeoff this redesign makes).
 //   2. Air density/altitude/ocean/ground mechanics are removed entirely --
-//      there's no atmosphere or sea level in orbit around a black hole. Air
-//      density is nominally 1.0 (sea-level-equivalent) everywhere, which
-//      keeps the arcade thrust/drag/stall feel exactly as tuned in the
-//      source project without an atmosphere to justify it physically. This
-//      is a deliberate "starfighter" arcade control scheme, not a claim of
-//      physical accuracy in vacuum.
-//   3. A hard speed cap, expressed as a fraction of c, is enforced in
-//      Update() -- see MAX_SPEED_FRACTION_OF_C below. The thrust/drag model
-//      above was tuned treating "sim units" as if they were meters, which
-//      is harmless for a small (stellar-mass) hole where one sim unit
-//      (GM/c^2) is kilometers, but once the black hole is something like
-//      TON 618 (one sim unit ~ 0.01 light-year, see Physics/Constants.h)
-//      the SAME numeric thrust/drag equilibrium speed becomes many times
-//      faster than light -- i.e. "cross several light-years in a few
-//      seconds". The cap converts a fixed real speed limit into whatever
-//      sim-units/s that implies for the CURRENTLY loaded black hole (passed
-//      into Update as metersPerSimUnit) and clamps velocity to it every
-//      frame, so the jet is always at most cinematically fast -- comparable
-//      to the relativistic cruise/insertion speeds depicted in Interstellar
-//      -- never literally faster than light, regardless of which hole (or
-//      mass slider value) is loaded.
+//      there's no atmosphere or sea level in orbit around a black hole.
 namespace Jet {
 
-const float JET_MASS = 15000.0f;           // kg (Su-57 approx) -- only used to convert forces to accelerations
-const float MAX_THRUST = 2000000.0f;       // Newtons (afterburner-capable)
-const float STALL_SPEED = 70.0f;           // sim units/s
 const float G_REFERENCE = 9.81f;           // m/s^2, used only to normalize G-force display, not as world gravity
-const float MACH_1 = 343.0f;               // sim units/s, purely for the arcade transonic-drag-rise flavor
+
+// How fast Shift/Ctrl change `cruiseSpeedSimUnitsPerSec`, in (sim-units/s)
+// per second -- i.e. this many sim-units/s of extra speed for every second
+// either key is held. No ceiling of its own: holding Shift raises the set
+// speed for as long as it's held, with no equilibrium or engine-rating
+// limit to plateau against (explicitly requested: "shift or ctrl
+// infinitely reduces/increases the speed"). The only thing that still
+// bounds the ship's ACTUAL velocity is the honest relativistic cap in
+// Update() below -- the set speed itself can be dialed arbitrarily high or
+// low, it just won't all show up as real motion past that cap. Lowered
+// from an original 400 alongside MIN_FLYABLE_SPEED_SIM_UNITS_PER_SEC
+// below (see that constant's comment) -- reported directly: "the ship is
+// very hard to control, make the speed limit much lower." At 400/s^2,
+// even a brief Shift tap added hundreds of sim-units/s, overshooting the
+// controllable range in well under a second; 150/s^2 gives a full ramp
+// from the default cruise speed to the new, much lower cap in a few
+// seconds instead of a fraction of one.
+const float CRUISE_SPEED_RAMP_RATE = 150.0f;
 
 // Hard ceiling on real speed, as a fraction of c -- chosen to sit comfortably
 // above anything a real jet/spacecraft reaches but still read as "fast but
 // not instantaneous" the way Interstellar's Endurance does near Gargantua,
-// rather than the thousands-of-c speeds the unclamped thrust/drag model
-// would otherwise produce around a supermassive hole. See Update().
+// rather than letting an arbitrarily large set speed read as literally
+// faster than light. See Update().
 const float MAX_SPEED_FRACTION_OF_C = 0.2f;
-
-// Thrust (see FlightPhysics::thrust) is allowed to go negative, down to
-// -MAX_THRUST * REVERSE_THRUST_FRACTION, so Ctrl (throttle down, see
-// InputHandler::ProcessKeyboard) can push past zero into genuine reverse
-// thrust instead of just idling at zero. Capped well below full forward
-// thrust (30%) -- arcade flavor: reverse is there to back out of a bad
-// approach or hold station, not to out-accelerate forward flight.
-const float REVERSE_THRUST_FRACTION = 0.3f;
 
 // Floor on the speed cap, in sim-units/s, applied AFTER the real-c
 // conversion above (see Update): max(relativisticCapSimUnits, this). Real
@@ -75,18 +75,23 @@ const float REVERSE_THRUST_FRACTION = 0.3f;
 // light-years, so the SAME 0.2c converts to roughly 6e-7 sim-units/s --
 // imperceptibly slow, meaning the jet was effectively frozen in place by
 // its own speed cap, not by any gravity or input problem, immediately
-// after spawning near any sufficiently massive hole (reported directly:
-// "near the black hole I cannot fly"). This floor keeps the pure
-// relativistic cap intact (and binding) for small/moderate-mass holes,
-// where it's already far above this floor and max() changes nothing, but
-// guarantees LOCAL maneuvering near a black hole never becomes physically
-// unplayable just because the hole is supermassive. 150 sim-units/s is
-// comfortably above STALL_SPEED (70) and MACH_1 (343 is the arcade
-// transonic reference, not a hard limit) -- fast enough to feel
-// responsive, nowhere near needing to be literal light speed for a sim
-// unit that, at TON 618's scale, is itself a significant fraction of a
-// light-year.
-const float MIN_FLYABLE_SPEED_SIM_UNITS_PER_SEC = 150.0f;
+// after spawning near any sufficiently massive hole. This floor keeps the
+// pure relativistic cap intact (and binding) for small/moderate-mass
+// holes, where it's already far above this floor and max() changes
+// nothing, but guarantees the ship never becomes physically unplayable
+// just because the hole is supermassive.
+//
+// Lowered from an original 10000 to 600, reported directly: "the ship is
+// very hard to control, make the speed limit much lower." 10000 was
+// sized to clear the OLD thrust/drag model's own natural top speed
+// (~9000) so the cap would never artificially bind during ordinary
+// throttle use -- but once speed became a direct "set speed" value with
+// no equilibrium ceiling of its own (the cruise-control redesign, see
+// the class comment above), there was no reason left to size the cap
+// around a now-deleted force model's top speed; 600 is simply a speed
+// this ship is actually controllable at, chosen directly rather than
+// derived from an equilibrium calculation that no longer exists.
+const float MIN_FLYABLE_SPEED_SIM_UNITS_PER_SEC = 600.0f;
 
 class FlightPhysics {
 public:
@@ -96,7 +101,31 @@ public:
     glm::quat rotation;
     glm::vec3 angularVelocity;  // rad/s in local space
 
-    float thrust;
+    // The pilot's directly-set forward speed, in sim-units/s -- Shift
+    // raises it, Ctrl lowers it (InputHandler::ProcessKeyboard). No cap
+    // of its own on the forward side: it can go arbitrarily high the
+    // longer Shift is held. Floored at exactly 0 by InputHandler, NOT
+    // here -- reverse flight is deliberately disabled (explicitly
+    // requested: "make it so i can not reverse"), so Ctrl decelerates
+    // down to a stop and holds there rather than continuing past zero.
+    // Every frame, UpdateForces sets the ship's velocity component
+    // ALONG its own nose direction to exactly this value -- not blended,
+    // not fought by drag, immediate. The one thing this deliberately gives
+    // up: gravity's REAL, divergent pull near the event horizon (see the
+    // class-level comment's point 1) can no longer drag the ship's speed
+    // up along a line it's already flying straight down/away from, since
+    // that component gets overwritten by cruiseSpeedSimUnitsPerSec every
+    // frame right after gravity is integrated into it -- "no amount of
+    // thrust can hold station near the horizon" is no longer literally
+    // true for a ship flying directly along the radial line, because
+    // "thrust" isn't a force here anymore, it's a set speed. What gravity
+    // still does, every frame, or real: bend the ship's heading away from
+    // a straight line (its contribution PERPENDICULAR to the nose still
+    // accumulates normally, unmodified, before the along-nose component is
+    // overwritten) -- a close pass still visibly curves the flight path,
+    // it just no longer forces your speed up along a nose-aligned dive.
+    float cruiseSpeedSimUnitsPerSec;
+
     float currentGForce;
     float peakGForce;
 
@@ -131,7 +160,6 @@ public:
 
     // Getters
     float GetSpeed() const;
-    float GetMachNumber() const;
     glm::vec3 GetForward() const;
     glm::vec3 GetUp() const;
     glm::vec3 GetRight() const;
@@ -140,7 +168,6 @@ private:
     void UpdateForces(float deltaTime, float maxSpeedSimUnitsPerSec);
     void UpdateRotation(float deltaTime);
     void CalculateGForce(const glm::vec3& acceleration);
-    float GetDragCoefficient(float mach) const;
 };
 
 } // namespace Jet

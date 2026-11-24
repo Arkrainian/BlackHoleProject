@@ -1,0 +1,36 @@
+{
+  "blackHoleMassSolar": 66000000000.0,
+  "blackHoleSpin": 0.0,
+  "diskBrightnessScale": 1.261,
+  "diskGlareIntensity": 1.1200000047683716,
+  "diskGlareRadius": 0.09200000017881393,
+  "diskMovieAccurateColors": true,
+  "diskTemperatureScale": 1.1,
+  "lightAzimuthDegrees": 0.0,
+  "lightColor": [
+    1.0,
+    1.0,
+    1.0
+  ],
+  "lightElevationDegrees": 30.0,
+  "lightIntensity": 1.2860000133514404,
+  "lightMode": 0,
+  "planets": [],
+  "shipMode": 1,
+  "shipOrbitAnimated": false,
+  "shipOrbitInclinationDegrees": -90.0,
+  "shipOrbitPhase": 3.142,
+  "shipOrbitRadius": 5.0,
+  "shipOrbitSpeedRadPerSec": 0.931,
+  "shipParkedEulerDegrees": [
+    89.0,
+    -3.0,
+    51.0
+  ],
+  "shipParkedPosition": [
+    -8.0,
+    25.5,
+    5.0
+  ],
+  "stars": []
+}

@@ -75,19 +75,21 @@ literal output of tracing photon geodesics.*
 ## Quick start
 
 Requires Visual Studio 2022 (MSVC) on Windows; CMake and Ninja are used
-via the ones bundled with VS. CUDA build additionally requires the CUDA
-Toolkit (developed against 12.6) and an NVIDIA GPU.
+via the ones bundled with VS. `build.bat` auto-detects whether the CUDA
+Toolkit (developed against 12.6) is installed and builds the GPU ray
+tracer/planet physics in if so, CPU-only otherwise -- one script, one
+`build\` output either way.
 
 ```bat
-:: CPU-only build (no CUDA toolkit needed)
 build.bat
 build\BlackHoleSimulator.exe
 build\tests\BlackHoleTests.exe
-
-:: CUDA-accelerated build (adds the GPU tracer and GPU-vs-CPU tests)
-build_cuda.bat
-build_cuda\BlackHoleSimulator.exe
 ```
+
+The resulting exe always runs: if it was built with CUDA but the machine
+running it has no CUDA-capable GPU, it falls back to the CPU ray
+tracer/planet physics automatically (see "GPU (CUDA) active" vs. "running
+on CPU" in the app's own UI).
 
 Everything else (GLFW, GLM, Dear ImGui) is fetched automatically by CMake
 at configure time — nothing to install beyond the compiler/CUDA toolkit.

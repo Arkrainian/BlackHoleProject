@@ -153,6 +153,26 @@ inline std::vector<CatalogObject> BuildCatalog() {
         {"TON 618", T::BlackHoleObj, 12.0538, 29.8117, 1.04e10, 6.6e10, 0.0, kUnknownSpin,
          "One of the most massive black holes known -- an ultramassive quasar engine; this app's original default scene"},
 
+        // --- Fictional, but physically grounded (Kip Thorne was the
+        //     science consultant and co-wrote the actual GR rendering
+        //     paper this app's own Kerr geodesic tracing is in the same
+        //     tradition as -- James, von Tunzelmann, Franklin & Thorne,
+        //     "Gravitational Lensing by Spinning Black Holes in
+        //     Astrophysics, and in the Movie Interstellar", 2015) ---
+        {"Gargantua", T::BlackHoleObj, 0.0, 0.0, 1.0e8, 1.0e8, 0.0, 0.998,
+         "Interstellar's black hole -- not a real catalog object, no real sky position (hence RA/Dec 0,0 "
+         "and an arbitrary placeholder distance here). Mass ~100 million solar masses per Kip Thorne's own "
+         "published figures for the film. Spin was specified as near the maximal a*=0.9999999999 in those "
+         "same figures (that's what gives Miller's planet its 60,000:1 time dilation in the story); the "
+         "0.998 here is this app's standard near-extremal clamp (Physics::BlackHole::SetSpin), the same "
+         "numerical-stability limit the real DNGR renderer used (reduced from Thorne's ~1 to 0.998) when "
+         "actually tracing geodesics for the movie -- so this is the same number for the same reason, not "
+         "a guess. The accretion disk's color/temperature is NOT a hand-picked movie-accurate hue; like "
+         "every other hole here it falls out of Astronomy::AccretionDisk's real Shakura-Sunyaev blackbody "
+         "model given this mass (see AccretionDisk.h) -- at ~1e8 solar masses that lands in the same hot, "
+         "blue-white quasar-disk regime as M87*, not the famously bright white halo the movie's own "
+         "visualization chose for watchability over Doppler-accurate contrast."},
+
         // --- Galaxies (distance context only -- not travel targets, see
         //     header comment above) ---
         {"Andromeda Galaxy (M31)", T::Galaxy, 0.7122, 41.2690, 2.537e6, 0.0, 0.0, kUnknownSpin,

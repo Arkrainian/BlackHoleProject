@@ -38,6 +38,19 @@ struct AccretionDiskSettings {
     // fraction.
     double eddingtonFraction = 0.3;   // L / L_Edd; ~0.3 is typical for a luminous quasar like TON 618
     double radiativeEfficiency = 0.1; // eta = L / (Mdot c^2); standard thin-disk value
+
+    // Explicit user request after asking "why is the color blue, in the
+    // movie it was orange" -- see EmittedColor()'s comment. When true,
+    // this swaps the physically-derived blackbody HUE for a fixed warm
+    // gold/white tint (the "Interstellar" look), while leaving the
+    // Stefan-Boltzmann brightness/redshift math (and hence the lensing,
+    // Doppler beaming, and gravitational dimming) completely untouched --
+    // matching what Double Negative's own paper says they actually did:
+    // they kept the real lensing/redshift physics but deliberately
+    // suppressed the disk's color-temperature variation for the final
+    // film. This is purely a visualization toggle, not a different
+    // physical model.
+    bool movieAccurateColors = false;
 };
 
 class AccretionDisk {

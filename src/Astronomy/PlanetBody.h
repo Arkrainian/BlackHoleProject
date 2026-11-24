@@ -202,7 +202,14 @@ public:
     const std::vector<PlanetSpring>& Springs() const { return m_springs; }
     const std::vector<PlanetFragment>& Fragments() const { return m_fragments; }
     const glm::vec3& BaseColor() const { return m_settings.material.color; }
+    void SetBaseColor(const glm::vec3& color) { m_settings.material.color = color; }
     const PlanetBodySettings& Settings() const { return m_settings; }
+
+    // Scene Editor support: shifts every particle (and its trail history) by
+    // `delta` -- same idea as StarBody::Translate. Spring rest lengths are
+    // unaffected (translation preserves relative distances); fragment center-
+    // of-mass fields are left stale until the next Update() rebuilds them.
+    void Translate(const glm::dvec3& delta);
 
     // Last values computed by Update (zero before the first Update call) --
     // the UI reads these directly rather than recomputing them, so the

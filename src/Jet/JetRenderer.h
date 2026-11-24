@@ -34,8 +34,11 @@ public:
     // tracer's camera used this frame (Rendering::Camera::ViewMatrix /
     // ProjectionMatrix) so the jet lines up with the lensed background.
     // `lightDirection` should point FROM the light TOWARD the jet.
+    // `lightColor`/`lightIntensity` are the Scene Editor's user-controllable
+    // light tint and brightness multiplier (default white, 1.0 == the
+    // original fixed lighting this always used before that control existed).
     void Draw(const glm::vec3& position, const glm::quat& rotation, const glm::mat4& view, const glm::mat4& projection,
-              const glm::vec3& lightDirection) const;
+              const glm::vec3& lightDirection, const glm::vec3& lightColor = glm::vec3(1.0f), float lightIntensity = 1.0f) const;
 
     bool IsLoaded() const { return m_loaded; }
 

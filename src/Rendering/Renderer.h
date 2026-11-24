@@ -122,6 +122,51 @@ public:
     // entirely -- used for the Stage 3 lensed-render view.
     void DrawFullscreenTexture(unsigned int texture) const;
 
+    // Scene Editor's "glare" control, now done entirely on the GPU: a
+    // bright-pass + separable-blur bloom (see Renderer.cpp's GlareGpuState)
+    // run against `texture` (at its own width/height, which may differ from
+    // the window), additively composited on top of that same texture drawn
+    // as a full-viewport quad -- i.e. a drop-in replacement for
+    // DrawFullscreenTexture when intensity > 0, and exactly
+    // DrawFullscreenTexture when it's not (cheap early-out). `radius` is
+    // the same fractional-image-size slider the old CPU version used.
+    // Previously this glow was computed on the CPU, over every pixel of the
+    // full HDR framebuffer, every time the scene re-traced -- visible lag
+    // on any machine without a lot of CPU cores to throw at it. The GPU
+    // already has the image uploaded as a texture for display anyway, so
+    // doing the same bright-pass/blur there instead is both free of that
+    // CPU cost and, being embarrassingly parallel per-pixel work, much
+    // faster on the hardware actually suited to it.
+    void DrawFullscreenTextureWithGlare(unsigned int texture, int width, int height, float intensity,
+                                         float radius) const;
+
+    // A short full-screen "falling through a wormhole" visual: radially
+    // pulls `texture` toward/away from screen center into motion streaks,
+    // adds pulsing tunnel-ring glow, and flashes to white/blue at the
+    // midpoint -- played while App.cpp's jet crosses an event horizon, to
+    // hide what is otherwise an instant camera-position jump to a random
+    // other catalog location (No Man's Sky-style). `progress` is 0..1
+    // across the whole sequence (strongest effect at 0.5, see
+    // Renderer.cpp's kWormholeFragmentShader); `timeSeconds` is
+    // free-running and only animates the tunnel-ring pattern.
+    // `textureIsFlippedVertically` matches DrawFullscreenTexture's own
+    // texcoord flip: true for the raw ray-traced lensed texture (row 0 =
+    // top of image), false for a texture captured straight off the GL
+    // backbuffer via CaptureFramebufferTexture below (already in on-screen
+    // orientation).
+    void DrawWormholeEffect(unsigned int texture, float progress, float timeSeconds,
+                             bool textureIsFlippedVertically = true) const;
+
+    // Copies the currently-bound framebuffer's color contents (whatever
+    // the app just rendered -- lensed view, Star System View, debug view,
+    // doesn't matter which) into a persistent GL texture sized
+    // `width`x`height`, and returns its id. Used by App.cpp to feed
+    // DrawWormholeEffect a texture of "whatever's on screen right now"
+    // regardless of which render branch produced it, so the wormhole
+    // overlay works uniformly across all of them instead of needing its
+    // own copy of each branch's drawing code.
+    unsigned int CaptureFramebufferTexture(int width, int height) const;
+
 private:
     // Tracks the last size UploadImage specified for a given texture object,
     // so it can tell whether a same-size call can use the cheaper
@@ -131,6 +176,12 @@ private:
     mutable unsigned int m_uploadedTexture = 0;
     mutable int m_uploadedWidth = 0;
     mutable int m_uploadedHeight = 0;
+
+    // Backing texture for CaptureFramebufferTexture -- same
+    // create-once/resize-on-change pattern as m_uploadedTexture above.
+    mutable unsigned int m_captureTexture = 0;
+    mutable int m_captureWidth = 0;
+    mutable int m_captureHeight = 0;
 };
 
 } // namespace Rendering

@@ -1,7 +1,11 @@
-# Build output (build.bat / build_cuda.bat), including FetchContent'd
-# third-party sources/build trees (glfw, glm, imgui, glew)
+# Build output (build.bat), including FetchContent'd third-party
+# sources/build trees (glfw, glm, imgui, glew)
 build/
 build_cuda/
+
+# MSI installer output (build_installer.bat); rebuild from installer/Product.wxs
+installer/*.msi
+installer/*.wixpdb
 
 # Crash dumps and runtime logs
 crashdumps/
@@ -18,3 +22,6 @@ imgui.ini
 .vscode/
 *.user
 Thumbs.db
+
+# Local scratch folder, not part of the project
+newlines/

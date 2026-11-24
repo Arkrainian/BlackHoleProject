@@ -2527,3 +2527,372 @@ warnings) and both test suites passing (0 failures). Not confirmed by
 actually moving the mouse in the running app -- same UI-automation
 caveat as the rest of this session; the fix follows directly from the sign
 analysis above, not trial-and-error.
+
+### Addendum (same session) — Jet mode is now keyboard-only, mouse-look removed
+
+User asked directly for mouse movement to stop steering the Endurance
+entirely -- keyboard only. Removed, not disabled: `Jet::InputHandler::
+ProcessMouse` is no longer called at all from the Jet input block
+(`App.cpp`), so mouse motion never reaches `mousePitchAccumulator`/
+`mouseRollAccumulator` (`InputHandler.cpp` itself untouched -- those
+accumulators just stay at 0 forever now, contributing nothing to
+`ProcessKeyboard`'s blended pitch/roll target). WASD/Q/E/Shift/Ctrl
+keyboard control is unchanged.
+
+Also removed, as genuinely dead code once mouse-look was gone rather than
+left half-working: the Tab-toggle cursor capture/hide behavior
+(`jetMouseCaptured`/`jetTabWasDown`) -- there's nothing left for a
+captured cursor to be FOR once the mouse doesn't steer anything, so the
+cursor now just stays normal/visible throughout Jet mode, same as every
+other camera mode when nothing needs it hidden. Removing that also
+exposed (and this session fixed) a second, now-genuinely-dead variable:
+`cameraModeJustChanged`/`previousCameraMode` existed solely to suppress
+one mouse-delta frame right after switching into Jet mode -- with
+mouse-look gone, nothing read `cameraModeJustChanged` anymore (confirmed
+by the compiler: `warning C4189: 'cameraModeJustChanged': local variable
+is initialized but not referenced` appeared the moment the mouse-look
+block was removed), so both were deleted rather than left as unused
+leftover state.
+
+Verified by a clean rebuild of both `build.bat`/`build_cuda.bat` (no
+warnings -- the transient C4189 above was caught and fixed in the same
+pass, not shipped) and both test suites passing (0 failures). Not
+confirmed by actually piloting the ship in the running app -- same
+UI-automation caveat as the rest of this session.
+
+### Addendum (same session) — the floor from the LAST session broke Shift/Ctrl throttle
+
+User reported Shift/Ctrl no longer visibly changed speed at all. Real
+regression, traced to the exact fix from the previous addendum
+("the REAL 'can't fly' cause..."): `MIN_FLYABLE_SPEED_SIM_UNITS_PER_SEC`
+was set to 150 there specifically to stop the jet being frozen near a
+supermassive hole -- but 150 is far BELOW this flight model's own natural
+thrust/drag equilibrium speed at almost any throttle setting. Worked the
+equilibrium condition (`F_thrust = 0.5 * airDensity * v^2 * dragCoeff`,
+`FlightPhysics.cpp`'s `UpdateForces`, using the supersonic drag
+coefficient since every one of these speeds is well past Mach 1) by
+hand: ~5216 sim-units/s at the default half-throttle, ~7377 at full
+forward thrust, ~9035 at full thrust plus afterburner, ~4041 at max
+reverse thrust. A 150 cap sits below every one of those -- so the
+velocity clamp bound at literally every throttle setting tested,
+pinning actual speed to the same 150 regardless of how far Shift/Ctrl
+pushed the underlying thrust value. Thrust really was changing
+(confirmed by reading `InputHandler::ProcessKeyboard` -- nothing resets
+it per frame); the clamp just always won before that change could ever
+show up as a different velocity.
+
+Fixed by raising the floor to **10000** sim-units/s -- comfortably above
+the highest natural equilibrium this flight model can produce (~9035),
+so the floor/cap now only binds in the genuinely pathological case it
+was built for (a relativistic cap collapsed to ~1e-6 at supermassive
+mass), never during ordinary throttle use at any black hole mass. The
+Advanced-panel amber warning added alongside the original floor (which
+shows the real c-multiple whenever the floor is actually overriding the
+"real 0.2c" the slider promises) needed no code change -- it already
+reads the floor constant and recomputes the implied multiple live, so it
+automatically reflects the new, larger number.
+
+Verified by a clean rebuild of both `build.bat`/`build_cuda.bat` (no
+warnings) and both test suites passing (0 failures). The equilibrium-
+speed arithmetic above was computed by hand (and double-checked with a
+throwaway script) before picking 10000, not guessed and adjusted after
+the fact. Not confirmed by actually holding Shift/Ctrl in the running
+app -- same UI-automation caveat as the rest of this session.
+
+### Addendum (same session) — "I can't slow down and it speeds up": two real causes, both fixed
+
+User reported Shift still felt like it sped the ship up uncontrollably
+while Ctrl barely slowed it at all -- not the same bug as the floor
+regression just above (that one made speed NOT change at all; this one
+is about Shift/Ctrl changing it, just asymmetrically and sluggishly).
+Found two independent, compounding causes:
+
+1. **The throttle ramp rate (50000 N/s) was far too slow relative to how
+   this model's equilibrium speed actually scales.** Equilibrium speed
+   goes as `sqrt(thrust)`, not linearly -- so a few seconds of holding
+   Ctrl only shaves a small percentage off `thrust`, which shaves an even
+   smaller percentage off the resulting cruise speed (3 seconds of Ctrl:
+   thrust down ~15%, speed down only `sqrt(0.85) ≈ 8%`). Meanwhile Shift,
+   climbing from the same starting point toward an ever-higher
+   equilibrium, reads as dramatically more effective over the same few
+   seconds -- same underlying rate, wildly different FELT responsiveness.
+   Fixed by raising the rate to **700000 N/s**
+   (`Jet::THRUST_RAMP_RATE_PER_SEC`, `FlightPhysics.h`) -- a full forward
+   sweep (0 to `MAX_THRUST`) now takes ~3 seconds instead of 40, and a
+   full reverse sweep under a second.
+2. **The "aerodynamic turn correction" was fighting every speed change,
+   not just correcting heading.** Re-reading `UpdateForces` closely: the
+   correction's target magnitude was the `airSpeed` captured at the TOP
+   of the function -- i.e. the speed BEFORE that frame's thrust/drag
+   integration ran -- not the speed AFTER it. Every single frame, this
+   partially pulled velocity's magnitude back toward its OWN PREVIOUS
+   value, directly undoing a fraction of whatever acceleration or
+   deceleration had just happened. This is not something either of this
+   session's two prior addenda introduced -- it's been there since the
+   turn-correction existed (Session 2) -- it just never surfaced as a
+   complaint before because nobody had pushed on sustained
+   deceleration hard enough to notice the drag. Fixed by targeting the
+   speed AFTER the thrust/drag/cap update instead (`currentSpeed =
+   glm::length(velocity)`, computed right before the correction, not
+   reused from the function's `airSpeed` local) -- the correction now
+   only ever corrects DIRECTION (its stated purpose: "velocity aligns
+   with the nose"), and stops partially undoing Shift/Ctrl's actual
+   effect on speed.
+
+Verified by a clean rebuild of both `build.bat`/`build_cuda.bat` (no
+warnings) and both test suites passing (0 failures). Cause #2 in
+particular was found by re-reading the integration order line by line,
+not by guessing at a sign error -- the bug was a STALE VALUE, not a
+wrong sign. Not confirmed by actually holding Shift/Ctrl in the running
+app -- same UI-automation caveat as the rest of this session.
+
+### Addendum (same session) — replaced the thrust/drag model with direct "set speed" cruise control
+
+User asked for something more fundamental than another tuning pass: make
+speed a literal set value, and make Shift/Ctrl raise/lower it with no
+ceiling of their own ("infinitely reduces/increases"). Rather than
+chase the thrust/drag equilibrium model through a third round of tuning,
+replaced it outright.
+
+- **`FlightPhysics::thrust` (a force, Newtons) is gone, replaced by
+  `cruiseSpeedSimUnitsPerSec` (a speed, sim-units/s).** Shift/Ctrl
+  (`InputHandler::ProcessKeyboard`) add/subtract a fixed rate
+  (`Jet::CRUISE_SPEED_RAMP_RATE = 400` sim-units/s per second of holding)
+  directly to/from it, unclamped in either direction -- no engine-rating
+  ceiling, no reverse-fraction limit, matching "infinitely" literally.
+  Negative values fly backward along the nose.
+- **`UpdateForces` no longer simulates thrust force, drag, or a mach-
+  dependent drag coefficient at all** -- `GetMachNumber`/
+  `GetDragCoefficient`/`MACH_1`/`JET_MASS`/`MAX_THRUST`/
+  `REVERSE_THRUST_FRACTION` are all deleted, not deprecated-in-place,
+  since none of them mean anything once speed is set directly rather
+  than derived from a force balance. Every frame: gravity is integrated
+  into `velocity` exactly as before (unchanged real GR physics, see
+  below for the one real tradeoff this causes), then velocity is
+  decomposed into its component along the ship's own nose direction and
+  everything perpendicular to that; the along-nose component is replaced
+  outright with `cruiseSpeedSimUnitsPerSec * afterburnerMultiplier`
+  (immediate, not blended/lagged), and the perpendicular component is
+  kept as-is. The old "aerodynamic turn correction" hack (which existed
+  only to fight sideways drift back toward the nose direction, and was
+  the source of the previous addendum's stale-speed bug) is gone
+  entirely -- this decomposition already guarantees the ship's speed
+  along its nose is always exactly the set speed, with no separate
+  correction needed.
+- **Real, explicitly-documented tradeoff, not a silently dropped
+  feature:** gravity's real, divergent pull near the event horizon can no
+  longer force the ship's OVERALL SPEED up while diving straight down or
+  straight away (that component gets overwritten by
+  `cruiseSpeedSimUnitsPerSec` the instant after gravity is integrated) --
+  "no amount of thrust can hold station near the horizon" is no longer
+  literally true along a radial line, because there is no "thrust" force
+  anymore, only a set speed. What survives unchanged: gravity's pull
+  PERPENDICULAR to the nose still accumulates normally before the
+  along-nose overwrite, so a close pass still visibly bends the flight
+  path -- the horizon just isn't an inescapable trap for a ship flying
+  straight at or away from it anymore. Documented in-line in
+  `FlightPhysics.h`'s class comment and `cruiseSpeedSimUnitsPerSec`'s own
+  comment specifically so this isn't mistaken for an oversight later.
+- **G-force readout now comes from the actual frame-to-frame velocity
+  change** (`(velocity_after - velocity_before) / deltaTime`) instead of
+  a sum of simulated forces divided by mass -- there's no force sum left
+  to read from, and this is honest about what G-force means anyway (how
+  hard the ship's actual motion just changed), so sudden set-speed
+  changes and sharp turns both still show up on the gauge.
+- Default starting cruise speed: 300 sim-units/s (`kDefaultCruiseSpeed`,
+  `FlightPhysics.cpp`) -- a modest, already-moving starting point, not
+  zero and not an arbitrary large number.
+- Updated the two on-screen control hints (`App.cpp`'s Jet-mode comment
+  and Advanced-panel `TextDisabled` string) to describe "set speed"
+  control instead of "thrust."
+
+Verified by a clean rebuild of both `build.bat`/`build_cuda.bat` (no
+warnings -- confirming no leftover references to the deleted
+thrust/drag symbols anywhere) and both test suites passing (0 failures;
+none of them touch jet flight physics directly, so this is a
+compile/link-level confirmation that the redesign didn't break anything
+else, not new coverage of the new model itself). Not confirmed by
+actually flying in the running app -- same UI-automation caveat as the
+rest of this session.
+
+### Addendum (same session) — chase camera was drifting away from the ship at low speed
+
+User reported the camera should stay locked to the Endurance regardless
+of speed, and specifically that it drifted above the ship at low speed.
+Root cause in `Jet::FlightCamera::UpdateChaseCamera`: the chase camera
+didn't snap directly to its offset from the ship -- it interpolated
+toward it with a "dynamic rubber-banding" alpha that sped up the MORE the
+camera had already fallen behind (`distance(smoothPosition, targetPos) >
+10` triggered a faster catch-up rate). That distance is itself a function
+of how much the ship has moved since the last frame -- a fast-moving ship
+displaces a lot per frame, keeps the camera in the fast "already behind,
+catch up quickly" regime, and the lag is never visually obvious; a slow
+or stationary ship barely displaces at all, so the camera sat in the slow
+smoothing regime (`smoothness = 0.9`, only ~10% of the remaining gap
+closed per frame at 60fps) and any small residual offset -- e.g. left
+over from before the ship slowed down, or from the ship's own rotation
+changing the target offset -- lingered and decayed slowly instead of
+snapping, which is exactly what "goes above the Endurance" at low speed
+looks like.
+
+Fixed by removing the lag entirely rather than retuning the alpha curve
+again: `UpdateChaseCamera` now sets `position`/`target`/`up` directly
+from the ship's current position/rotation every single frame, with no
+interpolation state at all (`smoothPosition`/`smoothTarget` and the
+`smoothness` field are deleted, not just unused). The camera now holds
+an IDENTICAL offset from the ship whether it's standing still, cruising,
+or reversing -- there is no more "catch-up" behavior to have a slow and
+fast regime in the first place. `FlightCamera::Update` dropped its now-
+unused `deltaTime` parameter as part of this (nothing in either camera
+mode needs frame time anymore), updated at its 3 call sites in `App.cpp`.
+
+Verified by a clean rebuild of both `build.bat`/`build_cuda.bat` (no
+warnings) and both test suites passing (0 failures). Not confirmed by
+actually flying slowly and watching the camera in the running app --
+same UI-automation caveat as the rest of this session; the fix removes
+the entire mechanism that could produce the reported drift, rather than
+adjusting one of its tuning constants.
+
+### Addendum (same session) — speed limit lowered, ship was too fast to control
+
+User reported the ship was very hard to control and asked for the speed
+limit to come down a lot. Three related constants, all in
+`FlightPhysics.h`/`.cpp`, lowered together rather than just one in
+isolation (each was originally sized against the now-deleted thrust/drag
+model's own numbers, not derived fresh for the cruise-control redesign):
+
+- **`MIN_FLYABLE_SPEED_SIM_UNITS_PER_SEC` (the actual speed cap): 10000
+  -> 600.** 10000 was sized specifically to clear the OLD thrust/drag
+  model's natural top speed (~9000) so the cap would never artificially
+  bind -- but that model is gone (previous addendum, this session), so
+  10000 no longer meant anything in particular; it just happened to still
+  be the active ceiling, and it's a genuinely very fast, hard-to-react-to
+  speed for direct manual piloting. 600 is sized directly for
+  controllability, not derived from a deleted calculation.
+- **`CRUISE_SPEED_RAMP_RATE`: 400 -> 150** (sim-units/s of speed added per
+  second of holding Shift/Ctrl). At 400, even a brief tap added hundreds
+  of units/s, blowing past a controllable range in a fraction of a
+  second; 150 spreads a full ramp from the default cruise speed to the
+  new, much lower cap over a few seconds instead.
+- **`kDefaultCruiseSpeed` (starting speed): 300 -> 150** -- kept well
+  under the new 600 cap so there's still meaningful room for Shift to do
+  something before clamping, instead of starting almost there already.
+
+Verified by a clean rebuild of both `build.bat`/`build_cuda.bat` (no
+warnings) and both test suites passing (0 failures). Not confirmed by
+actually flying in the running app -- same UI-automation caveat as the
+rest of this session; these are deliberately plain, directly-chosen
+numbers (not derived from a physics calculation the way earlier
+addenda's numbers were), since "controllable" is a feel judgment the user
+is in the best position to confirm or ask to adjust further.
+
+### Addendum (same session) — location markers, so objects' real position is visible separately from how they look lensed
+
+User reported still losing track of where things actually are while
+flying, and asked directly for physical markers on the black hole/star
+objects. Real distinction this addresses, not just "add a dot": a black
+hole's lensed shadow is an OPTICAL effect -- its apparent size and
+screen position are a function of how light bends on the way to the
+camera, not a literal outline of where the hole's center actually sits in
+flat space. Flying by eye using only the shadow as a position reference
+is like judging a swimming pool's true depth by the refracted image of
+its floor -- plausible-looking, and wrong by a visually significant
+amount especially up close, which is exactly the kind of thing that makes
+piloting near one feel disorienting.
+
+- **New `showLocationMarkers` toggle** (`App.cpp`, Advanced mode > Black
+  Hole panel, on by default): a bright magenta wireframe sphere
+  (`Renderer::DrawWireSphere`, already existed, just reused) drawn
+  directly at each gravitating/destination object's REAL position, via
+  the same flat (non-lensed) overlay-compositing path the piloted jet
+  and spawned stars/planets already use -- so, unlike the ray-traced
+  background, these markers are never bent by the lensing they're
+  specifically there to see past.
+  - Main ray-traced view: a marker at the primary black hole's origin,
+    sized at 3x its real Schwarzschild radius (scale-invariant in sim
+    units, so this is the same relative size regardless of mass); plus
+    one at each binary-mode body's own real position/radius, and one at
+    every freely-placed extra black hole's position/radius.
+  - Star System View: one marker around the visited star.
+  - Multi-Star System View: one marker per member, since multiple moving
+    bodies are exactly the case where losing track of which is which (or
+    where any of them currently are) is easiest.
+- The overlay-compositing branch's trigger condition (`if (jetVisible ||
+  !stars.empty() || !planets.empty())`) gained `|| showLocationMarkers`
+  -- without it, markers would never draw in a scene with no jet/stars/
+  planets spawned (i.e. the app's own default state), which would have
+  made the toggle appear broken the moment someone just launched the app
+  and turned it on.
+
+Verified by a clean rebuild of both `build.bat`/`build_cuda.bat` (no
+warnings) and both test suites passing (0 failures) -- this is a pure
+rendering addition, so neither test suite was expected to need new
+coverage, and none was added. Not confirmed by actually looking at the
+markers in the running app -- same UI-automation caveat as the rest of
+this session.
+
+### Addendum (same session) — reverse flight disabled
+
+User asked directly to remove reverse. `InputHandler::ProcessKeyboard`
+now floors `cruiseSpeedSimUnitsPerSec` at exactly 0 after Shift/Ctrl are
+applied (`std::max(..., 0.0f)`) -- Ctrl decelerates the ship down to a
+stop and holds there instead of continuing past zero into backward
+flight. Floored in `InputHandler`, not `FlightPhysics`, since the cap is
+about an input/control-scheme choice (no reverse control exists) rather
+than a property of the flight model itself -- `FlightPhysics` still has
+no opinion about negative speed and would fly backward correctly if some
+other caller ever set a negative cruise speed directly. Forward-side
+behavior (Shift, no ceiling of its own) is unchanged. Updated the three
+places that documented reverse (`FlightPhysics.h`'s field comment,
+`App.cpp`'s Jet-mode comment, and its Advanced-panel control-hint text)
+to say floored-at-a-stop instead of reversing.
+
+Verified by a clean rebuild of both `build.bat`/`build_cuda.bat` (no
+warnings) and both test suites passing (0 failures). Not confirmed by
+actually holding Ctrl to a stop in the running app -- same UI-automation
+caveat as the rest of this session.
+
+### Addendum (same session) — the Star Map ("waypoints") is now in Simple mode too
+
+User asked for waypoints to be reachable from the Simple-mode panel --
+previously the Universe/Star Map only lived in Advanced mode (plus the
+"M" popup from Session 18, which not everyone would think to try).
+Added a new "Waypoints" section to Simple mode (`App.cpp`, right after
+the "Objects" star/planet card, before the "switch to Advanced mode"
+button), wrapped in its own `CollapsingHeader` so it doesn't clutter the
+simple panel by default. Calls the exact same `DrawUniversePanelContents`
+lambda Advanced mode and the "M" popup already share (Session 18) --
+three entry points to the identical catalog browser/Travel button/multi-
+star section now, instead of writing a fourth copy.
+
+Verified by a clean rebuild of both `build.bat`/`build_cuda.bat` (no
+warnings) and both test suites passing (0 failures). Not confirmed by
+actually opening Simple mode and clicking through to a waypoint in the
+running app -- same UI-automation caveat as the rest of this session.
+
+### Addendum (same session) — location markers also in Simple mode, defaulted off; ship spawns at 0 speed
+
+Two small, explicit follow-up requests after the Waypoints addition
+above:
+
+- **`showLocationMarkers` added to Simple mode too** (`App.cpp`, right
+  under the new Waypoints section), the same checkbox Advanced mode's
+  Black Hole panel already has -- both toggle the one shared flag, so
+  there's still only one source of truth for whether markers are drawn,
+  just two places to flip it depending on which mode is open.
+- **Default flipped from on to off** -- explicitly requested ("make it
+  disabled on default"). Markers are now an opt-in aid rather than always
+  present from a fresh launch.
+- **The Endurance now spawns/respawns at exactly 0 speed**, not a
+  nonzero default. `kDefaultCruiseSpeed` (`FlightPhysics.cpp`) changed
+  from 150 to 0 -- explicitly requested ("make sure the endurance doesnt
+  have speed on spawn, it should have 0 speed"). Applies everywhere the
+  ship's flight state resets: the "Pilot Endurance" button, falling past
+  the event horizon, and arriving via Universe/Star Map travel, since all
+  three go through the same `FlightPhysics::Reset`/constructor path. Shift
+  still raises speed from 0 with no ceiling of its own, same as always.
+
+Verified by a clean rebuild of both `build.bat`/`build_cuda.bat` (no
+warnings) and both test suites passing (0 failures). Not confirmed by
+actually spawning the ship and checking its speed reads exactly 0 in the
+running app -- same UI-automation caveat as the rest of this session.

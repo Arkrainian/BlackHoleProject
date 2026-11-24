@@ -53,11 +53,19 @@ void InputHandler::ProcessKeyboard(GLFWwindow* window, FlightPhysics& physics, f
     physics.rollInput = smoothedRoll;
     physics.yawInput = smoothedYaw;
 
-    // Thrust: Shift = increase, Left/Right Ctrl = decrease (and past zero,
-    // genuine reverse thrust -- see REVERSE_THRUST_FRACTION), W+Shift =
-    // afterburner. Previously Space decreased thrust with a floor at zero
-    // (no reverse at all); moved to Ctrl specifically so reverse has its
-    // own dedicated key, not a repurposed "idle" key.
+    // Cruise speed: Shift raises it, Ctrl lowers it, W+Shift adds the
+    // afterburner multiplier. No ceiling on the forward side -- holding
+    // Shift keeps raising it for as long as it's held, with no
+    // engine-rating limit to plateau against (explicitly requested:
+    // "shift or ctrl infinitely reduces/increases the speed/throttle").
+    // The forward side's only bound on the ship's actual resulting
+    // velocity is the honest relativistic cap applied in
+    // FlightPhysics::Update, not anything here. Ctrl, however, IS floored
+    // at exactly 0 -- reverse flight is deliberately disabled (explicitly
+    // requested: "make it so i can not reverse"). Floored here, not in
+    // FlightPhysics, so Ctrl simply decelerates to a stop and holds there
+    // rather than overshooting into a negative value that would fly the
+    // ship backward.
     bool shiftPressed = (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
                           glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
     bool ctrlPressed = (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
@@ -65,17 +73,17 @@ void InputHandler::ProcessKeyboard(GLFWwindow* window, FlightPhysics& physics, f
     bool wPressed = (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS);
 
     if (shiftPressed) {
-        physics.thrust += 50000.0f * deltaTime;
+        physics.cruiseSpeedSimUnitsPerSec += CRUISE_SPEED_RAMP_RATE * deltaTime;
         physics.afterburner = wPressed;
     } else {
         physics.afterburner = false;
     }
 
     if (ctrlPressed) {
-        physics.thrust -= 50000.0f * deltaTime;
+        physics.cruiseSpeedSimUnitsPerSec -= CRUISE_SPEED_RAMP_RATE * deltaTime;
     }
 
-    physics.thrust = glm::clamp(physics.thrust, -MAX_THRUST * REVERSE_THRUST_FRACTION, MAX_THRUST);
+    physics.cruiseSpeedSimUnitsPerSec = std::max(physics.cruiseSpeedSimUnitsPerSec, 0.0f);
 }
 
 void InputHandler::ProcessMouse(float xoffset, float yoffset, FlightPhysics& physics, float deltaTime) {

@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 
+# Static CRT (/MT) so the installed .exe has no dependency on the VC++
+# Redistributable being present on the end-user's machine -- must be set
+# before the first project() call for CMP0091 to take effect.
+cmake_policy(SET CMP0091 NEW)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set(CMAKE_CUDA_RUNTIME_LIBRARY "Static")
+
 # CUDA is added as a project language only once Stage 7 turns it on, so Stage 1
 # can configure/build on a machine without nvcc wired into CMake yet.
 option(BH_ENABLE_CUDA "Enable CUDA-accelerated ray tracer (Stage 7+)" OFF)
@@ -67,7 +74,16 @@ set(glew-cmake_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(glew-cmake_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(ONLY_LIBS ON CACHE BOOL "" FORCE)
 
-FetchContent_MakeAvailable(glfw glm imgui glew)
+# Header-only; used only by the Scene Editor's save/load (src/Application/
+# SceneFile.cpp) to (de)serialize scene state to a human-readable .json file.
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG        v3.11.3
+)
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(glfw glm imgui glew nlohmann_json)
 
 # Dear ImGui ships as loose sources with no CMakeLists of its own; build the
 # core library plus the GLFW+OpenGL3 backends we need as a small static lib.
@@ -173,7 +189,7 @@ target_include_directories(BlackHoleSimulator PRIVATE src)
 # model) are single-header libraries vendored in-repo rather than
 # FetchContent'd -- neither has (or needs) a build of its own.
 target_include_directories(BlackHoleSimulator PRIVATE external/stb external/cgltf)
-target_link_libraries(BlackHoleSimulator PRIVATE bh_physics bh_astronomy bh_raytracing glfw imgui libglew_static opengl32)
+target_link_libraries(BlackHoleSimulator PRIVATE bh_physics bh_astronomy bh_raytracing glfw imgui libglew_static opengl32 nlohmann_json::nlohmann_json)
 
 if(WIN32)
     target_compile_definitions(BlackHoleSimulator PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
